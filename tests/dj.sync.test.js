@@ -77,7 +77,8 @@ test('synced blends: every beat pair within 2 ms across tempo pairs and ×2 / ÷
           assert.ok(Math.abs(tr.play.rate[0].v - 1) <= 0.0811);
           glides.add(assertGlidesHome(tr, B));
           assert.ok(Math.abs(tr.bpm - bpmA) < 1e-6, 'master tempo is the outgoing track');
-          assert.match(tr.why, /BPM \([+−]\d+\.\d%\)/);
+          assert.match(tr.why, /BPM \((?:[+−]\d+\.\d|±0\.0)%\)/);
+          assert.doesNotMatch(tr.why, /[+−]0\.0%/, 'no pitch change is not a signed zero');
           worstAll = Math.max(worstAll, al.worst);
           cases++;
         }
@@ -87,6 +88,20 @@ test('synced blends: every beat pair within 2 ms across tempo pairs and ×2 / ÷
   assert.ok(cases >= 600, `cases ${cases}`);
   assert.ok(worstAll < 1e-6, `perfect grids align to float precision, got ${worstAll}`);
   assert.deepEqual([...glides].sort((x, y) => x - y), [0, 8, 12, 16], 'no glide when matched already; longer the further off-pitch');
+});
+
+test('the pitch readout in Transition.why: signed when there is a change, "±0.0%" when it rounds to none', () => {
+  const whyAt = (ratio) => {
+    const { planner, prev, incoming } = pair(124, 124 * ratio);
+    return planner.next(prev, incoming, { earliest: 4, force: { type: 'bassSwap', beats: 16 } }).why;
+  };
+  // the incoming track is faster by a hair: it is slowed by 0.03 % — which used to read "(−0.0%)"
+  assert.match(whyAt(1.0003), /BPM \(±0\.0%\)/);
+  assert.match(whyAt(0.9997), /BPM \(±0\.0%\)/);
+  assert.match(whyAt(1), /BPM \(±0\.0%\)/);
+  assert.match(whyAt(1.02), /BPM \(−2\.0%\)/);
+  assert.match(whyAt(0.98), /BPM \(\+2\.0%\)/);
+  assert.match(whyAt(1.0006), /BPM \(−0\.1%\)/);
 });
 
 test('longer modes glide home over 16–32 beats', () => {
@@ -216,7 +231,8 @@ test('unsyncable pairs are never blended: tempo gap or an untrustworthy grid', (
         assert.ok(!BLENDS.includes(tr.type), `case ${k}: got ${tr.type}`);
         assert.equal(tr.synced, false);
         assert.ok(tr.play.rate.every((q) => q.v === 1), 'unsynced incoming plays at its own tempo from the start');
-        assert.match(tr.why, k < 2 ? /too far apart/ : /no steady beat/);
+        // the reason names what is true: the tempos, or the ONE track the analysis could not vouch for
+        assert.match(tr.why, [/tempos too far apart to match$/, /tempos too far apart to match$/, /no steady beat detected in the outgoing track$/, /no steady beat detected in the incoming track$/][k]);
       }
     }
   }

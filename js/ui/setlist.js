@@ -96,8 +96,13 @@ export function createSetlist(list, extra) {
     else row.li.removeAttribute('aria-current');
   }
 
-  /** @param {any[]} items SetlistItem[] */
-  function set(items) {
+  /**
+   * @param {any[]} items SetlistItem[]
+   * @param {{crate?: number}} [info] crate: how many different tracks the crate can play. The list
+   *   itself is not that number: it holds replays once the crate has come round, and leaves out what
+   *   is not queued yet. Without it the header falls back to counting the rows.
+   */
+  function set(items, info) {
     current = Array.isArray(items) ? items : [];
     const seen = new Set();
     let prev = null;
@@ -126,7 +131,8 @@ export function createSetlist(list, extra) {
       rows.delete(key);
     }
     extra.empty.hidden = seen.size > 0;
-    setText(extra.count, seen.size ? `${played} played · ${seen.size} in the crate` : '');
+    const crate = info && Number.isFinite(info.crate) && info.crate >= 0 ? Math.round(info.crate) : seen.size;
+    setText(extra.count, seen.size ? `${played} played · ${crate} in the crate` : '');
 
     // Follow the playing track unless the user just scrolled the list themselves.
     if (nowKey && nowKey !== focusKey) {

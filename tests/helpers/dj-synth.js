@@ -10,8 +10,31 @@ export const ALL_TYPES = ['bassSwap', 'eqBlend', 'filterBlend', 'echoOut', 'reve
 
 /**
  * A plausible Analysis for a track with a steady (optionally jittered / drifting) beat grid.
- * @param {object} o  bpm, duration, conf, first (first beat s), downbeat, pc, mode, keyConf, energy,
+ * @param {object} o  bpm, duration, conf, first (first beat s), downbeat, pc, mode, keyConf, energy, energyCurve,
  *                    cueEnd, drop, jitter (s, needs rng), drift (fractional tempo change across the track), trimDb
+ */
+/**
+ * Analysis.grid for a synthetic beat list: trust values plus a slot pattern (16 per beat) with attacks
+ * in the given slots of every beat (0 = on the beat, 8 = half a beat later, 4 / 12 = the sixteenths).
+ * @param {number} beatCount
+ * @param {{head?:number, tail?:number, phase?:number, hits?:number[], headHits?:number[], tailHits?:number[], floor?:number}} [g]
+ *   headHits / tailHits: a different pattern for the first / last 24 beats (a syncopated intro / outro)
+ */
+export function synthGrid(beatCount, g = {}) {
+  const P = 16;
+  const slots = new Uint8Array(beatCount * P);
+  for (let i = 0; i < beatCount; i++) {
+    const hits = i < 24 && g.headHits ? g.headHits : i >= beatCount - 24 && g.tailHits ? g.tailHits : g.hits || [0];
+    for (let s = 0; s < P; s++) slots[i * P + s] = g.floor ?? 12;
+    // the bar accent keeps the pattern from being perfectly periodic, as in real music
+    hits.forEach((s, k) => (slots[i * P + s] = Math.max(60, (k === 0 ? 230 : 150) - (i % 4 ? 30 : 0))));
+  }
+  return { phase: g.phase ?? 0.9, head: g.head ?? 0.9, tail: g.tail ?? 0.9, perBeat: P, slots };
+}
+
+/**
+ * (`grid`: omitted = an analysis without grid trust, as every hand-made one was before Analysis.grid
+ * existed; true = a clear grid; an object = synthGrid options.)
  */
 export function synthAnalysis(o = {}) {
   const bpm = o.bpm ?? 120;
@@ -45,9 +68,10 @@ export function synthAnalysis(o = {}) {
     key: { pc, mode, name: `${pc}${mode}`, camelot: camelot(pc, mode), confidence: o.keyConf ?? 0.8 },
     loudness: { rms: 0.2, peak: 0.9, trimDb: o.trimDb ?? -2 },
     energy: o.energy ?? 0.6,
-    energyCurve: [],
+    energyCurve: o.energyCurve ?? [],
     cues: { start: cueStart, end: cueEnd, in: cueIn, drop: o.drop ?? null },
     wave: { cols: 0, perSec: 100, low: new Uint8Array(0), mid: new Uint8Array(0), high: new Uint8Array(0) },
+    ...(o.grid ? { grid: synthGrid(beats.length, o.grid === true ? {} : o.grid) } : {}),
   };
 }
 
@@ -336,6 +360,27 @@ export function randomAnalysis(r) {
     cueEnd: r.next() < 0.5 ? undefined : duration - r.range(0, Math.min(6, duration / 3)),
     drop: r.next() < 0.5 ? null : r.range(0, duration),
   });
+  // Grid trust on about half of them: any trust values, on-beat / off-beat / busy patterns — and now and
+  // then a broken one (wrong length, odd slot count, junk values).
+  const gRoll = r.next();
+  if (gRoll < 0.5) {
+    const pick = () => (r.next() < 0.6 ? r.range(0.5, 1) : r.next());
+    const pat = r.next();
+    an.grid = synthGrid(an.beats.length, {
+      phase: pick(),
+      head: pick(),
+      tail: pick(),
+      hits: pat < 0.6 ? [0] : pat < 0.75 ? [8] : pat < 0.9 ? [0, 8] : [0, 4, 8, 12],
+      headHits: r.next() < 0.2 ? [8] : undefined,
+      tailHits: r.next() < 0.2 ? [6, 0] : undefined,
+    });
+    const bad = r.next();
+    if (bad < 0.04) an.grid.slots = an.grid.slots.subarray(0, 7);
+    else if (bad < 0.08) an.grid.perBeat = 5;
+    else if (bad < 0.12) an.grid.head = NaN;
+    else if (bad < 0.16) an.grid.slots = null;
+    else if (bad < 0.2) an.grid = { phase: 'x' };
+  }
   // corrupt some fields the way a bad analysis might
   const c = r.next();
   if (c < 0.03) an.cues.end = an.cues.start; // empty usable region
@@ -347,7 +392,7 @@ export function randomAnalysis(r) {
 }
 
 /** A crate that looks like a real playlist: tempo clusters, mostly steady grids, some awkward tracks. */
-export function synthCrate(r, n, { full = false } = {}) {
+export function synthCrate(r, n, { full = false, grid = false } = {}) {
   const tracks = [];
   for (let i = 0; i < n; i++) {
     const u = r.next();
@@ -374,6 +419,17 @@ export function synthCrate(r, n, { full = false } = {}) {
         drop: r.next() < 0.6 ? r.range(duration * 0.15, duration * 0.6) : null,
       }),
     });
+    if (grid) {
+      // like a real crate: most tracks clear at both ends, some syncopated at one, a few off-beat throughout
+      const u2 = r.next();
+      const an = tracks[i].analysis;
+      const clear = () => r.range(0.55, 1);
+      const murky = () => r.range(0, 0.3);
+      if (u2 < 0.6) an.grid = synthGrid(an.beats.length, { phase: clear(), head: clear(), tail: clear() });
+      else if (u2 < 0.75) an.grid = synthGrid(an.beats.length, { phase: clear(), head: murky(), tail: clear(), headHits: [8, 0] });
+      else if (u2 < 0.9) an.grid = synthGrid(an.beats.length, { phase: clear(), head: clear(), tail: murky(), tailHits: [6, 12] });
+      else an.grid = synthGrid(an.beats.length, { phase: murky(), head: murky(), tail: murky(), hits: [8] });
+    }
   }
   return tracks;
 }

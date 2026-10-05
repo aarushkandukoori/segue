@@ -35,6 +35,33 @@ function defaultPxPerSec(cssWidth) {
   return 150;
 }
 
+// ── a cued deck ──────────────────────────────────────────────────────────────────────────────────
+// The lanes are time-aligned: a track that starts in 15 s would sit 15 s to the right of the playhead,
+// far outside the display, and its lane would be a black rectangle for most of every solo. So a deck
+// that has not started yet is PARKED the way DJ software shows a cued record: its entry point (where
+// it will come in) rests on the playhead, dimmed, with no beat ticks — it is not on the set's clock
+// yet, and ticks would falsely read as "these grids do not line up". Shortly before it starts the deck
+// is pulled back to where the clock says it belongs (WIND seconds, like a hand winding a record back
+// before letting it go) and from then on it runs in time-aligned, ticks showing, for the last
+// `approach` seconds: the part where you can watch the two grids meet.
+const WIND = 0.9;
+const TICK_FADE = 0.35;
+
+/**
+ * How far a cued deck has moved from "parked" (0) to "on the set's clock" (1), given the seconds of set
+ * time until it starts. Continuous: 0 while parked, an eased 0 → 1 during the pull-back, 1 for the
+ * final approach (and for a deck that is already running).
+ * @param {number} startsIn  seconds until the deck starts
+ * @param {number} approach  length of the time-aligned run-in, seconds
+ * @param {number} [wind]    length of the pull-back before it, seconds
+ */
+export function cuedBlend(startsIn, approach, wind = WIND) {
+  if (!(startsIn > approach)) return 1;
+  if (!(startsIn < approach + wind)) return 0;
+  const u = (approach + wind - startsIn) / wind;
+  return u * u * (3 - 2 * u);
+}
+
 /**
  * @param {HTMLCanvasElement} canvas  sized by CSS; this module owns its bitmap size
  * @param {{ pxPerSec?: (cssWidth:number)=>number, labels?: boolean }} [opts]
@@ -45,7 +72,7 @@ export function createWaves(canvas, opts = {}) {
   const showLabels = opts.labels !== false;
 
   // All geometry in device pixels.
-  const geo = { W: 0, H: 0, dpr: 1, laneH: 0, railHalf: 0, th: 0, colPx: 1, cx: 0 };
+  const geo = { W: 0, H: 0, dpr: 1, laneH: 0, railHalf: 0, th: 0, colPx: 1, cx: 0, approach: 3 };
   const lutLow = new Uint16Array(256);
   const lutMid = new Uint16Array(256);
   const lutHigh = new Uint16Array(256);
@@ -70,6 +97,9 @@ export function createWaves(canvas, opts = {}) {
     markers: [],
     lastPos: NaN,
     lastAud: NaN,
+    // what the last paint showed (read by tests): buffer position on the playhead, and "on the clock" 0..1
+    shownPos: NaN,
+    shownAligned: 1,
   }));
 
   function dropTiles(dk, keepPool) {
@@ -98,6 +128,9 @@ export function createWaves(canvas, opts = {}) {
     canvas.width = W;
     canvas.height = H;
     geo.colPx = (pxPerSecFor(cssW) * dpr) / 100;
+    // a cued deck runs in from 60 % of the way to the right-hand edge: long enough to watch the grids
+    // meet, short enough that the lane is not empty for long (2.3 s on a phone, 4.3 s at 1440 px)
+    geo.approach = clamp((0.6 * (cssW / 2)) / pxPerSecFor(cssW), 1.5, 4.5);
     // Resizing a canvas resets its context state, so it is (re)configured here.
     ctx.imageSmoothingQuality = 'medium';
     if (heightChanged) {
@@ -292,12 +325,33 @@ export function createWaves(canvas, opts = {}) {
   function drawDeck(dk, fd) {
     if (!dk.view) return;
     const { W, H, cx, laneH, th, colPx, dpr } = geo;
-    const pos = fd ? fd.pos : dk.restPos;
+    let pos = fd ? fd.pos : dk.restPos;
     const aud = fd ? clamp01(fd.audible) : 0;
     // The x axis is SET time, not buffer time: a deck pitched to 0.976× is drawn 1/0.976 wider, so two
     // beat-matched decks have the same on-screen beat spacing and their grids line up across the whole
     // display (not just at the playhead). Clamped so a brake / spinback does not zoom absurdly.
     const rate = fd && fd.rate > 0 ? clamp(fd.rate, 0.7, 1.4) : 1;
+    // `aligned`: 0 while the deck is parked (see "a cued deck" above), 1 once it is on the set's clock.
+    let aligned = 1;
+    const startsIn = fd ? fd.startsIn : 0;
+    if (startsIn > 0 && startsIn < Infinity) {
+      const w = cuedBlend(startsIn, geo.approach);
+      if (w < 1) {
+        // pos is the "virtual" position before the start, so the entry point is startsIn further on.
+        // (Should a plan enter before the first sample, the first sample is what gets parked.)
+        const entry = pos + startsIn * rate;
+        const parked = entry > 0 ? entry : 0;
+        pos = parked + (pos - parked) * w;
+      }
+      aligned = clamp01((geo.approach - startsIn) / TICK_FADE);
+    } else if (startsIn < 0 && pos < 0) {
+      // The caller does not say when the deck starts; all that is known is that the track has not
+      // begun. Park its first sample on the playhead until the clock gets there.
+      pos = 0;
+      aligned = 0;
+    }
+    dk.shownPos = pos;
+    dk.shownAligned = aligned;
     // colPx is device px per 1/100 s; a wave with a different perSec has proportionally narrower columns.
     const pxPerCol = (colPx * 100) / dk.perSec / rate;
     const x0 = cx - pos * dk.perSec * pxPerCol;
@@ -305,7 +359,7 @@ export function createWaves(canvas, opts = {}) {
     const cB = Math.min(dk.cols, Math.ceil((W - x0) / pxPerCol));
     if (cB > cA) {
       const y = dk.i === 0 ? 0 : H - th;
-      ctx.globalAlpha = 0.34 + 0.66 * aud;
+      ctx.globalAlpha = 0.26 + 0.08 * aligned + 0.66 * aud;
       ctx.imageSmoothingEnabled = pxPerCol < 1 || Math.abs(pxPerCol - Math.round(pxPerCol)) > 1e-3;
       const t0 = Math.floor(cA / TILE_COLS);
       const t1 = Math.floor((cB - 1) / TILE_COLS);
@@ -321,7 +375,7 @@ export function createWaves(canvas, opts = {}) {
     // ticks touch tip-to-tip when the grids are aligned. Drawn per frame (a few dozen rects) rather than
     // baked into the tiles so they stay crisp at any scale and readable even on a silent, cued deck.
     const beats = dk.beats;
-    if (beats) {
+    if (beats && aligned > 0) {
       const pxPerSec = dk.perSec * pxPerCol;
       const mid = Math.floor(H / 2);
       const railHalf = geo.railHalf;
@@ -330,7 +384,7 @@ export function createWaves(canvas, opts = {}) {
       const wDown = Math.max(2, Math.round(2.5 * dpr));
       const pal = DECK_COLORS[dk.i];
       const tR = (W - x0) / pxPerSec;
-      ctx.globalAlpha = 0.5 + 0.5 * aud;
+      ctx.globalAlpha = (0.5 + 0.5 * aud) * aligned;
       let down = true;
       ctx.fillStyle = pal.tick;
       for (let i = firstBeatAtOrAfter(beats, -x0 / pxPerSec - 0.05); i < beats.length && beats[i] <= tR; i++) {
@@ -361,8 +415,8 @@ export function createWaves(canvas, opts = {}) {
   // Copy of the last frame handed to draw(), so a resize (which clears the bitmap) can repaint at once
   // instead of showing an empty canvas until the next frame arrives.
   const held = [
-    { on: false, pos: 0, audible: 0, rate: 1 },
-    { on: false, pos: 0, audible: 0, rate: 1 },
+    { on: false, pos: 0, audible: 0, rate: 1, startsIn: 0 },
+    { on: false, pos: 0, audible: 0, rate: 1, startsIn: 0 },
   ];
   let heldPhase = 1;
   let everDrawn = false;
@@ -374,12 +428,18 @@ export function createWaves(canvas, opts = {}) {
     h.pos = fd.pos;
     h.audible = fd.audible;
     h.rate = fd.rate > 0 ? fd.rate : 1;
+    // −1 = not given (see draw()); 0 = running
+    h.startsIn = fd.startsIn === undefined ? -1 : fd.startsIn > 0 ? fd.startsIn : 0;
   }
 
   /**
    * Paint one frame.
-   * @param {{pos:number, audible:number, rate?:number}|null} fd0
-   * @param {{pos:number, audible:number, rate?:number}|null} fd1
+   * `startsIn` (optional): seconds of set time until that deck starts playing — > 0 only while it is
+   * cued, 0 once it runs; `pos` is then the virtual position positionAt() gives before the start.
+   * When the field is absent a deck with pos < 0 is still parked (first sample on the playhead), but
+   * it cannot be shown running in ahead of its start.
+   * @param {{pos:number, audible:number, rate?:number, startsIn?:number}|null} fd0
+   * @param {{pos:number, audible:number, rate?:number, startsIn?:number}|null} fd1
    * @param {number} [beatPhase]  0..1, pulses the playhead
    */
   function draw(fd0, fd1, beatPhase = 1) {
@@ -399,8 +459,8 @@ export function createWaves(canvas, opts = {}) {
     // Nothing moved (paused) → keep the last bitmap.
     const p0 = fd0 ? fd0.pos : -1;
     const p1 = fd1 ? fd1.pos : -1;
-    const a0 = fd0 ? fd0.audible + fd0.rate : -1;
-    const a1 = fd1 ? fd1.audible + fd1.rate : -1;
+    const a0 = fd0 ? fd0.audible + fd0.rate + fd0.startsIn : -1;
+    const a1 = fd1 ? fd1.audible + fd1.rate + fd1.startsIn : -1;
     if (!dirty && p0 === decks[0].lastPos && p1 === decks[1].lastPos && a0 === decks[0].lastAud && a1 === decks[1].lastAud) {
       return;
     }
@@ -486,7 +546,12 @@ export function createWaves(canvas, opts = {}) {
     },
     hasDeck: (i) => !!decks[i].view,
     /** @internal test hook */
-    _stats: () => ({ tiles: [decks[0].tiles.size, decks[1].tiles.size], pool: pool.length, geo: { ...geo } }),
+    _stats: () => ({
+      tiles: [decks[0].tiles.size, decks[1].tiles.size],
+      pool: pool.length,
+      geo: { ...geo },
+      shown: decks.map((dk) => ({ pos: dk.shownPos, aligned: dk.shownAligned })),
+    }),
   };
 }
 

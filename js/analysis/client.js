@@ -1,6 +1,7 @@
 // Main-thread front end of the analysis: AudioBuffer in → Analysis out.
 //
 //   1. cache lookup (memory → IndexedDB), keyed by `key` + ANALYSIS_VERSION
+//      (analyses of the user's own files stay in memory: see isPrivateKey)
 //   2. downmix to mono + resample to the analysis rate on the main thread, in ≤ ~8 ms slices
 //      (a decoded 5-minute stereo buffer is ~115 MB; only the 26 MB mono copy leaves this thread)
 //   3. analyzeTrack in a module Worker (pool of 2); if Workers cannot be used — or one dies — the same
@@ -12,6 +13,19 @@ import { createResampler } from './dsp.js';
 const DB_NAME = 'segue-analysis';
 const STORE = 'analysis';
 const MEMORY_LIMIT = 400; // entries kept in the in-memory cache (an Analysis is ~10–100 kB)
+// Records the database may hold (previews: ~12 kB each, so about 25 MB). Found fuller than this when
+// it is opened, the store is emptied: an analysis takes a tenth of a second to redo, and a cache that
+// only ever grows is a log of every track someone has played.
+const STORE_LIMIT = 2000;
+
+/**
+ * Keys whose analyses never leave memory. A local file's key is `local:<file name>:<size>:<modified>`
+ * (sources/local.js): written to IndexedDB it would keep the names of someone's own recordings in the
+ * browser profile for good — after "nothing leaves this device", on an origin every other page of the
+ * same host can read. So those live for the session only.
+ * @param {string} key
+ */
+export const isPrivateKey = (key) => String(key).startsWith('local:');
 const SLICE_MS = 8;
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -133,7 +147,7 @@ function openDatabase() {
 /**
  * @param {{workers?: number}} [options]  workers: pool size (default 2); 0 = always analyse on the main thread
  * @returns {{
- *   analyze(buffer: AudioBuffer, opts: {key: string, bpmHint?: number}): Promise<import('./analyze.js').Analysis>,
+ *   analyze(buffer: AudioBuffer, opts: {key: string, bpmHint?: number}): Promise<import('./analyze.js').Analysis>,   // cached by key: memory, and IndexedDB unless isPrivateKey(key)
  *   cached(key: string): Promise<import('./analyze.js').Analysis|null>,
  *   destroy(): void,
  *   readonly stats: {cacheHits:number, worker:number, main:number, workerFailures:number, storage:'indexeddb'|'memory'|'pending'}
@@ -155,22 +169,34 @@ export function createAnalyzer({ workers = 2 } = {}) {
     if (!dbPromise) {
       dbPromise = openDatabase().then((db) => {
         stats.storage = db ? 'indexeddb' : 'memory';
-        if (db) pruneOldVersions(db);
+        if (db) prune(db);
         return db;
       });
     }
     return dbPromise;
   };
 
-  function pruneOldVersions(db) {
+  /**
+   * Housekeeping when the database is opened: drop analyses of other versions, drop anything stored
+   * under a private key (earlier builds wrote local file names here), and start over when the store
+   * has outgrown STORE_LIMIT.
+   */
+  function prune(db) {
     try {
       const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
-      const req = store.openKeyCursor();
-      req.onsuccess = () => {
-        const cur = req.result;
-        if (!cur) return;
-        if (typeof cur.key === 'string' && !cur.key.endsWith(suffix)) store.delete(cur.key);
-        cur.continue();
+      const count = store.count();
+      count.onsuccess = () => {
+        if (count.result > STORE_LIMIT) {
+          store.clear();
+          return;
+        }
+        const req = store.openKeyCursor();
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (!cur) return;
+          if (typeof cur.key === 'string' && (!cur.key.endsWith(suffix) || isPrivateKey(cur.key))) store.delete(cur.key);
+          cur.continue();
+        };
       };
     } catch (err) {
       /* best effort */
@@ -184,6 +210,12 @@ export function createAnalyzer({ workers = 2 } = {}) {
   }
 
   async function readStored(key) {
+    if (isPrivateKey(key)) {
+      // Never written, and never read back from an earlier build's records — which the housekeeping
+      // removes when the database is opened, so open it even in a session of local files only.
+      database();
+      return null;
+    }
     const db = await database();
     if (!db) return null;
     return new Promise((resolve) => {
@@ -198,6 +230,7 @@ export function createAnalyzer({ workers = 2 } = {}) {
   }
 
   async function writeStored(key, analysis) {
+    if (isPrivateKey(key)) return;
     const db = await database();
     if (!db) return;
     try {
@@ -212,9 +245,10 @@ export function createAnalyzer({ workers = 2 } = {}) {
 
   async function cached(key) {
     if (!key) return null;
+    key = String(key);
     const hit = memory.get(key);
     if (hit) return hit;
-    const stored = await readStored(String(key));
+    const stored = await readStored(key);
     if (stored) remember(key, stored);
     return stored;
   }

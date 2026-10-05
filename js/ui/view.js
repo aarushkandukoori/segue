@@ -22,6 +22,7 @@ const SOURCE_NAMES = { spotify: 'Spotify', deezer: 'Deezer', text: 'Track list',
 const MODES = ['preview', 'short', 'medium', 'full'];
 const AUDIO_EXT = /\.(mp3|m4a|m4b|mp4|aac|wav|wave|flac|ogg|oga|opus|aif|aiff|caf|webm|weba|wma)$/i;
 const DRAWER_QUERY = '(max-width: 1179px)';
+const MODE_LOCKED_WHY = 'Previews are 30 seconds — add your own files to unlock longer plays';
 
 /**
  * @typedef {Object} ViewHandlers
@@ -68,6 +69,7 @@ export function createView(root, handlers) {
   const ticker = createTicker(R.ticker, R);
   const setlist = createSetlist(R['crate-list'], { count: R['crate-count'], empty: R['crate-empty'] });
   const attract = createAttract(R.attract, R['attract-lock'], backdrop);
+  const waveTagBox = [R.wt0, R.wt1];
   const waveTags = [R.wt0.querySelector('[data-part="t"]'), R.wt1.querySelector('[data-part="t"]')];
   /** @type {[any, any]} */
   const deckViews = [null, null];
@@ -102,9 +104,61 @@ export function createView(root, handlers) {
   }
 
   // ── landing ──────────────────────────────────────────────────────────────────────────────────
-  function hint(message) {
+  /** Where the last load was started from — a failure is reported there. '' = not from this page (a share link). */
+  let lastSource = '';
+  /** @type {HTMLElement|null} */
+  let lastChip = null;
+
+  /** Message under the link field; `invalid` also marks the field itself as the thing to correct. */
+  function hint(message, invalid = true) {
+    const bad = !!message && invalid;
     setText(R.hint, message);
-    R.field.classList.toggle('is-invalid', !!message);
+    R.field.classList.toggle('is-invalid', bad);
+    if (bad) R.input.setAttribute('aria-invalid', 'true');
+    else R.input.removeAttribute('aria-invalid');
+  }
+  function textHint(message) {
+    setText(R['text-hint'], message);
+    R.text.classList.toggle('is-invalid', !!message);
+    if (message) R.text.setAttribute('aria-invalid', 'true');
+    else R.text.removeAttribute('aria-invalid');
+  }
+  function clearErrors() {
+    hint('');
+    textHint('');
+  }
+
+  /**
+   * A load failed. Say so next to what the user used to start it, and hand that control back: the
+   * link field is focused with its text selected (paste the right link straight over it), a pasted
+   * list gets the caret back, a crate chip gets focus again. The message stays until the next edit or
+   * the next attempt — unlike a toast, it cannot time out before it has been read.
+   * Called while another screen is showing, it falls back to an error toast.
+   * @param {string} message
+   */
+  function inputError(message) {
+    const text = String(message == null ? '' : message);
+    if (!text) return;
+    if (screen !== 'landing') {
+      toast(text, 'error');
+      return;
+    }
+    clearErrors();
+    if (lastSource === 'text' && !R['text-panel'].hidden) {
+      textHint(text);
+      R.text.focus();
+      // focus alone only guarantees the box is on screen; the message sits just under it
+      R['text-panel'].scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    hint(text, lastSource === 'input');
+    if (lastSource === 'input') {
+      R.input.focus();
+      R.input.select();
+    } else if (lastSource === 'demo' && lastChip && lastChip.isConnected) {
+      lastChip.focus();
+    }
+    R.form.scrollIntoView({ block: 'nearest' });
   }
 
   function nudge(node) {
@@ -126,7 +180,8 @@ export function createView(root, handlers) {
       }
       return;
     }
-    hint('');
+    clearErrors();
+    lastSource = fromList ? 'text' : 'input';
     call('onSubmit', text);
   }
 
@@ -159,10 +214,15 @@ export function createView(root, handlers) {
   R.text.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit(R.text.value, true);
   });
+  R.text.addEventListener('input', () => textHint(''));
 
   R.demos.addEventListener('click', (e) => {
     const btn = e.target instanceof Element ? e.target.closest('button[data-demo]') : null;
-    if (btn) call('onDemo', btn.dataset.demo);
+    if (!btn) return;
+    clearErrors();
+    lastSource = 'demo';
+    lastChip = /** @type {HTMLElement} */ (btn);
+    call('onDemo', btn.dataset.demo);
   });
   R.examples.addEventListener('click', (e) => {
     const btn = e.target instanceof Element ? e.target.closest('button[data-url]') : null;
@@ -211,6 +271,8 @@ export function createView(root, handlers) {
       const skipped = all.length - audio.length;
       toast(`Skipped ${skipped} file${skipped === 1 ? '' : 's'} that ${skipped === 1 ? 'isn’t' : 'aren’t'} audio.`, 'info');
     }
+    clearErrors();
+    lastSource = 'files';
     call('onFiles', audio);
   }
   R.file.addEventListener('change', () => {
@@ -304,7 +366,8 @@ export function createView(root, handlers) {
     waves.setDeck(i, deckViews[i]);
     qRemain[i] = -2;
     setText(waveTags[i], deckViews[i] ? 'Cued' : 'Empty');
-    (i === 0 ? R.wt0 : R.wt1).classList.toggle('is-empty', !deckViews[i]);
+    waveTagBox[i].classList.toggle('is-empty', !deckViews[i]);
+    waveTagBox[i].classList.toggle('is-cued', !!deckViews[i]);
     setlist.setDecks(deckViews);
     syncTransitionSides();
     soloCheck = 0;
@@ -336,9 +399,12 @@ export function createView(root, handlers) {
     soloCheck = 0;
   }
 
-  /** @param {any[]} items SetlistItem[] */
-  function setSetlist(items) {
-    setlist.set(items);
+  /**
+   * @param {any[]} items SetlistItem[]
+   * @param {{crate?: number}} [info] crate: number of different playable tracks, for the header
+   */
+  function setSetlist(items, info) {
+    setlist.set(items, info);
   }
 
   // Setlist drawer (docked column on wide screens, drawer / bottom sheet below that).
@@ -431,6 +497,14 @@ export function createView(root, handlers) {
     tp.mode = input.value;
     call('onMode', input.value);
   });
+  // Locked (30-second previews): a tooltip is no explanation on a touch screen, so a tap on the locked
+  // control — or on the chip that stands in for it on compact layouts — says why. (The CSS lets taps
+  // fall through the disabled radios; a disabled control would swallow them.)
+  const explainMode = () => toast(MODE_LOCKED_WHY, 'info');
+  R.mode.addEventListener('click', () => {
+    if (tp.modeEnabled === false) explainMode();
+  });
+  press(R['mode-note'], explainMode);
   paintVibe(0.5);
   paintVolume(0.9);
 
@@ -490,7 +564,11 @@ export function createView(root, handlers) {
       tp.modeEnabled = modeEnabled;
       R.mode.disabled = !modeEnabled;
       R.mode.classList.toggle('is-locked', !modeEnabled);
-      R.mode.title = modeEnabled ? 'How long each track plays before the next blend' : 'Previews are 30 seconds — add your own files to unlock longer plays';
+      R.mode.title = modeEnabled ? 'How long each track plays before the next blend' : MODE_LOCKED_WHY;
+      R['mode-note'].hidden = modeEnabled;
+      R['mode-note'].title = MODE_LOCKED_WHY;
+      // lets the phone layout give a live control a row of its own
+      R.transport.classList.toggle('is-mode-live', modeEnabled);
     }
   }
 
@@ -502,7 +580,8 @@ export function createView(root, handlers) {
     const text = String(message == null ? '' : message);
     if (!text) return;
     const type = kind === 'error' || kind === 'success' ? kind : 'info';
-    const ttl = type === 'error' ? 7000 : 4200;
+    // an error is usually an instruction: give a long one the time it takes to read (≈ 60 ms a character)
+    const ttl = type === 'error' ? Math.min(15000, Math.max(7000, 2500 + text.length * 60)) : 4200;
     const id = `${type}|${text}`;
     const dismiss = () => {
       const t = liveToasts.get(id);
@@ -563,13 +642,17 @@ export function createView(root, handlers) {
   let qElapsed = -1;
   let isLong = false;
   let lastNow = 0;
+  let lastT = NaN;
   let locked = false;
   let lockFor = 0;
   let soloCheck = 0;
 
   function paintLock(d0, d1, playing, dt) {
     let ok = false;
-    if (playing && d0 && d1) {
+    // "Beat lock" is a claim about two tracks you can hear: a deck that is only cued (silent, parked in
+    // its lane) may well sit in phase by arithmetic, but nothing is locked to anything yet.
+    const heard = locked ? 0.02 : 0.04;
+    if (playing && d0 && d1 && d0.audible > heard && d1.audible > heard) {
       const a = waves.beatPhaseAt(0, d0.pos);
       const b = waves.beatPhaseAt(1, d1.pos);
       if (a >= 0 && b >= 0) {
@@ -586,7 +669,13 @@ export function createView(root, handlers) {
     }
   }
 
-  /** @param {any} f FrameState */
+  /**
+   * @param {any} f FrameState (SPEC.md §4). One optional addition per DeckFrame:
+   *   `startsIn` — seconds of set time until that deck's play starts: > 0 while the deck is cued (loaded,
+   *   silent, not started), 0 once it runs. With it the cued deck's waveform is parked in its lane and
+   *   counted down ("Cued · in 0:14") instead of sitting off-screen; without it the view can only tell
+   *   that a deck has not begun from a negative `pos`, and parks it without the run-in or the countdown.
+   */
   function frame(f) {
     if (screen !== 'stage' || !f || !f.decks) return;
     const now = performance.now();
@@ -604,7 +693,12 @@ export function createView(root, handlers) {
     deckUi[1].frame(d1);
     mixer.frame(f, d0 ? waves.ampAt(0, d0.pos) : 0, d1 ? waves.ampAt(1, d1.pos) : 0, dt);
     ticker.frame(f.t);
-    paintLock(d0, d1, playing, dt);
+    // "In phase for half a second" is measured on the set's clock: what the lamp says must not depend
+    // on how the frames happen to be spaced in real time (a burst after a stall, a coarse timer).
+    let dtSet = f.t - lastT;
+    lastT = f.t;
+    if (!(dtSet > 0) || dtSet > 0.25) dtSet = dt;
+    paintLock(d0, d1, playing, dtSet);
 
     const es = f.elapsed > 0 ? Math.floor(f.elapsed) : 0;
     if (es !== qElapsed) {
@@ -615,12 +709,23 @@ export function createView(root, handlers) {
       const v = deckViews[i];
       const d = i === 0 ? d0 : d1;
       if (!v || !d) continue;
-      // a cued deck reports a "virtual" position before its start: never show more than the track's length
-      const left = Math.ceil(v.duration - (d.pos > 0 ? d.pos : 0));
-      const rem = left > 0 ? (left < 35999 ? left : 35999) : 0;
-      if (rem !== qRemain[i]) {
-        qRemain[i] = rem;
-        setText(waveTags[i], `−${fmtTime(rem)}`);
+      // One number per state, so the text is only rebuilt when it changes:
+      //   ≥ 0   playing, that many seconds left
+      //   −3    cued, start time not known (no startsIn; the "virtual" position before the start is < 0)
+      //   ≤ −10 cued, starts in (−code − 10) seconds — "time left" would be a clock that is not running
+      let code;
+      if (d.startsIn > 0 && d.startsIn < Infinity) {
+        const wait = Math.ceil(d.startsIn);
+        code = -10 - (wait < 35999 ? wait : 35999);
+      } else if (d.pos < 0) code = -3;
+      else {
+        const left = Math.ceil(v.duration - d.pos);
+        code = left > 0 ? (left < 35999 ? left : 35999) : 0;
+      }
+      if (code !== qRemain[i]) {
+        qRemain[i] = code;
+        setText(waveTags[i], code >= 0 ? `−${fmtTime(code)}` : code === -3 ? 'Cued' : `Cued · in ${fmtTime(-code - 10)}`);
+        waveTagBox[i].classList.toggle('is-cued', code < 0);
       }
     }
     let rs = 0;
@@ -667,6 +772,7 @@ export function createView(root, handlers) {
     setSetlist,
     setTransport,
     toast,
+    inputError,
     frame,
     destroy,
     /** @internal test hook: waveform tile-cache statistics */

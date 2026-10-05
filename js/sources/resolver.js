@@ -6,7 +6,7 @@ import { sharedDeezer } from './deezer.js';
 import { sharedItunes } from './itunes.js';
 import { localKey } from './local.js';
 import { ACCEPT_SCORE, CONFIDENT_SCORE, artistScore, bestMatch, normalizeTitle, parseTitle, primaryArtist } from './match.js';
-import { SourceError, UNKNOWN_ARTIST, abortError, cleanText, httpsUrl, isAbort, request, sleep, throwIfAborted } from './util.js';
+import { SourceError, UNKNOWN_ARTIST, abortError, cleanText, createPulse, download, httpsUrl, isAbort, sleep, throwIfAborted } from './util.js';
 
 /**
  * code:
@@ -26,8 +26,17 @@ export class ResolveError extends Error {
   }
 }
 
-const AUDIO_TIMEOUT_MS = 20000;
+// A preview download is given up on when it stops moving, not when it is slow. The conductor fetches
+// three at a time, and three ~0.5 MB clips do not fit through a 400 kbit/s connection in any fixed
+// 20 seconds — cutting them off there threw away 70 % finished downloads and started them again
+// from zero, over and over. So: no bytes at all for AUDIO_IDLE_MS, on any of the downloads under
+// way (the CDNs send parallel files mostly one after the other, so "this one" being quiet only
+// means it is waiting its turn), means the connection is dead; AUDIO_TOTAL_MS is a backstop
+// against a server that drips forever and a single file that is stuck while the others flow.
+const AUDIO_IDLE_MS = 15000;
+const AUDIO_TOTAL_MS = 120000;
 const MIN_AUDIO_BYTES = 2048; // anything smaller is an error page, not 30 s of audio
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // a 30-second clip is about 1 MB; this is not one
 const PRECISE_OFF_MS = 10 * 60 * 1000;
 const PRECISE_MISS_LIMIT = 2;
 const SEARCH_LIMIT = 15;
@@ -135,6 +144,7 @@ export function createResolver(cfg = {}) {
   let preciseMisses = 0;
   let preciseOffUntil = 0;
   const stats = { deezer: 0, itunes: 0, noMatch: 0, requests: 0 };
+  const audioPulse = createPulse(); // every audio download of this resolver; see download()
 
   const remember = (key, value) => {
     if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
@@ -394,9 +404,11 @@ export function createResolver(cfg = {}) {
       let res = null;
       let failure = null;
       try {
-        res = await request(url, { signal, timeoutMs: AUDIO_TIMEOUT_MS, as: 'arrayBuffer', fetchImpl: cfg.fetchImpl });
+        res = await download(url, { signal, idleMs: AUDIO_IDLE_MS, totalMs: AUDIO_TOTAL_MS, maxBytes: MAX_AUDIO_BYTES, pulse: audioPulse, fetchImpl: cfg.fetchImpl });
       } catch (err) {
         if (isAbort(err)) throw err;
+        // Not a network hiccup, and a second copy would be just as big.
+        if (err instanceof SourceError && err.code === 'too-large') throw new ResolveError('no-audio', 'That file is far too large to be a preview clip.', { cause: err });
         failure = err;
       }
       if (res && res.ok && res.body && res.body.byteLength > MIN_AUDIO_BYTES) return res.body;

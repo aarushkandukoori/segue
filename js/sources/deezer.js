@@ -114,7 +114,9 @@ export function createDeezer(cfg = {}) {
           await sleep(400, opts.signal);
           continue; // one retry for a flaky network / timeout
         }
-        if (err instanceof SourceError) throw err;
+        // The JSONP transport's own 'unreachable' is a bare "Could not reach Deezer." — replace it with
+        // the message that tells the user what to do; any other typed error already says it.
+        if (err instanceof SourceError && err.code !== 'unreachable') throw err;
         throw new SourceError('unreachable', "Couldn't reach Deezer — check your connection and try again.", { cause: err, detail: path });
       }
       const error = data && data.error;

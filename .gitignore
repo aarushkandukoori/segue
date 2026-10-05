@@ -2,6 +2,19 @@ node_modules/
 tests/fixtures/
 handoff/
 .DS_Store
-*.wav
-*.log
 .claude/
+*.log
+
+# Audio never belongs in this repository (test audio is generated or downloaded into tests/fixtures/).
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.opus
+*.aiff
+*.webm
+
+# One-off scratch scripts next to the e2e suites.
+tests/e2e/_*.mjs

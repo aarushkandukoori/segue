@@ -4,7 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPlanner } from '../js/dj/planner.js';
 import { evalParam, positionAt, rateAt } from '../js/dj/timeline.js';
-import { BRAKE_FLOOR, CUT_S, FX_DEFAULTS, INIT_LEAD_S, KILL_DB, PREROLL_S, RECIPES, STRIP_DEFAULTS, SWAP_AHEAD_S, TYPES, createLane, labelFor, preferredLengths } from '../js/dj/transitions.js';
+import { BRAKE_FLOOR, CUT_S, FX_DEFAULTS, INIT_LEAD_S, KILL_DB, PREROLL_S, RECIPES, REOPEN_AHEAD_S, RISER_GAIN, STRIP_DEFAULTS, SWAP_AHEAD_S, TRICKS, TYPES, createLane, labelFor, preferredLengths } from '../js/dj/transitions.js';
+import { createRng } from '../js/util/rng.js';
 import { dbToGain } from '../js/dj/timeline.js';
 import { ALL_TYPES, applyOut, checkBusSessions, checkTransition, synthAnalysis } from './helpers/dj-synth.js';
 
@@ -162,6 +163,45 @@ test('eqBlend: highs, then mids, then bass', () => {
   assert.ok(Math.abs(tr.marks.find((m) => m.label === 'Bass').t - beat(10)) < 1e-6);
 });
 
+test('eqBlend over 8 beats (the usual length on previews): the bass still changes hands into a bar line', () => {
+  // 0.75 × 8 = beat 6 = the THIRD beat of a bar: the low end used to change hands mid-phrase in every
+  // 8-beat EQ blend. It now completes on beat 4, the bar line in the middle, with the highs and mids
+  // moved up so the order stays highs → mids → bass.
+  const { tr, a, b, bad, A, out } = make('eqBlend', 8);
+  assert.deepEqual(bad, []);
+  assert.equal(tr.beats, 8);
+  const beat = (k) => tr.tStart + ((tr.tEnd - tr.tStart) * k) / 8;
+  assert.equal(a('low', beat(2) - 1e-6), 0, 'bass untouched until two beats before the line');
+  assert.equal(b('low', beat(2) - 1e-6), KILL_DB);
+  near(a('low', beat(3) - SWAP_AHEAD_S / 2), -8, 1e-6, 'basses cross low, never both up');
+  near(b('low', beat(3) - SWAP_AHEAD_S / 2), -8, 1e-6);
+  assert.equal(a('low', beat(4)), KILL_DB);
+  assert.equal(b('low', beat(4)), 0);
+  // … and beat 4 of the blend is a bar line of the outgoing track
+  const pos = positionAt(applyOut(out, { ...tr, aEndAt: null }), beat(4));
+  const i = A.beats.findIndex((x) => Math.abs(x - pos) < 2e-3);
+  assert.ok(i >= 0 && (i - A.downbeat) % 4 === 0, `beat ${i} of the outgoing track (downbeat ${A.downbeat})`);
+  const reach = (fn, p, target) => {
+    for (let t = tr.tStart; t <= tr.tEnd; t += 0.005) if (Math.abs(fn(p, t) - target) < 1e-9) return t;
+    return Infinity;
+  };
+  const [hi, mid, low] = [reach(b, 'high', 0), reach(b, 'mid', 0), reach(b, 'low', 0)];
+  assert.ok(hi < mid && mid < low && low <= beat(4) + 1e-6, `highs ${hi}, mids ${mid}, bass ${low}; line at ${beat(4)}`);
+  assert.ok(reach(a, 'high', -22) < reach(a, 'mid', -16) && reach(a, 'mid', -16) < reach(a, 'low', KILL_DB));
+  assert.ok(Math.abs(tr.marks.find((m) => m.label === 'Bass').t - beat(2)) < 1e-6);
+  assert.equal(a('gain', beat(4)), 1, 'outgoing at full level until the bass is handed over');
+  assert.equal(a('gain', tr.tEnd), 0);
+  assert.equal(b('gain', beat(2)), 1, 'incoming is up before its bass arrives');
+  // 16 and 32 beats keep the three-quarter line (a bar line there); a 4-beat blend (Skip) has none inside
+  for (const [L, k] of [[16, 12], [32, 24], [4, 3]]) {
+    const m = make('eqBlend', L, L === 4 ? { quick: true } : {});
+    assert.equal(m.tr.beats, L);
+    const bt = (x) => m.tr.tStart + ((m.tr.tEnd - m.tr.tStart) * x) / L;
+    assert.equal(m.b('low', bt(k)), 0, `${L} beats: bass handed over by beat ${k}`);
+    assert.equal(m.b('low', bt(k - Math.min(2, L / 4)) - 1e-6), KILL_DB);
+  }
+});
+
 test('filterBlend: high-pass sweeps up exponentially across the whole transition, fader closes on the last beat', () => {
   const { tr, a, b, beat } = make('filterBlend', 16);
   let prev = 0;
@@ -270,7 +310,9 @@ test('spinback: main source muted, reverse one-shot rewinds ~1–1.5 s with a ra
     assert.ok(fast >= 2.4 && fast <= 3.4 && slow >= 0.9 && slow <= 1.3, `rates ${rev[0].rate0} → ${rev[0].rate1}`);
     shapes[rev[0].rate0 > rev[0].rate1 ? 'slowing' : 'windingUp']++;
     near(rev[0].len, (dur * (rev[0].rate0 + rev[0].rate1)) / 2, 1e-9, 'rewinds exactly the audio under the rate ramp');
-    assert.ok(a('gain', tr.tStart + dur * 0.45) === 1 && a('gain', tr.tEnd) === 0, 'fader closes over the second half');
+    // (closed from the middle, the spin had faded out 150 – 300 ms before the drop it winds into)
+    assert.ok(a('gain', tr.tStart + dur * 0.75 - 1e-6) === 1 && a('gain', tr.tEnd) === 0, 'fader closes over the last quarter only');
+    near(a('gain', tr.tStart + dur * 0.875), 0.5, 1e-6);
     assert.ok(tr.fx.some((f) => f.kind === 'impact' && f.t === tr.tEnd));
     assert.equal(tr.synced, false);
   }
@@ -294,6 +336,9 @@ test('brake: outgoing rate ramps to ~0 over about a beat via aRate, incoming ent
     const pos = positionAt({ ...braked, endAt: null }, tr.tEnd);
     assert.ok(pos < free && pos <= A.duration);
     assert.equal(a('gain', tr.tEnd), 0);
+    // the platter does the fading; the fader only tidies up the last fifth (from the middle it left dead air)
+    assert.equal(a('gain', tr.tStart + dur * 0.8 - 1e-6), 1);
+    near(a('gain', tr.tStart + dur * 0.9), 0.5, 1e-6);
     assert.ok(tr.play.rate.every((q) => q.v === 1));
   }
 });
@@ -326,7 +371,9 @@ test('riserDrop: riser spans the transition into the bar line, outgoing thins ou
     assert.equal(riser.length, 1);
     assert.equal(riser[0].t, tr.tStart);
     near(riser[0].t + riser[0].dur, tr.tEnd, 1e-9);
-    assert.ok(riser[0].gain >= 0.85 && riser[0].gain <= 1.2, 'riser ends about as loud as the music it lifts');
+    // (0.85 – 1.2 was "as loud as a full track" by plain RMS and 5 – 9 LU hotter by ear: tests/e2e/mix.e2e.mjs measures it)
+    assert.deepEqual(RISER_GAIN, [0.42, 0.6]);
+    assert.ok(riser[0].gain >= RISER_GAIN[0] && riser[0].gain <= RISER_GAIN[1], `riser gain ${riser[0].gain}`);
     assert.ok(tr.fx.some((f) => f.kind === 'impact' && f.t === tr.tEnd));
     assert.ok(a('hpf', tr.tEnd - 0.02) > 900);
     assert.ok(a('gain', beat(L * 0.6)) < 1 && a('gain', beat(L * 0.6)) >= 0.7);
@@ -334,6 +381,86 @@ test('riserDrop: riser spans the transition into the bar line, outgoing thins ou
     gaps.add(a('gain', beat(L - 0.25)) === 0 ? 'gap' : 'none');
   }
   assert.deepEqual([...gaps].sort(), ['gap', 'none'], 'the half-beat breath before the drop is a seeded option');
+});
+
+test('impact one-shots: sized to the music they announce — smaller than a doubled downbeat, smaller still into a quiet entry', () => {
+  const impactOf = (tr) => tr.fx.find((f) => f.kind === 'impact' && f.t === tr.tEnd);
+  const RANGE = { spinback: [0.3, 0.42], riserDrop: [0.3, 0.42], cut: [0.27, 0.39], loopRoll: [0.27, 0.39] };
+  // a track that enters at (or within ordinary dynamics of) its full level: the plain range
+  for (const curve of [undefined, new Array(200).fill(1), new Array(200).fill(0.92)]) {
+    for (const [type, [lo, hi]] of Object.entries(RANGE)) {
+      const seen = [];
+      for (let n = 0; n < 40; n++) {
+        const { tr } = make(type, type === 'cut' ? 0 : undefined, { seed: `imp${n}`, vibe: 1, bpmB: 160, b: curve ? { energyCurve: curve } : {} });
+        assert.equal(tr.type, type);
+        const f = impactOf(tr);
+        if (f) seen.push(f.gain);
+      }
+      assert.ok(seen.length >= 15, `${type}: ${seen.length} impacts in 40`);
+      assert.ok(Math.min(...seen) >= lo && Math.max(...seen) <= hi, `${type}: ${Math.min(...seen)} … ${Math.max(...seen)}`);
+      assert.ok(Math.max(...seen) - Math.min(...seen) > 0.03, 'seeded variety');
+    }
+  }
+  // a quiet entry (15 dB under the track's loud parts: an intro, a breakdown): the boom follows it down
+  const quiet = new Array(200).fill(0.5);
+  for (const [type, [lo, hi]] of Object.entries(RANGE)) {
+    for (let n = 0; n < 40; n++) {
+      const o = { seed: `imp${n}`, vibe: 1, bpmB: 160 };
+      const full = impactOf(make(type, type === 'cut' ? 0 : undefined, o).tr);
+      const soft = impactOf(make(type, type === 'cut' ? 0 : undefined, { ...o, b: { energyCurve: quiet } }).tr);
+      assert.equal(!!full, !!soft, 'the level changes, not whether there is one');
+      if (!full) continue;
+      // 15 dB under → 12 dB beyond the 3 dB of ordinary dynamics → 0.7 × 12 = 8.4 dB less boom
+      near(20 * Math.log10(soft.gain / full.gain), -8.4, 1e-6, type);
+      assert.ok(soft.gain < lo && soft.gain > 0.1 * hi);
+    }
+  }
+  // the curve is read where the track ENTERS: a quiet stretch somewhere else changes nothing
+  const lateDip = new Array(200).fill(1).fill(0.3, 60);
+  const o = { seed: 'imp-late', vibe: 1, bpmB: 160 };
+  assert.equal(impactOf(make('spinback', undefined, { ...o, b: { energyCurve: lateDip } }).tr).gain, impactOf(make('spinback', undefined, o).tr).gain);
+  // garbage in the curve is not a level
+  for (const junk of [[NaN, NaN, NaN], ['x'], [5, 5, 5], [-3]]) {
+    const g = impactOf(make('spinback', undefined, { ...o, b: { energyCurve: junk } }).tr).gain;
+    assert.ok(g >= 0.3 * 10 ** (-0.7 * 15 / 20) - 1e-9 && g <= 0.42, `curve ${JSON.stringify(junk)} → ${g}`);
+  }
+});
+
+test('"Smooth" drops the optional boom: cuts and rolls carry no impact at vibe 0, most of them at vibe 1', () => {
+  const share = (type, vibe) => {
+    let k = 0;
+    for (let n = 0; n < 200; n++) if (make(type, type === 'cut' ? 0 : 4, { seed: `boom${n}`, vibe }).tr.fx.some((f) => f.kind === 'impact')) k++;
+    return k / 200;
+  };
+  for (const type of ['cut', 'loopRoll']) {
+    assert.equal(share(type, 0), 0, `${type} at vibe 0`);
+    assert.ok(share(type, 0.1) > 0.05 && share(type, 0.1) < 0.3, `${type} at vibe 0.1: ${share(type, 0.1)}`);
+    assert.ok(share(type, 0.5) > 0.35 && share(type, 0.5) < 0.65, `${type} at vibe 0.5 (unchanged): ${share(type, 0.5)}`);
+    assert.ok(share(type, 1) > 0.6, `${type} at vibe 1: ${share(type, 1)}`);
+  }
+});
+
+test('Build + drop: the high-pass is fully open BEFORE the downbeat it drops on', () => {
+  // Reopened in 20 ms starting ON the downbeat, the moving filter rang with the kick: a thud up to
+  // 7 – 10 dB over the record's own low end, taken straight back out by the limiter.
+  for (const span of TRICKS.hpfBuild.spans) for (const beatSec of [0.35, 0.5, 0.85]) {
+    const lane = createLane(STRIP_DEFAULTS);
+    const marks = [];
+    const at = (k) => 10 + k * beatSec;
+    TRICKS.hpfBuild.build({ A: lane, at, rng: createRng(`build${span}`), span, marks, fx: [], beatSec });
+    const hpf = (t) => evalParam(lane.events, 'hpf', t, STRIP_DEFAULTS.hpf);
+    assert.deepEqual(marks, [{ t: at(0), label: 'Build' }, { t: at(span), label: 'Drop' }]);
+    assert.equal(hpf(at(0)), 20);
+    const top = hpf(at(span - 0.25));
+    assert.ok(top >= 700 && top <= 1300, `the lows are drained by the last quarter beat: ${top} Hz`);
+    assert.ok(hpf(at(span - 0.125)) < top && hpf(at(span - 0.125)) > 20, 'reopening during the last quarter beat');
+    assert.equal(hpf(at(span) - REOPEN_AHEAD_S), 20, 'fully open ahead of the downbeat');
+    assert.equal(hpf(at(span)), 20);
+    assert.equal(REOPEN_AHEAD_S, SWAP_AHEAD_S, 'the kick starts a little ahead of the grid: the same margin a bass swap keeps');
+    // nothing of the trick is scheduled on or after its drop
+    assert.ok(lane.events.every((e) => e.p === 'hpf' && e.t < at(span)));
+    assert.ok(at(span) - REOPEN_AHEAD_S - at(span - 0.25) >= 0.06, 'the reopening is a sweep (60 ms or more), not a snap');
+  }
 });
 
 test('first(): fade-in with an opening low-pass from the first bar line', () => {

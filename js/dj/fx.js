@@ -1,5 +1,7 @@
 // FX building blocks for the engine: seeded noise, the generated reverb impulse response, the shared
-// delay / reverb buses, the four one-shot effects (riser, impact, loop, reverse) and the iOS audio unlock.
+// delay / reverb buses, the four one-shot effects (riser, impact, loop, reverse), the iOS audio unlock,
+// and two guards: the filters that cancel a compressor's treble pre-emphasis (Firefox), and the check
+// that keeps non-finite samples of a decoded buffer out of the graph.
 //
 // The one-shot schedulers do not talk to the engine's bookkeeping directly. The engine hands them a small
 // environment object and gets back the nodes it must dispose later:
@@ -123,6 +125,137 @@ export function probeLoopLatency() {
     return extra > 0 && extra <= 1024 ? extra : 0;
   })().catch(() => 0);
   return loopProbe;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The limiter's pre-emphasis (Firefox).
+//
+// Every browser's DynamicsCompressorNode descends from one WebKit implementation. The original boosts
+// the treble in front of its level detector and takes the boost out again behind it: four first-order
+// zero/pole shelves, about +13 dB at 12 kHz. Chromium and WebKit dropped that stage long ago; Firefox
+// still runs it, so there a hi-hat 12 dB under the threshold already pulls the whole mix down.
+// The emphasis is a fixed, invertible filter, which means it can be cancelled exactly from outside:
+//
+//     in ─▶ CUT ─▶ [ BOOST ─▶ detector + gain ─▶ CUT ] ─▶ BOOST ─▶ out          [ … ] = Firefox's node
+//
+// CUT × BOOST = 1 on either side of the gain stage: the detector sees the signal as it is, and the
+// output is the input times the gain reduction. That is what the other engines' compressors do, so the
+// limiter then behaves the same everywhere (measured against Chrome: same reduction within 0.05 dB).
+
+/** The emphasis constants of the original WebKit DynamicsCompressor (and so of Firefox's). */
+const EMPHASIS = { stages: 4, stageGainDb: 4.4, stageRatio: 2, anchorHz: 15000 };
+
+/**
+ * IIRFilterNode coefficients of the compressor pre-emphasis (`boost`) and of its exact inverse (`cut`)
+ * at a sample rate. Both have unity gain at DC.
+ * @returns {{boost: {feedforward: number[], feedback: number[]}, cut: {feedforward: number[], feedback: number[]}}}
+ */
+export function emphasisFilters(sampleRate) {
+  const times = (a, b) => {
+    const out = new Array(a.length + b.length - 1).fill(0);
+    for (let i = 0; i < a.length; i++) for (let j = 0; j < b.length; j++) out[i + j] += a[i] * b[j];
+    return out;
+  };
+  const gk = 1 - EMPHASIS.stageGainDb / 20;
+  let f = EMPHASIS.anchorHz / (sampleRate / 2);
+  let num = [1];
+  let den = [1];
+  for (let i = 0; i < EMPHASIS.stages; i++) {
+    // One stage: H(z) = k (1 − zero·z⁻¹) / (1 − pole·z⁻¹), k chosen for 0 dB at 0 Hz.
+    const zero = Math.exp(-Math.PI * f * gk);
+    const pole = Math.exp((-Math.PI * f) / gk);
+    const k = (1 - pole) / (1 - zero);
+    num = times(num, [k, -k * zero]);
+    den = times(den, [1, -pole]);
+    f /= EMPHASIS.stageRatio;
+  }
+  const lead = (c, by) => c.map((v) => v / by); // feedback[0] = 1, so no browser has to normalise
+  return {
+    boost: { feedforward: num, feedback: den },
+    cut: { feedforward: lead(den, num[0]), feedback: lead(num, num[0]) },
+  };
+}
+
+/** @type {Map<number, Promise<boolean>>} one measurement per page and sample rate */
+const emphasisProbes = new Map();
+
+/**
+ * How much a compressor with `settings` pulls down a steady tone 9 dB under its threshold, in dB
+ * (0 = not at all), judged against the same tone 26 dB lower so that makeup gain cancels out.
+ * `wrapped` puts the emphasis-cancelling filters around it. Also returns the small-signal gain.
+ */
+async function compressorReduction(OAC, sampleRate, settings, wrapped) {
+  const frames = Math.ceil((0.6 * sampleRate) / 128) * 128;
+  const ctx = new OAC(2, frames, sampleRate);
+  const amp = Math.pow(10, (settings.threshold - 9) / 20);
+  const osc = ctx.createOscillator();
+  // Bright enough to show the emphasis, and not a simple fraction of the usual sample rates (a tone
+  // whose samples keep missing its crests would read lower than it is).
+  osc.frequency.value = Math.min(11000, sampleRate * 0.3);
+  const merger = ctx.createChannelMerger(2);
+  const k = wrapped ? emphasisFilters(sampleRate) : null;
+  [amp, amp / 20].forEach((a, i) => {
+    const gain = ctx.createGain();
+    const comp = ctx.createDynamicsCompressor();
+    gain.gain.value = a;
+    comp.threshold.value = settings.threshold;
+    comp.knee.value = settings.knee;
+    comp.ratio.value = settings.ratio;
+    comp.attack.value = settings.attack;
+    comp.release.value = settings.release;
+    osc.connect(gain);
+    if (k) {
+      const cut = ctx.createIIRFilter(k.cut.feedforward, k.cut.feedback);
+      const boost = ctx.createIIRFilter(k.boost.feedforward, k.boost.feedback);
+      gain.connect(cut);
+      cut.connect(comp);
+      comp.connect(boost);
+      boost.connect(merger, 0, i);
+    } else {
+      gain.connect(comp);
+      comp.connect(merger, 0, i);
+    }
+  });
+  merger.connect(ctx.destination);
+  osc.start();
+  const out = await ctx.startRendering();
+  // The last 100 ms: a fresh compressor needs a moment to open up, the same on both channels.
+  const from = frames - Math.round(0.1 * sampleRate);
+  const level = (ch) => {
+    const d = out.getChannelData(ch);
+    let s = 0;
+    for (let i = from; i < frames; i++) s += d[i] * d[i];
+    return Math.sqrt(s / (frames - from));
+  };
+  const small = level(1) / (amp / 20);
+  return { reductionDb: 20 * Math.log10(level(0) / amp / small), small };
+}
+
+/**
+ * Does this browser's DynamicsCompressorNode pre-emphasise the treble (see above), and do the filters
+ * of emphasisFilters() cancel it? Measured once per page and sample rate with two tiny offline renders
+ * (the second only where the first finds the emphasis). False wherever it cannot be measured.
+ * @param {number} sampleRate
+ * @param {{threshold: number, knee: number, ratio: number, attack: number, release: number}} settings
+ * @returns {Promise<boolean>} true = wrap the compressor in the `cut` / `boost` pair
+ */
+export function probeCompressorEmphasis(sampleRate, settings) {
+  const key = Math.round(sampleRate);
+  let probe = emphasisProbes.get(key);
+  if (!probe) {
+    probe = (async () => {
+      const OAC = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
+      if (!OAC) return false;
+      const bare = await compressorReduction(OAC, key, settings, false);
+      if (!(bare.reductionDb < -0.5)) return false; // a tone under the threshold is left alone: nothing to cancel
+      if (typeof OAC.prototype.createIIRFilter !== 'function') return false;
+      // Only trust the cure where it demonstrably works: no reduction left, level unchanged.
+      const fixed = await compressorReduction(OAC, key, settings, true);
+      return Math.abs(fixed.reductionDb) < 0.25 && Math.abs(fixed.small / bare.small - 1) < 0.01;
+    })().catch(() => false);
+    emphasisProbes.set(key, probe);
+  }
+  return probe;
 }
 
 /**
@@ -326,6 +459,87 @@ export function quietAt(buffer, pos) {
     if (Math.abs(peekBuf[0]) > 1e-4 || Math.abs(peekBuf[1]) > 1e-4) return false;
   }
   return true;
+}
+
+/** Samples beyond ±this are not audio (full scale is 1). The analysis clamps its own copy at the same value. */
+export const SAMPLE_CEILING = 8;
+const SCAN = 32768;
+let scanBuf = null;
+/** Buffers already known to be clean (checked or repaired). */
+const cleanBuffers = new WeakSet();
+
+/** Repair frames [from, to) of one channel in place. Returns how many samples had to change. */
+function repairRange(buffer, ch, from, to) {
+  const n = to - from;
+  const C = SAMPLE_CEILING;
+  // Read through copyFromChannel where it exists (see quietAt: no whole-buffer copies in Firefox).
+  const viaCopy = typeof buffer.copyFromChannel === 'function' && typeof buffer.copyToChannel === 'function';
+  let view;
+  if (viaCopy) {
+    if (!scanBuf) scanBuf = new Float32Array(SCAN);
+    view = n === SCAN ? scanBuf : scanBuf.subarray(0, n);
+    buffer.copyFromChannel(view, ch, from);
+  } else view = buffer.getChannelData(ch).subarray(from, to);
+  let i = 0;
+  for (; i < n; i++) {
+    const v = view[i];
+    if (!(v >= -C && v <= C)) break; // NaN fails both comparisons
+  }
+  if (i === n) return 0;
+  let fixed = 0;
+  for (; i < n; i++) {
+    const v = view[i];
+    if (v >= -C && v <= C) continue;
+    view[i] = v === Infinity || v === -Infinity || v !== v ? 0 : v > 0 ? C : -C;
+    fixed++;
+  }
+  if (viaCopy) buffer.copyToChannel(view, ch, from);
+  return fixed;
+}
+
+/**
+ * Make a decoded AudioBuffer safe to play, in place: NaN and ±Infinity become 0, absurd magnitudes are
+ * clamped to ±SAMPLE_CEILING. A damaged or hand-made 32-bit float file decodes to such samples, and a
+ * single NaN that reaches a filter or the delay loop stays in its state for good, silencing everything
+ * mixed afterwards. engine.addPlay() calls this itself; a buffer is only ever scanned once.
+ * Costs about a millisecond per million samples (a 4-minute stereo track: ~20 ms). For long files call
+ * sanitizeBufferAsync() right after decoding instead, then addPlay() finds the work already done.
+ * @param {AudioBuffer} buffer
+ * @returns {number} samples repaired (0 = it was clean, or had been checked before)
+ */
+export function sanitizeBuffer(buffer) {
+  if (!buffer || cleanBuffers.has(buffer)) return 0;
+  let fixed = 0;
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    for (let a = 0; a < buffer.length; a += SCAN) fixed += repairRange(buffer, ch, a, Math.min(buffer.length, a + SCAN));
+  }
+  cleanBuffers.add(buffer);
+  return fixed;
+}
+
+/**
+ * sanitizeBuffer() in slices of `sliceMs`, yielding to the event loop in between: for use right after
+ * decodeAudioData, where a long file must not freeze the page.
+ * @param {AudioBuffer} buffer
+ * @param {number} [sliceMs]
+ * @returns {Promise<number>} samples repaired
+ */
+export async function sanitizeBufferAsync(buffer, sliceMs = 6) {
+  if (!buffer || cleanBuffers.has(buffer)) return 0;
+  const clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let fixed = 0;
+  let t0 = clock();
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    for (let a = 0; a < buffer.length; a += SCAN) {
+      fixed += repairRange(buffer, ch, a, Math.min(buffer.length, a + SCAN));
+      if (clock() - t0 < sliceMs) continue;
+      await new Promise((r) => setTimeout(r, 0));
+      if (cleanBuffers.has(buffer)) return fixed; // someone played it meanwhile: addPlay() finished the job
+      t0 = clock();
+    }
+  }
+  cleanBuffers.add(buffer);
+  return fixed;
 }
 
 /**

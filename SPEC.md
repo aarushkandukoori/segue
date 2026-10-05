@@ -19,9 +19,15 @@ it in your `handoff/<area>.md` so the integrator sees it.
 - Untrusted strings (titles, artists, playlist names, anything from the network or a file) go into the
   DOM with `textContent` / attribute setters only. Never `innerHTML` with dynamic data. Image/audio/link
   URLs must be `https:` (or `blob:` for local files) before use.
-- Works in current Chrome, Safari (incl. iOS) and Firefox. AudioContext is created/resumed only inside
-  a user gesture. No `cancelAndHoldAtTime` without a fallback (Firefox lacks it). No negative
-  `playbackRate` (Chrome outputs silence).
+- Target: current Chrome, Safari (incl. iOS) and Firefox (what has actually been run is in README.md,
+  "Honest limits"). AudioContext is created/resumed only inside a user gesture. No
+  `cancelAndHoldAtTime` without a fallback (Firefox lacks it). No negative `playbackRate` (Chrome
+  outputs silence).
+- The page runs under a Content-Security-Policy (`index.html`, same in `ui-demo.html`): scripts from
+  `'self'` and `https://api.deezer.com` (JSONP) only, no inline script or style (`style="…"` attributes
+  and `<style>` elements are refused; CSSOM writes are fine), `connect-src 'self' https:`, images
+  `'self'` / `https:` / `data:` / `blob:`, media `blob:` only, workers `'self'` only, fonts from Google Fonts,
+  `object-src` / `base-uri` / `form-action` `'none'`.
 - Code style: small pure functions, JSDoc types on exports, no classes needed, no frameworks. Comments
   explain *why*, not what. `node --test` for pure logic; headless Chrome (puppeteer-core) for anything
   touching Web Audio / DOM / network-from-a-browser.
@@ -51,13 +57,15 @@ ui-demo.html                    [ui]    mock-driven harness for the view (no aud
 js/main.js                      [integrator]  bootstrap: view <-> conductor wiring, URL params, rAF loop
 js/util/rng.js                  [brain]
 js/sources/{spotify,deezer,itunes,resolver,local,text,demo,index}.js   [sources]
-js/analysis/{dsp,tempo,key,features,analyze,worker,client}.js           [analysis]
+js/analysis/{dsp,tempo,grid,key,features,analyze,worker,client}.js      [analysis]  grid.js = beat grid vs. the audible attacks (Analysis.grid)
 js/dj/timeline.js               [foundation — DONE, do not change semantics]
 js/dj/{camelot,transitions,planner}.js   [brain]
 js/dj/{engine,fx,recorder}.js   [engine]
 js/dj/conductor.js              [integrator]
-js/ui/*.js                      [ui]
+js/ui/*.js                      [ui]    (fonts.js switches the deferred Google Fonts stylesheet on; no other module touches the network)
 tests/*.test.js                 node --test (each area prefixes its files: analysis.*.test.js, dj.*.test.js, sources.*.test.js)
+tests/helpers/*.js              synthetic analyses / audio, and the evaluations on real previews (need tests/fixtures; skip without)
+tests/tools/fetch-fixtures.mjs  downloads the preview fixtures into tests/fixtures/ (never committed)
 tests/e2e/serve.mjs, browser.mjs   [foundation — DONE] static server (ephemeral port) + headless Chrome launcher
 tests/e2e/<area>.e2e.mjs        headless-Chrome scripts, exit code 0 = pass
 tests/fixtures/                 git-ignored scratch (downloaded audio etc.). NEVER commit audio.
@@ -124,10 +132,12 @@ time). "Buffer position" = seconds into a track's decoded audio.
  */
 
 /** @typedef {Object} Analysis
- * @property {number} v              ANALYSIS_VERSION
+ * @property {number} v              ANALYSIS_VERSION (2 since Analysis.grid; cached results of another version are recomputed)
  * @property {number} duration
  * @property {number} bpm            global tempo folded into [70, 180)
- * @property {number} bpmConfidence  0..1; ≥ 0.5 means "the beat grid is trustworthy enough to beat-match"
+ * @property {number} bpmConfidence  0..1; ≥ 0.5 means "the TEMPO is trustworthy enough to beat-match" (never below grid.phase once
+ *                                   that reaches 0.5: attacks that sit on the beats prove a grid). Whether two stretches may be
+ *                                   overlapped beat on beat is a second question, answered by `grid` below."
  * @property {number[]} beats        beat times, strictly increasing, covering the whole track (extrapolated on the grid through quiet parts)
  * @property {number} downbeat       index into beats of the first bar start. Bars are 4 beats: i is a downbeat iff (i - downbeat) % 4 === 0
  * @property {{pc:number, mode:'major'|'minor', name:string, camelot:string, confidence:number}} key   pc 0=C … 11=B; camelot like "8A"
@@ -138,6 +148,17 @@ time). "Buffer position" = seconds into a track's decoded audio.
  *           start/end = usable region (after a fade-in, before a fade-out / trailing silence)
  *           in = first downbeat ≥ start;  drop = downbeat with the biggest sustained energy jump, or null
  * @property {{cols:number, perSec:number, low:Uint8Array, mid:Uint8Array, high:Uint8Array}} wave   peak 0..255 per column per band, perSec = 100
+ * @property {{phase:number, head:number, tail:number, perBeat:number, slots:Uint8Array}} grid
+ *           How far the beat PHASE can be trusted (a track can have a rock-solid tempo and still carry its loud hits
+ *           between the beats). Measured on a 1 ms attack envelope that is linear in amplitude (js/analysis/grid.js).
+ *           phase       0..1 over the whole usable region: do the loud attacks sit ON the beats, clearly and all the way through?
+ *           head / tail 0..1, the same question for the first / last 16 beats of the usable region — where a preview is blended
+ *                       into and out of (the 8 beats nearest the edge count double). ≥ 0.5 = this end can be overlapped beat on beat.
+ *           perBeat     16
+ *           slots       perBeat values per beat (beats.length × perBeat), 0..255: mean attack strength in each sixteenth of every
+ *                       beat, slot 0 centred on the beat. The planner lays two tracks' slots over each other before it overlaps them.
+ *           All zero when there is no tempo to speak of. Optional for the planner: an analysis without `grid` (hand-made, tests)
+ *           is taken at its bpmConfidence.
  */
 
 /** Automation event; mirrors AudioParam scheduling. `t` is set time.
@@ -163,6 +184,7 @@ time). "Buffer position" = seconds into a track's decoded audio.
  * @property {Ev[]} events          strip automation sorted by t. MUST contain a 'set' for every param it later ramps. Grows when the outgoing transition is planned.
  * @property {number|null} endAt    set time the main source stops; null until the outgoing transition is planned
  * @property {number} soloFrom      set time its incoming transition ends
+ * @property {string} [via]         type of the transition that brought it in (planner bookkeeping; the engine ignores it)
  */
 
 /** One-shot effects.
@@ -178,7 +200,12 @@ time). "Buffer position" = seconds into a track's decoded audio.
  * @property {number} id
  * @property {'fadeIn'|'bassSwap'|'eqBlend'|'filterBlend'|'echoOut'|'reverbWash'|'cut'|'spinback'|'brake'|'loopRoll'|'riserDrop'} type
  * @property {string} label      "Bass swap · 16 beats"
- * @property {string} why        one short sentence for the UI: "126 → 124 BPM (−1.6%) · 8A → 9A"
+ * @property {string} why        one short line for the UI: "126 → 124 BPM (−1.6%) · 8A → 9A". The bracket is the incoming track's pitch
+ *                               change while matched ("±0.0%" when it rounds to none). A move that is not a beat-matched blend ends
+ *                               with the reason, true of THIS pair: "no steady beat detected in the incoming track | the outgoing
+ *                               track | either track", "tempos too far apart to match", "tempos match, but the drums would clash —
+ *                               kept apart" (held by the gate), "double-time | half-time apart, not blended", "no room left for a
+ *                               blend", "chosen for variety"
  * @property {number} from       outgoing playId, −1 for the first track
  * @property {number} to         incoming playId
  * @property {number} tStart     set time of the first audible change
@@ -193,6 +220,10 @@ time). "Buffer position" = seconds into a track's decoded audio.
  * @property {Fx[]} fx
  * @property {Ev[]} fxEvents     FX-bus automation
  * @property {{t:number, label:string}[]} marks   moments for the UI ticker ("Bass swap", "Drop", "Echo out")
+ * @property {{ok:boolean, out:number, in:number, contrast?:number}} [trust]   blends only: what the overlap gate made of the two
+ *           stretches. out / in = grid trust (0..1) of the outgoing tail / incoming head over the overlap; contrast = how much
+ *           better the two slot patterns fit beat on beat than at any other offset (only when both analyses carry slots);
+ *           ok = the gate would let this overlap through (false only on a blend that was forced, e.g. by a test).
  */
 ```
 
@@ -241,7 +272,13 @@ export function createAnalyzer({ workers?: number }): {
 }
 ```
 Budgets: 30 s preview ≤ 250 ms in the worker; 5-minute track ≤ 3 s. Must not throw on silence, on clips
-< 5 s, on beatless/ambient audio (then `bpmConfidence` ≈ 0 and `beats` is still a valid regular grid).
+< 5 s, on beatless/ambient audio (then `bpmConfidence` ≈ 0, `grid` is all zero and `beats` is still a valid
+regular grid).
+
+Cache: keyed by `AudioRef.key` + `ANALYSIS_VERSION` in IndexedDB — previews only. Keys that start with
+`local:` (they contain the file's name) are kept in memory for the session and never written; records
+under such keys left by earlier builds are deleted when the database opens. The store is cleared when it
+is found above 2,000 records.
 
 ### sources (`js/sources/`)
 
@@ -259,7 +296,15 @@ export function createResolver(): {
 }
 ```
 Spotify fetch = fallback chain over relays 1→2→3 (+ markdown parse of relay 2 as last resort), each with a
-timeout, validated by actually finding a non-empty `trackList`. Errors are typed and human-readable
+timeout, validated by actually finding a non-empty `trackList`. Relay answers are not trusted for size
+either: bodies are read as a stream and dropped past 2 MB (`SourceError('too-large')`, the next relay is
+asked), parsers are linear in their input, and at most `SPOTIFY_MAX_TRACKS` (200) songs are kept — the
+embed itself stops at 100; `Playlist.total` carries the real count for the "first N of M" note.
+
+Preview downloads (`util.js download()`, used by `fetchAudio`) are judged by progress, not by a fixed
+deadline: a download is given up only after 15 s without a byte on ANY audio download of the same
+resolver (CDNs serve parallel responses one after the other on a slow line; waiting in line is not a
+dead connection), with a 2-minute backstop and a size cap. Errors are typed and human-readable
 ("That playlist is private or doesn't exist", "Couldn't reach Spotify — try again"). Matching must
 normalize titles (strip `feat.`, `- Remastered 2011`, bracketed suffixes, diacritics, case) and use the
 duration when known; reject weak matches rather than play the wrong song.
@@ -278,7 +323,9 @@ export function createPlanner(opts: { seed: string|number, vibe?: number /*0 smo
   chooseNext(current: {id, artist, analysis}|null, candidates: {id, artist, analysis}[], ctx: {playIndex: number, recentArtists: string[]}): number,   // index into candidates
   first(track: {id, analysis}, opts?: {startAt?: number}): Transition,   // type 'fadeIn', from −1
   next(prev: {play: Play, analysis: Analysis}, incoming: {id, analysis}, opts: {earliest: number, quick?: boolean}): Transition,
+  setVibe(v), setMode(m),   // live controls: affect plans made from now on (plans stay a pure function of seed + vibe + mode + inputs)
 }
+export function holdPlayAt(play: Play, t: number): Play   // the play as the engine holds it after engine.cancelFrom(t) (Skip)
 ```
 - Pure and deterministic: same seed + same inputs ⇒ identical output (deep-equal), regardless of call
   history (derive sub-RNGs from `seed` + play id; never use `Math.random`/`Date`).
@@ -295,6 +342,16 @@ export function createPlanner(opts: { seed: string|number, vibe?: number /*0 smo
   track, and after the transition its rate glides back to 1.0 over a few bars. Use a least-squares local
   grid over the beats in the overlap region, not single beat times. `timeline.js` gives
   `timeAtPosition` / `positionAt` for the mapping.
+- The overlap gate (`canOverlap` in planner.js): two matched tracks are only OVERLAPPED (bassSwap /
+  eqBlend / filterBlend) where the analyses vouch for the beat phase at both ends — neither end's grid
+  trust (`Analysis.grid` head / tail, whole-track `phase` when a track is left mid-way) below 0.15, and
+  the two slot patterns fitting beat on beat at least 1.05× better than at any other offset; without
+  slot patterns both ends must reach 0.5. Held pairs are handed over on a bar line with a move that
+  needs no overlap, carrying the tempo across where the move allows; `Transition.why` says so. The gate's
+  verdict travels on blends as `Transition.trust`.
+- `chooseNext` prefers a track it can really blend into (tempo, key, energy arc AND the gate), looks one
+  track ahead (a candidate that leads to a blend afterwards is worth half a blend now), and spends a
+  hand-over that is lost anyway on a track nothing could be matched with.
 - Otherwise use transitions that do not need sync (echo-out, reverb wash, spinback, brake, riser→drop,
   filter fade + cut).
 - Gain staging: never have both tracks' bass at full during an overlap; keep summed level sane.
@@ -307,7 +364,9 @@ export function createPlanner(opts: { seed: string|number, vibe?: number /*0 smo
 
 ```js
 export function createEngine(opts?: { context?: BaseAudioContext }): {
-  ctx: BaseAudioContext,
+  ctx: BaseAudioContext,                        // created on first access — only touch it inside a user gesture
+  state: 'suspended'|'running'|'closed'|'interrupted',   // the context's state WITHOUT creating it ('suspended' while there is none; 'interrupted' is iOS)
+  unlock(): void,                               // the gesture-bound part of start() on its own: create / resume the context (iOS: the silent <audio>). Call synchronously in the tap when the set can only start later.
   start(opts?: {at?: number}): Promise<void>,   // set time 0 ≡ ctx time `at` (default currentTime + 0.15); resumes a suspended realtime ctx. With an OfflineAudioContext use at: 0.
   now(): number,                                // set time
   toCtx(setTime: number): number,
@@ -317,16 +376,24 @@ export function createEngine(opts?: { context?: BaseAudioContext }): {
   cancelFrom(setTime: number): number[],        // un-schedule everything at/after setTime (hold values as of setTime), drop one-shots not yet started, remove plays whose startAt ≥ setTime; returns removed play ids
   pause(): Promise<void>, resume(): Promise<void>,
   setVolume(v: number): void,
-  levels(): { rms: number, peak: number, bands: Uint8Array, wave: Uint8Array },   // per-frame cheap; reuses arrays
+  levels(): { rms: number, peak: number, bands: Uint8Array, wave: Uint8Array },   // per-frame cheap; reuses arrays; silence while a realtime context is not running (paused / interrupted)
   on(type: 'playstart'|'playend', fn: (e:{playId:number}) => void): () => void,  // best-effort timers
-  recordStream(): MediaStream,
+  on(type: 'statechange', fn: (e:{state:string}) => void): () => void,           // every change of the context's state, exactly once — also the ones a browser makes without firing its own event (polled every 50 ms)
+  recordStream(): MediaStream,                  // null on an OfflineAudioContext
   destroy(): void,
+  // beyond the original surface: uiTime() (set time of the sound at the speakers, for drawing), reset() (New Set),
+  // getPlay(id) (the engine's copy of a play after extendPlay / cancelFrom), tick(), playState(id), debug()
 }
+export function sanitizeBuffer(buffer: AudioBuffer): number            // NaN / ±Infinity → 0, absurd magnitudes clamped, in place; addPlay() calls it itself, once per buffer
+export function sanitizeBufferAsync(buffer: AudioBuffer): Promise<number>   // the same in slices; call right after decoding a long file so addPlay() finds the work done
 // recorder.js
 export function createRecorder(stream: MediaStream): { start(), stop(): Promise<Blob>, readonly recording: boolean, mimeType: string }
 ```
 Strips are created per play and torn down after `endAt` + FX tail (no node leaks over a multi-hour set).
 The same engine code must render inside an `OfflineAudioContext` (that is how correctness is tested).
+Where a browser's DynamicsCompressor still pre-emphasises the treble in front of its detector (Firefox),
+the limiter is wrapped in a filter pair that cancels it (measured once per page, `fx.js
+probeCompressorEmphasis`).
 
 ### ui (`index.html`, `css/`, `js/ui/`) — a dumb, state-driven view
 
@@ -343,16 +410,24 @@ export function createView(root: HTMLElement, handlers: {
   setPlaylist(p: {title, subtitle?, artwork?, link?, count: number, source: string}),
   setDeck(deck: 0|1, d: DeckView|null),
   setTransition(tv: TransitionView|null),
-  setSetlist(items: SetlistItem[]),
+  setSetlist(items: SetlistItem[], info?: {crate: number}),   // crate = different playable tracks (the header's "N in the crate"; the rows also hold replays)
   setTransport(s: {playing: boolean, canSkip: boolean, recording: boolean, seed: string, vibe: number, mode: string, modeEnabled: boolean, volume: number}),
   toast(message: string, kind?: 'info'|'error'|'success'),
+  inputError(message: string),                // a failed load, written under the control it was started from (link field / list box / crate chip) until the next edit; a toast when another screen is showing
   frame(f: FrameState): void,                 // every animation frame
+  destroy(): void,
 }
 /** DeckView      {playId, title, artist, artwork?, link?, bpm, camelot, keyName, duration, provider, wave: Analysis['wave'], beats: number[], downbeat: number, cues: Analysis['cues']} */
-/** TransitionView {type, label, why, fromTitle, toTitle, state: 'upcoming'|'active', tStart, tEnd, marks: {t,label}[]} */
-/** SetlistItem   {key, title, artist, artwork?, bpm?, camelot?, state: 'played'|'playing'|'mixing'|'next'|'queued'|'loading'|'failed', via?: string /*transition label into it*/, link?} */
+/** TransitionView {type, label, why, fromTitle, toTitle, state: 'upcoming'|'active'|'waiting', tStart, tEnd, marks: {t,label}[], synced?,
+ *                  trick?: {label, on /*track title*/, tStart, tEnd},   // 'upcoming' only: a mid-solo trick in flight (shown as a pill for ≥ 2 s; "Next: …" is not re-announced)
+ *                  reason?: 'network'|'loading'}                        // 'waiting' only: the crate ran dry — nothing on air, nothing planned (label + why say it; no titles, no marks, tStart === tEnd)
+ */
+/** SetlistItem   {key, title, artist, artwork?, bpm?, camelot?, state: 'played'|'playing'|'mixing'|'next'|'queued'|'loading'|'failed', via?: string /*transition label into it*/, link?,
+ *                 deck?: 0|1, again?: true /*heard before in this set: the crate has come round*/} */
 /** FrameState    {t: number, playing: boolean, elapsed: number,
- *                 decks: [DeckFrame|null, DeckFrame|null],   // DeckFrame {pos, rate, bpmNow, gain, low, mid, high, hpf, lpf, audible /*0..1*/}
+ *                 decks: [DeckFrame|null, DeckFrame|null],   // DeckFrame {pos, rate, bpmNow, gain, low, mid, high, hpf, lpf, audible /*0..1*/, startsIn}
+ *                                                            //   a deck that is cued or stopped reports gain 0 and audible 0; startsIn = seconds of set time
+ *                                                            //   until a cued deck starts (0 once it runs): its waveform is parked in its lane and counted down
  *                 crossfade: number /*-1 deck0 … +1 deck1*/, beatPhase: number /*0..1 within the current beat*/,
  *                 levels: {rms, peak, bands: Uint8Array}} */
 ```
@@ -364,9 +439,32 @@ analyze, concurrency ≈ 3; keep compressed bytes, drop decoded AudioBuffers out
 memory) → start as soon as the first track is ready → for each next slot wait for the "crate window"
 (first 5 unplayed tracks in base order) to settle, `chooseNext`, decode, `planner.next`, hand to the
 engine well ahead of time (Web Audio does the sample-accurate timing; timers are only for bookkeeping).
-Endless: when the crate is empty, reshuffle and continue. Skip = `engine.cancelFrom(now)` + `planner.next(…,
-{earliest: now + 0.25, quick: true})`, only when a single track is playing. Tracks that fail to
-resolve/decode are marked failed and skipped. URL: `?p=<playlist id>&seed=<seed>` reproduces a set.
+Endless: when the crate is empty, reshuffle and continue (every pass plays every track once; no A-B-A in
+small crates). Skip = `engine.cancelFrom(now)` + `planner.next(…, {earliest: now + 0.25, quick: true})`,
+only when a single track is playing. Tracks that fail to resolve/decode are marked failed and skipped;
+network failures stay retryable once the crate has produced a track. URL:
+`?p=<playlist id>&seed=<seed>&vibe=<0..1>` reproduces a set (a link without `vibe` means 0.5; the
+recipient's own stored vibe is neither used nor overwritten).
+
+As built, beyond the paragraph above (`createConductor({engine, analyzer, resolver, decode})`):
+
+```js
+load(playlist, {seed?, vibe?, mode?, autostart?, patient?})   // patient: a share-link seed — wait (≤ 10 s) for the whole head of the order before choosing the opener
+begin(), newSet(), stop(), skip(), pause(), resume(), setVibe(v), setMode(m), setVolume(v), poke(), destroy()
+audioState()            // make `paused` say what is true of the AudioContext; the conductor also hears the engine's 'statechange' itself and checks every tick
+canSkip(): boolean      // cheap enough for every animation frame
+snapshot(): {loaded, started, playing, paused, stalled: ''|'network'|'loading', seed, vibe, mode, modeEnabled, canSkip, playlist, now,
+             playIndex, current, decks: [DeckView|null, DeckView|null], transition: TransitionView|null, setlist: SetlistItem[], stats, status}
+history(), debug(), live                                      // tests / the per-frame loop
+seed, vibe, started, paused /*by the user or by the browser*/, pausedByUser
+on('start'|'change'|'status'|'skip'|'error', fn)
+export function deckFrameAt(df, play, analysis, t): boolean   // one DeckFrame at set time t, written in place (pure)
+```
+
+Transport truth has one owner: `paused` mirrors the real context (a browser that stops the audio by
+itself — a phone call, iOS "interrupted", a start without a user gesture — shows Play; audio that comes
+back by itself plays again unless the user had paused). History: starting a set from the start screen
+pushes one entry, so Back returns to the start screen; seed / vibe changes and New Set replace it.
 
 ## 5. Product priorities
 

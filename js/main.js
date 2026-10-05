@@ -5,10 +5,9 @@
 import { createView } from './ui/view.js';
 import { DEMOS, EXAMPLES, SourceError, applyTags, createResolver, loadPlaylist, parseInput, playlistFromFiles } from './sources/index.js';
 import { createAnalyzer } from './analysis/client.js';
-import { createEngine } from './dj/engine.js';
+import { createEngine, sanitizeBufferAsync } from './dj/engine.js';
 import { createRecorder, extensionFor } from './dj/recorder.js';
-import { createConductor, decodeAudio } from './dj/conductor.js';
-import { dbToGain, evalParam, positionAt, rateAt } from './dj/timeline.js';
+import { createConductor, decodeAudio, deckFrameAt } from './dj/conductor.js';
 import { randomSeed } from './util/rng.js';
 
 /** Slider at 100 % = engine volume 1.25: the engine keeps headroom for two tracks, measured safe to 1.5. */
@@ -61,6 +60,9 @@ let quietCtx = null;
  * go through an OfflineAudioContext; the buffers play in the real context all the same.
  */
 function decode(bytes) {
+  return decodeRaw(bytes).then(checked);
+}
+function decodeRaw(bytes) {
   if (unlocked) return decodeAudio(engine.ctx, bytes);
   if (!quietCtx) {
     const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
@@ -68,6 +70,20 @@ function decode(bytes) {
     quietCtx = new Offline(2, 2, 48000);
   }
   return decodeAudio(quietCtx, bytes);
+}
+/**
+ * The engine refuses to let a NaN / Infinity sample into its graph and checks every buffer before it
+ * plays; done here, in slices, right after decoding, that check never lands in one piece on the frame
+ * a full-length file starts on (a 6-minute file is ~35 million samples).
+ */
+async function checked(buffer) {
+  try {
+    await sanitizeBufferAsync(buffer);
+    metrics.buffersChecked++;
+  } catch (err) {
+    console.warn('[segue] could not check a decoded file', err); // addPlay() checks it again itself
+  }
+  return buffer;
 }
 
 const conductor = createConductor({ engine, analyzer, resolver, decode });
@@ -83,9 +99,11 @@ let gestureAt = 0;
 let recorder = null;
 let recordingSeed = '';
 let stallNoted = false;
-const shown = { decks: ['', ''], transition: '', media: '', title: document.title };
+/** performance.now() of a history.back() of our own (the logo): its popstate has nothing left to do. */
+let ownBackAt = -1e9;
+const shown = { decks: ['', ''], transition: '', media: '', title: document.title, /** @type {boolean|null} */ canSkip: null };
 const baseTitle = document.title;
-const metrics = { firstSoundMs: null, loads: 0 };
+const metrics = { firstSoundMs: null, loads: 0, buffersChecked: 0 };
 
 // ── view ─────────────────────────────────────────────────────────────────────────────────────────
 const view = createView(document.getElementById('app'), {
@@ -104,11 +122,12 @@ const view = createView(document.getElementById('app'), {
     openFiles(files);
   },
   onStart() {
-    gesture();
+    gesture(true);
     if (!playlist) return goHome();
     conductor.begin();
     if (conductor.started) {
-      if (conductor.paused) quiet(conductor.resume());
+      // Cued and waiting for this tap (the browser would not start the audio without one).
+      quiet(conductor.resume());
       show('stage');
       return;
     }
@@ -119,22 +138,36 @@ const view = createView(document.getElementById('app'), {
     }, 300);
   },
   onPlayPause() {
+    if (!conductor.started) return gesture();
+    // Decide from what is true before this tap changes it: gesture() below may wake a context the
+    // browser had stopped, and a set that was silent must come back as "playing", not flip to paused.
+    const halted = conductor.paused || !audioRunning();
     gesture();
-    if (!conductor.started) return;
-    if (conductor.paused) quiet(conductor.resume());
+    if (halted) quiet(conductor.resume());
     else quiet(conductor.pause());
   },
   onSkip() {
     conductor.skip();
   },
   onNewSet() {
+    if (!playlist) return gesture();
+    conductor.newSet(); // first: a set the user had paused is over, so this tap may wake the audio again
     gesture();
-    if (!playlist) return;
-    conductor.newSet();
     resetShown();
     syncUrl();
     view.toast(`New set #${conductor.seed} — same crate, different mix`, 'success');
     sync();
+    // Normally the new opener is in hand and plays within a moment. When it is not (the connection
+    // dropped), a silent stage explains nothing: go back to the loading screen, which says what the
+    // set is waiting for and offers Cancel.
+    const token = loadToken;
+    const seed = conductor.seed;
+    setTimeout(() => {
+      if (token !== loadToken || screen !== 'stage' || conductor.started || conductor.seed !== seed) return;
+      show('loading');
+      const st = conductor.snapshot().status;
+      if (st) view.setLoading(st);
+    }, 1200);
   },
   onVibe(v) {
     prefs.vibe = clamp01(v);
@@ -168,14 +201,29 @@ const view = createView(document.getElementById('app'), {
   },
 });
 
+// The file picker: the tap that opens it is the last user gesture before the files arrive — in Safari
+// the 'change' event that delivers them no longer counts as one, and an AudioContext first touched
+// there stays suspended. Unlock on that tap (it reaches the input from its label and from the
+// keyboard alike); the context then runs through the picker and the set can start by itself.
+{
+  const picker = document.getElementById('segue-files');
+  if (picker) picker.addEventListener('click', () => gesture());
+}
+
 function show(name) {
   screen = name;
   view.setScreen(name);
 }
 
-/** Everything that needs a user gesture: creating / resuming the AudioContext (and iOS's silent element). */
-function gesture() {
+/**
+ * Everything that needs a user gesture: creating / resuming the AudioContext (and iOS's silent element).
+ * Not while the user has the set paused: a tap on Rec, Share or the setlist must not start the sound
+ * again behind a button that says Play — Play itself resumes through the conductor.
+ * @param {boolean} [force] the tap asks for sound whatever the state ("Start the set")
+ */
+function gesture(force = false) {
   gestureAt = performance.now();
+  if (!force && conductor.started && conductor.pausedByUser) return;
   try {
     engine.unlock();
     unlocked = true;
@@ -183,6 +231,16 @@ function gesture() {
     console.warn('[segue] audio unavailable', err);
     view.toast('This browser cannot play Web Audio, so Segue cannot mix here.', 'error');
   }
+}
+
+// Browsers stop an AudioContext on their own (a phone call, another app taking the audio session,
+// iOS's "interrupted") and sometimes bring it back on their own. The engine reports every such change
+// ('statechange', also the ones a browser makes without an event) and the conductor listens to it
+// itself, so the transport always shows what is true; nothing to wire here.
+
+/** Is the context producing sound? (engine.state never creates a context just to answer.) */
+function audioRunning() {
+  return engine.state === 'running'; // never compare with 'suspended': iOS also has 'interrupted'
 }
 
 function resetShown() {
@@ -206,7 +264,8 @@ function fail(err) {
   const friendly = err instanceof SourceError;
   if (!friendly) console.error('[segue] load failed', err);
   goHome();
-  view.toast(friendly ? err.message : 'Something went wrong while loading that. Please try again.', 'error');
+  // Under the control the load was started from (and it stays there); a toast when there is none.
+  view.inputError(friendly ? err.message : 'Something went wrong while loading that. Please try again.');
 }
 
 async function openInput(input, opts) {
@@ -251,6 +310,12 @@ async function openFiles(files) {
   startPlaylist(pl, { autostart: true });
 }
 
+/**
+ * @param {any} pl Playlist
+ * @param {{autostart?: boolean, seed?: string, vibe?: number, fromLink?: boolean}} [opts]
+ *   fromLink: the set comes from the address bar (a share link, or Back / Forward to one): seed and
+ *   vibe are the link's, and the history entry is the one we are on.
+ */
 function startPlaylist(pl, opts = {}) {
   playlist = pl;
   metrics.loads++;
@@ -260,12 +325,15 @@ function startPlaylist(pl, opts = {}) {
   resetShown();
   view.setSetlist([]);
   conductor.setVolume(prefs.volume * VOLUME_SCALE);
-  conductor.load(pl, { seed: opts.seed || randomSeed(), vibe: prefs.vibe, mode: prefs.mode, autostart: !!opts.autostart });
+  // The set's vibe: the link's when it came from one (the visitor's own stored preference would
+  // build a different set than the sender heard), otherwise the visitor's.
+  const vibe = opts.fromLink && Number.isFinite(opts.vibe) ? opts.vibe : prefs.vibe;
+  conductor.load(pl, { seed: opts.seed || randomSeed(), vibe, mode: prefs.mode, autostart: !!opts.autostart, patient: !!opts.fromLink && !!opts.seed });
   if (!conductor.snapshot().loaded) return; // the conductor refused it (empty) and already reported why
-  syncUrl();
+  enterSet(!!opts.fromLink);
   syncTransport();
   if (pl.total > pl.tracks.length) {
-    const where = pl.source === 'spotify' ? ' — Spotify only shares the first 100 with web pages' : '';
+    const where = pl.source === 'spotify' && pl.tracks.length <= 100 ? ' — Spotify only shares the first 100 with web pages' : '';
     view.toast(`Mixing the first ${pl.tracks.length} of ${pl.total} tracks${where}.`, 'info');
   }
   if (opts.autostart) {
@@ -275,18 +343,41 @@ function startPlaylist(pl, opts = {}) {
   }
 }
 
-function goHome() {
+/**
+ * Back to the start screen: stop the set (a running recording is saved), then put the address bar and
+ * the history right. @param {{fromHistory?: boolean}} [opts] fromHistory: the browser already moved
+ * (Back / Forward) — only the page has to follow.
+ */
+function goHome(opts = {}) {
   cancelLoad();
   if (recorder && recorder.recording) finishRecording();
   conductor.stop();
   playlist = null;
   resetShown();
   view.setSetlist([]);
+  shown.canSkip = false;
   view.setTransport({ playing: false, canSkip: false });
   setMedia(null);
   document.title = baseTitle;
-  syncUrl();
   show('landing');
+  if (opts.fromHistory) return;
+  if (historyState().pushed) {
+    // The set has a history entry of its own on top of the start screen's: step back onto that one,
+    // so Forward still leads to the set and Back does not pass through a second start screen.
+    try {
+      ownBackAt = performance.now();
+      history.back();
+      return;
+    } catch {
+      ownBackAt = -1e9;
+    }
+  }
+  try {
+    const base = `${location.origin}${location.pathname}`;
+    if (base !== location.href || history.state) history.replaceState(null, '', base);
+  } catch {
+    /* file:// or a sandbox without history access */
+  }
 }
 
 // ── conductor → view ─────────────────────────────────────────────────────────────────────────────
@@ -296,6 +387,14 @@ conductor.on('status', (s) => {
 });
 
 conductor.on('start', () => {
+  if (conductor.paused) {
+    // The opener is cued but the browser would not start the audio without a tap (Safari once its
+    // file picker has closed, any browser after a drop, a tab that never had a gesture): offer the
+    // one tap instead of a stage that claims to be playing. The set waits at 0:00.
+    if (screen === 'loading') show('ready');
+    sync();
+    return;
+  }
   if (metrics.firstSoundMs == null && gestureAt) {
     // 150 ms is the engine's start lead-in: the first sample leaves that long after start().
     metrics.firstSoundMs = Math.round(performance.now() - gestureAt + 150);
@@ -306,13 +405,14 @@ conductor.on('start', () => {
 
 conductor.on('error', ({ message }) => {
   goHome();
-  view.toast(message, 'error');
+  view.inputError(message);
 });
 
 conductor.on('change', sync);
 
 function syncTransport() {
   const s = conductor.snapshot();
+  shown.canSkip = s.canSkip;
   view.setTransport({
     playing: s.started ? s.playing : screen === 'stage',
     canSkip: s.canSkip,
@@ -328,6 +428,9 @@ function syncTransport() {
 function sync() {
   const s = conductor.snapshot();
   if (!s.loaded) return;
+  // A set that was waiting for its audio (see 'start') and got it without the button — the browser
+  // let the context run after all — belongs on the stage.
+  if (s.playing && (screen === 'ready' || screen === 'loading')) show('stage');
   for (let d = 0; d < 2; d++) {
     const info = s.decks[d];
     const id = info ? `${s.seed}:${info.playId}` : '';
@@ -337,27 +440,31 @@ function sync() {
     }
   }
   const tv = s.transition;
-  const tsig = tv ? `${s.seed}|${tv.state}|${tv.type}|${tv.label}|${tv.tStart}|${tv.toTitle}` : '';
+  const tsig = tv ? `${s.seed}|${tv.state}|${tv.type}|${tv.label}|${tv.tStart}|${tv.toTitle}|${tv.trick ? `${tv.trick.label}@${tv.trick.tStart}` : ''}|${tv.why}` : '';
   if (tsig !== shown.transition) {
     shown.transition = tsig;
     view.setTransition(tv);
   }
-  view.setSetlist(s.setlist);
+  // Second argument: how many different tracks the crate can play (the list itself also holds replays).
+  view.setSetlist(s.setlist, { crate: s.stats.total - s.stats.failed });
+  shown.canSkip = s.canSkip;
   view.setTransport({ playing: s.started ? s.playing : screen === 'stage', canSkip: s.canSkip, seed: s.seed, vibe: s.vibe, mode: s.mode, modeEnabled: s.modeEnabled });
   setMedia(s.started ? s : null);
 
-  // The crate ran dry (network gone, or nothing else playable yet): say so once instead of going quiet.
-  if (s.started && s.playing && !s.decks[0] && !s.decks[1]) {
+  // The crate ran dry (network gone, or nothing else playable yet): the ticker carries the state for
+  // as long as it lasts (snapshot.transition, state 'waiting'); a toast says it once as well.
+  if (s.stalled) {
     if (!stallNoted) {
       stallNoted = true;
-      view.toast('Waiting for the next track — the set picks up as soon as it loads.', 'info');
+      const offline = s.stalled === 'network' || navigator.onLine === false;
+      view.toast(offline ? 'Lost the connection — the set picks up as soon as the next track can load.' : 'Waiting for the next track — the set picks up as soon as it loads.', 'info');
     }
   } else if (s.decks[0] || s.decks[1]) stallNoted = false;
 }
 
 // ── per-frame paint (no allocation: one FrameState, mutated in place) ────────────────────────────
 
-const mkDeck = () => ({ pos: 0, rate: 1, bpmNow: 0, gain: 0, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, audible: 0 });
+const mkDeck = () => ({ pos: 0, rate: 1, bpmNow: 0, gain: 0, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, audible: 0, startsIn: 0 });
 const deckFrames = [mkDeck(), mkDeck()];
 const frameState = { t: 0, playing: false, elapsed: 0, /** @type {[any, any]} */ decks: [null, null], crossfade: 0, beatPhase: 0, /** @type {any} */ levels: null };
 const beatCursor = [0, 0];
@@ -395,33 +502,13 @@ function frame() {
       f.decks[d] = null;
       continue;
     }
-    const p = rec.play;
-    const an = rec.entry.analysis;
     const df = deckFrames[d];
-    const ev = p.events;
-    const end = p.endAt;
-    df.pos = positionAt(p, t);
-    df.rate = t < p.startAt ? p.rate[0].v : rateAt(p, end != null && t > end ? end : t);
-    df.bpmNow = an.bpm * df.rate;
-    df.gain = evalParam(ev, 'gain', t, 1);
-    df.low = evalParam(ev, 'low', t, 0);
-    df.mid = evalParam(ev, 'mid', t, 0);
-    df.high = evalParam(ev, 'high', t, 0);
-    df.hpf = evalParam(ev, 'hpf', t, 20);
-    df.lpf = evalParam(ev, 'lpf', t, 20000);
-    const running = t >= p.startAt && (end == null || t < end) && df.pos < an.duration;
-    if (running) {
-      // A rough "how much of this deck can you hear": fader × what the EQ and filters leave.
-      const eq = 0.5 * dbToGain(df.low) + 0.3 * dbToGain(df.mid) + 0.2 * dbToGain(df.high);
-      const hp = 1 - Math.log(Math.max(df.hpf, 20) / 20) / 9;
-      const lp = Math.log(Math.max(df.lpf, 40) / 20) / Math.log(1000);
-      const a = df.gain * eq * (hp > 0.25 ? hp : 0.25) * (lp > 0.3 ? (lp < 1 ? lp : 1) : 0.3);
-      df.audible = a < 1 ? a : 1;
-    } else df.audible = 0;
+    // (a deck that is cued or has stopped reports fader 0: the mixer shows what can be heard; a cued
+    // one also says how long until it starts, which parks its waveform in the lane with a countdown)
+    deckFrameAt(df, rec.play, rec.entry.analysis, t);
     f.decks[d] = df;
-    const g = running ? df.gain : 0;
-    if (d === 0) g0 = g;
-    else g1 = g;
+    if (d === 0) g0 = df.gain;
+    else g1 = df.gain;
     if (df.audible > leadAud) {
       leadAud = df.audible;
       lead = d;
@@ -431,6 +518,13 @@ function frame() {
   f.beatPhase = lead >= 0 ? beatPhaseAt(conductor.live.decks[lead].entry.analysis.beats, deckFrames[lead].pos, lead) : 0;
   f.levels = engine.levels();
   view.frame(f);
+  // Skip opens and closes on the audio clock (a solo begins, a trick ends), between two ticks of the
+  // conductor: follow it here, so the button is never enabled later — or longer — than Skip works.
+  const can = started && conductor.canSkip();
+  if (can !== shown.canSkip) {
+    shown.canSkip = can;
+    view.setTransport({ canSkip: can });
+  }
 }
 
 // ── address bar: always a link to this exact set ─────────────────────────────────────────────────
@@ -440,18 +534,84 @@ const shareable = () => !!playlist && (playlist.source === 'spotify' || playlist
 function currentUrl() {
   const base = `${location.origin}${location.pathname}`;
   if (!shareable() || !conductor.seed) return base;
-  const vibe = Math.round(prefs.vibe * 100) / 100;
-  return `${base}?p=${playlist.id}&seed=${encodeURIComponent(conductor.seed)}${vibe === 0.5 ? '' : `&vibe=${vibe}`}`;
+  // Always with the vibe the set is using: a link without one would be rebuilt with whatever the
+  // recipient last left their own slider at — a different set.
+  const vibe = Math.round(conductor.vibe * 100) / 100;
+  return `${base}?p=${playlist.id}&seed=${encodeURIComponent(conductor.seed)}&vibe=${vibe}`;
 }
 
+/** Seed / vibe changed: the entry we are on describes the set as it is now (never a new entry — a Vibe drag must not fill the history). */
 function syncUrl() {
   try {
     const url = currentUrl();
-    if (url !== location.href) history.replaceState(null, '', url);
+    if (url !== location.href) history.replaceState(history.state, '', url);
   } catch {
     /* file:// or a sandbox without history access: the app works without it */
   }
 }
+
+// ── history: Back leaves the set, not the site ───────────────────────────────────────────────────
+//
+// The start screen and the set are two history entries: starting a set from the start screen pushes
+// one ({segue: 'set', pushed: true}), so Back (the phone's back button, a swipe) returns to the start
+// screen instead of walking off to whatever site was open before — and Forward leads to the set
+// again (a link set is rebuilt from its URL; files and pasted lists cannot be, the start screen stays).
+// A share link opened directly IS its entry (pushed: false): nothing of ours lies behind it.
+
+function historyState() {
+  try {
+    const st = history.state;
+    return st && st.segue === 'set' ? st : {};
+  } catch {
+    return {};
+  }
+}
+
+/** A set has been loaded: give it its history entry (or, when it came from the address bar, mark the one we are on). */
+function enterSet(fromLink) {
+  try {
+    const here = historyState();
+    const url = currentUrl();
+    if (fromLink || here.segue) history.replaceState({ segue: 'set', pushed: !!here.pushed }, '', url);
+    else history.pushState({ segue: 'set', pushed: true }, '', url);
+  } catch {
+    /* no history access: Back leaves the page, as before */
+  }
+}
+
+/** The set a URL describes, or null: {p, seed, vibe}. A link that names no vibe was made at the default. */
+function linkFrom(search) {
+  const qs = new URLSearchParams(search);
+  const p = qs.get('p');
+  if (!p) return null;
+  const parsed = parseInput(p);
+  const seedQ = qs.get('seed') || '';
+  const vibeQ = qs.get('vibe');
+  return {
+    p,
+    ok: (parsed.kind === 'spotify' || parsed.kind === 'deezer') && p.length < 200,
+    seed: /^[A-Za-z0-9]{1,24}$/.test(seedQ) ? seedQ : undefined,
+    vibe: vibeQ !== null && vibeQ !== '' && Number.isFinite(Number(vibeQ)) ? clamp01(Number(vibeQ)) : 0.5,
+  };
+}
+
+function onPopState() {
+  const link = linkFrom(location.search);
+  if (performance.now() - ownBackAt < 1500) {
+    // Our own step back from the logo: the page is on the start screen already — and whatever the
+    // user started in the meantime must not be torn down by it.
+    ownBackAt = -1e9;
+    if (!(link && link.ok)) return;
+  }
+  if (link && link.ok) {
+    if (playlist && playlist.id === link.p && conductor.seed === link.seed) return;
+    // Forward (or Back) onto a set's entry: rebuild it; like any share link it waits for a tap.
+    openInput(link.p, { autostart: false, seed: link.seed, vibe: link.vibe, fromLink: true });
+    return;
+  }
+  if (screen !== 'landing' || playlist) goHome({ fromHistory: true });
+}
+
 let urlTimer = 0;
 function syncUrlSoon() {
   clearTimeout(urlTimer);
@@ -595,27 +755,32 @@ function bindMediaKeys() {
 
 function boot() {
   view.setDemos(DEMOS, EXAMPLES);
-  const qs = new URLSearchParams(location.search);
-  const vibeQ = qs.get('vibe');
-  if (vibeQ !== null && Number.isFinite(Number(vibeQ))) prefs.vibe = clamp01(Number(vibeQ));
   view.setTransport({ playing: false, canSkip: false, recording: false, seed: '', vibe: prefs.vibe, mode: 'preview', modeEnabled: false, volume: prefs.volume });
   bindMediaKeys();
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) conductor.poke();
+    if (document.hidden) return;
+    conductor.poke();
+    // Back in front: if the browser stopped the audio meanwhile and the user had not paused, try to
+    // pick it up. A browser that wants a tap for this leaves the Play button showing.
+    if (conductor.started && conductor.paused && !conductor.pausedByUser) quiet(conductor.resume());
   });
+  window.addEventListener('popstate', onPopState);
   requestAnimationFrame(frame);
 
-  // A share link: ?p=<playlist id>&seed=<seed>. Audio needs a tap first, so this lands on "ready".
-  const p = qs.get('p');
-  if (p) {
-    const parsed = parseInput(p);
-    const seedQ = qs.get('seed') || '';
-    if ((parsed.kind === 'spotify' || parsed.kind === 'deezer') && p.length < 200) {
-      openInput(p, { autostart: false, seed: /^[A-Za-z0-9]{1,24}$/.test(seedQ) ? seedQ : undefined });
+  // A share link: ?p=<playlist id>&seed=<seed>&vibe=<0..1>. Audio needs a tap first, so this lands on
+  // "ready". Seed and vibe are the link's for this set; the visitor's stored preferences stay theirs.
+  const link = linkFrom(location.search);
+  if (link) {
+    if (link.ok) {
+      openInput(link.p, { autostart: false, seed: link.seed, vibe: link.vibe, fromLink: true });
       return;
     }
     view.toast('That share link doesn’t point to a playlist Segue can read.', 'error');
-    syncUrl();
+    try {
+      history.replaceState(null, '', `${location.origin}${location.pathname}`);
+    } catch {
+      /* no history access */
+    }
   }
   show('landing');
 }

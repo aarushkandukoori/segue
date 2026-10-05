@@ -7,6 +7,18 @@ import { SourceError, UNKNOWN_ARTIST, abortError, cleanText, httpsUrl, isAbort, 
 
 /** The embed page lists at most this many tracks, whatever the playlist's real length (measured 2026-10). */
 export const SPOTIFY_EMBED_CAP = 100;
+/**
+ * The most tracks kept from one answer, like the other sources' caps. Today the embed never lists
+ * more than SPOTIFY_EMBED_CAP; this is what stops a relay that answers with twenty thousand rows
+ * from turning into twenty thousand catalogue lookups and setlist rows.
+ */
+export const SPOTIFY_MAX_TRACKS = 200;
+
+// What comes back through a relay is somebody else's text. A real answer for a 100-track playlist
+// is 50 kB as JSON and 150 kB as HTML (measured 2026-10); anything past these limits is dropped
+// unread, and nothing below reads an answer with a pattern whose cost depends on what it says.
+const MAX_RELAY_BYTES = 2 * 1024 * 1024;
+const MAX_META_BYTES = 256 * 1024; // oEmbed and the song count are a few hundred bytes
 
 const ID = /^[A-Za-z0-9]{22}$/;
 const TRACK_URI = /^spotify:track:([A-Za-z0-9]{22})$/;
@@ -20,12 +32,34 @@ const pageUrl = (type, id) => `https://open.spotify.com/${type}/${id}`;
 
 /* ------------------------------------------------------------------ parsing (pure) */
 
-/** Pull the __NEXT_DATA__ JSON out of an HTML string without ever handing the HTML to the DOM. */
+const NEXT_DATA_ID = /\bid=["']__NEXT_DATA__["']/i;
+
+/**
+ * Pull the __NEXT_DATA__ JSON out of an HTML string without ever handing the HTML to the DOM.
+ *
+ * A left-to-right scan in which every character is looked at a bounded number of times: find a
+ * "<script", find the ">" that ends that tag, look for the id in between, move on from the ">".
+ * (One pattern for the whole thing — tag, attributes, id, body, closing tag — is shorter, and takes
+ * minutes on 60 kB of unclosed "<script id=…" repeats: each of its three open-ended parts starts
+ * over from every position the others stopped at.)
+ */
 export function nextDataFromHtml(html) {
   if (typeof html !== 'string') return null;
-  const m = /<script\b[^>]*\bid=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(html);
-  if (!m) return null;
-  return parseJson(m[1]);
+  const open = /<script\b/gi; // sticky state (lastIndex) is this call's own
+  while (open.exec(html)) {
+    const attrsAt = open.lastIndex;
+    const tagEnd = html.indexOf('>', attrsAt);
+    if (tagEnd < 0) return null; // no tag is closed from here on
+    if (!NEXT_DATA_ID.test(html.slice(attrsAt, tagEnd))) {
+      open.lastIndex = tagEnd + 1;
+      continue;
+    }
+    const close = /<\/script>/gi;
+    close.lastIndex = tagEnd + 1;
+    const end = close.exec(html);
+    return end ? parseJson(html.slice(tagEnd + 1, end.index)) : null;
+  }
+  return null;
 }
 
 function parseJson(text) {
@@ -63,10 +97,11 @@ function cleanArtists(value) {
 
 /**
  * Embed entity → Playlist. Builds fresh objects from a whitelist of fields, so nothing else in the
- * embed payload (audio previews, tokens) can leak through.
+ * embed payload (audio previews, tokens) can leak through. Keeps the first SPOTIFY_MAX_TRACKS songs.
  * @param {any} entity
  * @param {{type: 'playlist'|'album', id: string}} ref
- * @returns {{playlist: import('./index.js').Playlist, rawCount: number}}
+ * @returns {{playlist: import('./index.js').Playlist, rawCount: number, found: number}}
+ *          rawCount = rows in the embed's list, found = songs among them (≥ playlist.tracks.length)
  */
 export function playlistFromEntity(entity, ref) {
   const cover =
@@ -84,6 +119,7 @@ export function playlistFromEntity(entity, ref) {
     const id = `spotify:track:${m[1]}`;
     if (seen.has(id)) continue; // the same song added twice
     seen.add(id);
+    if (tracks.length >= SPOTIFY_MAX_TRACKS) continue; // counted (seen.size) so the caller can say "first N of M", not kept
     /** @type {import('./index.js').TrackMeta} */
     const meta = {
       id,
@@ -108,7 +144,7 @@ export function playlistFromEntity(entity, ref) {
   const subtitle = cleanText(entity.subtitle);
   if (subtitle) playlist.subtitle = subtitle;
   if (cover) playlist.artwork = cover;
-  return { playlist, rawCount: list.length };
+  return { playlist, rawCount: list.length, found: seen.size };
 }
 
 function pickImage(images) {
@@ -120,6 +156,26 @@ function pickImage(images) {
   return sorted.length ? httpsUrl(sorted[0].url) : undefined;
 }
 
+// The markdown parser reads line by line. Each line is trimmed and cut to MD_MAX_LINE before any
+// pattern sees it, the patterns have nothing left to try twice (no optional space at either end,
+// and the capture runs to the end of the line whatever is in it), and only MD_MAX_LINES lines are
+// looked at — a real 100-track page has about 700 lines of under 100 characters.
+const MD_MAX_LINES = 20000;
+const MD_MAX_LINE = 400;
+const MD_LINE_BREAK = /\r?\n/;
+const MD_TRACK = /^\d+\.\s+#{2,4}\s+([\s\S]+)$/;
+const MD_ITEM = /^\d+\.\s+#{2,4}(?:\s|$)/; // any numbered heading, titled or not
+const MD_ARTIST = /^#{3,5}\s+([\s\S]+)$/;
+const MD_DURATION = /^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$/;
+const MD_NOT_FOUND = /^#{1,3}\s*Page not found$/i;
+const MD_TITLE = /^Title:/;
+const MD_TITLE_SUFFIX = /\s*[-|]\s*Spotify(?:\s*\|\s*Spotify)?$/i;
+
+const mdLine = (raw) => {
+  const line = raw.trim();
+  return line.length > MD_MAX_LINE ? line.slice(0, MD_MAX_LINE).trimEnd() : line;
+};
+
 /**
  * Last-resort parser for the markdown rendering of the embed page (r.jina.ai without the HTML header):
  *
@@ -130,28 +186,34 @@ function pickImage(images) {
  *     03:45
  *
  * No track ids in this format, so ids are "spotify:md:<n>" and tracks have no link.
+ * Keeps the first SPOTIFY_MAX_TRACKS songs; `found` counts all of them.
  * @param {string} md
  * @param {{type: 'playlist'|'album', id: string}} ref
- * @returns {{kind: 'playlist', playlist: import('./index.js').Playlist, rawCount: number} | {kind: 'not-found'} | {kind: 'bad'}}
+ * @returns {{kind: 'playlist', playlist: import('./index.js').Playlist, rawCount: number, found: number} | {kind: 'not-found'} | {kind: 'bad'}}
  */
 export function playlistFromMarkdown(md, ref) {
   if (typeof md !== 'string' || !md) return { kind: 'bad' };
-  const lines = md.split(/\r?\n/);
-  if (/^#{1,3}\s*Page not found\s*$/im.test(md)) return { kind: 'not-found' };
+  const lines = md.split(MD_LINE_BREAK, MD_MAX_LINES).map(mdLine);
+  if (lines.some((line) => MD_NOT_FOUND.test(line))) return { kind: 'not-found' };
   let title = '';
-  const head = /^Title:\s*(.*)$/m.exec(md);
-  if (head) title = cleanText(head[1].replace(/\s*[-|]\s*Spotify(?:\s*\|\s*Spotify)?\s*$/i, ''));
+  const head = lines.find((line) => MD_TITLE.test(line));
+  if (head) title = cleanText(head.slice(6).replace(MD_TITLE_SUFFIX, ''));
   const tracks = [];
+  let found = 0;
   for (let i = 0; i < lines.length; i++) {
-    const t = /^\s*\d+\.\s+#{2,4}\s+(.+?)\s*$/.exec(lines[i]);
+    const t = MD_TRACK.exec(lines[i]);
     if (!t) continue;
+    const name = cleanText(t[1]);
+    if (!name) continue;
+    found++;
+    if (tracks.length >= SPOTIFY_MAX_TRACKS) continue;
     let artist = '';
     let explicit = false;
     let durationMs;
     // The artist heading and the duration follow within a few lines, before the next numbered item.
     for (let j = i + 1; j < Math.min(lines.length, i + 8); j++) {
-      if (/^\s*\d+\.\s+#{2,4}\s/.test(lines[j])) break;
-      const a = /^\s*#{3,5}\s+(.+?)\s*$/.exec(lines[j]);
+      if (MD_ITEM.test(lines[j])) break;
+      const a = MD_ARTIST.exec(lines[j]);
       if (a && !artist) {
         let text = a[1];
         if (/^E\s+\S/.test(text)) {
@@ -161,14 +223,12 @@ export function playlistFromMarkdown(md, ref) {
         artist = cleanArtists(text);
         continue;
       }
-      const d = /^\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\s*$/.exec(lines[j]);
+      const d = MD_DURATION.exec(lines[j]);
       if (d) {
         durationMs = ((Number(d[1] || 0) * 60 + Number(d[2])) * 60 + Number(d[3])) * 1000;
         break;
       }
     }
-    const name = cleanText(t[1]);
-    if (!name) continue;
     /** @type {import('./index.js').TrackMeta} */
     const meta = { id: `spotify:md:${tracks.length}`, title: name, artist: artist || UNKNOWN_ARTIST, explicit };
     if (durationMs) meta.durationMs = durationMs;
@@ -177,7 +237,8 @@ export function playlistFromMarkdown(md, ref) {
   if (!tracks.length) return { kind: 'bad' };
   return {
     kind: 'playlist',
-    rawCount: tracks.length,
+    rawCount: found,
+    found,
     playlist: {
       id: `spotify:${ref.type}:${ref.id}`,
       source: 'spotify',
@@ -230,8 +291,9 @@ export const RELAYS = [
 
 /**
  * One relay, one try.
- * @returns {Promise<{kind: 'playlist', playlist: import('./index.js').Playlist, rawCount: number, via: string}
+ * @returns {Promise<{kind: 'playlist', playlist: import('./index.js').Playlist, rawCount: number, found: number, via: string}
  *                 | {kind: 'not-found', via: string} | {kind: 'empty', via: string} | {kind: 'fail', via: string, reason: string}>}
+ *          reason: 'timeout', 'too-large', 'network', 'http 502', … (for the log)
  */
 export async function tryRelay(relay, ref, opts = {}) {
   const req = relay.build(embedUrl(ref.type, ref.id));
@@ -242,6 +304,7 @@ export async function tryRelay(relay, ref, opts = {}) {
       timeoutMs: opts.timeoutMs || ATTEMPT_TIMEOUT_MS,
       headers: req.headers,
       as: req.as,
+      maxBytes: MAX_RELAY_BYTES,
       fetchImpl: opts.fetchImpl,
     });
   } catch (err) {
@@ -255,9 +318,9 @@ export async function tryRelay(relay, ref, opts = {}) {
   const entity = read.entity;
   // A relay must answer for the playlist we asked about (guards against a stale/wrong cached page).
   if (typeof entity.id === 'string' && entity.id !== ref.id) return { kind: 'fail', via: relay.name, reason: 'wrong entity' };
-  const { playlist, rawCount } = playlistFromEntity(entity, ref);
+  const { playlist, rawCount, found } = playlistFromEntity(entity, ref);
   if (!playlist.tracks.length) return { kind: 'empty', via: relay.name };
-  return { kind: 'playlist', playlist, rawCount, via: relay.name };
+  return { kind: 'playlist', playlist, rawCount, found, via: relay.name };
 }
 
 /** Markdown rendering via r.jina.ai — independent of the __NEXT_DATA__ format. */
@@ -268,6 +331,7 @@ export async function tryMarkdown(ref, opts = {}) {
       signal: opts.signal,
       timeoutMs: opts.timeoutMs || ATTEMPT_TIMEOUT_MS,
       as: 'text',
+      maxBytes: MAX_RELAY_BYTES,
       fetchImpl: opts.fetchImpl,
     });
   } catch (err) {
@@ -292,6 +356,7 @@ export async function spotifyOEmbed(ref, opts = {}) {
       signal: opts.signal,
       timeoutMs: opts.timeoutMs || 3000,
       as: 'json',
+      maxBytes: MAX_META_BYTES,
       fetchImpl: opts.fetchImpl,
     });
     if (!res.ok || !res.body || typeof res.body !== 'object') return null;
@@ -310,7 +375,7 @@ export async function spotifyTrackCount(ref, opts = {}) {
   const selector = 'meta[name="music:song_count"]';
   const url = `https://web.scraper.workers.dev/?url=${encodeURIComponent(pageUrl(ref.type, ref.id))}&selector=${encodeURIComponent(selector)}&scrape=attr&attr=content`;
   try {
-    const res = await request(url, { signal: opts.signal, timeoutMs: opts.timeoutMs || 2500, as: 'json', fetchImpl: opts.fetchImpl });
+    const res = await request(url, { signal: opts.signal, timeoutMs: opts.timeoutMs || 2500, as: 'json', maxBytes: MAX_META_BYTES, fetchImpl: opts.fetchImpl });
     const raw = res.ok && res.body ? res.body.result : undefined;
     const n = Number(typeof raw === 'string' ? raw : Array.isArray(raw) ? raw[0] : NaN);
     return Number.isInteger(n) && n > 0 && n < 1e6 ? n : undefined;
@@ -446,11 +511,14 @@ export async function loadSpotify(ref, opts = {}) {
   if (result.kind === 'not-found') throw new SourceError('not-found', NOT_FOUND_MESSAGE, { detail: `via ${result.via}` });
   if (result.kind === 'empty') throw new SourceError('empty', `That ${thing} has no songs in it yet.`, { detail: `via ${result.via}` });
 
-  const { playlist, rawCount } = result;
+  const { playlist, rawCount, found } = result;
+  // More songs in the answer than were kept: say so even if the real count cannot be had.
+  let total = found > playlist.tracks.length ? found : 0;
   if (rawCount >= SPOTIFY_EMBED_CAP) {
     // The embed stops at 100; find out how long the playlist really is.
-    const total = await spotifyTrackCount(ref, { fetchImpl: opts.fetchImpl, signal });
-    if (total && total > playlist.tracks.length) playlist.total = total;
+    const real = await spotifyTrackCount(ref, { fetchImpl: opts.fetchImpl, signal });
+    if (real && real > total) total = real;
   }
+  if (total > playlist.tracks.length) playlist.total = total;
   return playlist;
 }

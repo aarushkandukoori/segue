@@ -672,6 +672,12 @@ a {
   color: #ff8d95;
 }
 
+/* A message (on a phone it runs to three lines) keeps its distance from what follows it. */
+.l-hint:not(:empty) {
+  padding-bottom: 16px;
+  line-height: 1.4;
+}
+
 .l-demos {
   display: flex;
   align-items: center;
@@ -854,6 +860,21 @@ a {
 .l-text-panel textarea:focus-visible {
   outline: none;
   border-color: var(--ink-3);
+}
+
+/* a failed list: same message slot as under the link field, but it takes no room while empty */
+.l-text-panel textarea.is-invalid {
+  border-color: var(--rec);
+}
+
+.l-text-hint {
+  min-height: 0;
+  margin-top: 0;
+  padding-left: 2px;
+}
+
+.l-text-hint:empty {
+  display: none;
 }
 
 /* iOS zooms the whole page when a field under 16px takes focus */

@@ -17,7 +17,7 @@
 
 import { createPlanner, holdPlayAt, MODES } from './planner.js';
 import { createRng, randomSeed } from '../util/rng.js';
-import { evalParam, sortEvents, timeAtPosition } from './timeline.js';
+import { dbToGain, evalParam, positionAt, rateAt, sortEvents, timeAtPosition } from './timeline.js';
 
 /** Crate window: the next track is chosen among the first WINDOW unplayed tracks of the base order. */
 export const WINDOW = 5;
@@ -27,6 +27,12 @@ export const HEAD = 3;
 const MARGIN = 0.3;
 /** After the first head track is ready, how long the rest of the head may take before we start anyway. */
 const HEAD_GRACE_MS = 2500;
+/** The same for a set that must come out as its link says (seed from a share link): the opener is chosen from the whole head, so wait for it — within reason. */
+const HEAD_PATIENT_MS = 10000;
+/** A mid-solo trick stays announced at least this long (most are over in half a second). */
+const TRICK_HOLD = 2;
+/** Moving the Vibe slider re-plans the announced transition once the slider has rested this long. */
+const VIBE_SETTLE_MS = 600;
 /** Plays remembered for the setlist. */
 const HISTORY = 60;
 /** Playlists up to this size keep their compressed audio for the whole session (no refetch on replays). */
@@ -34,6 +40,9 @@ const KEEP_BYTES_UP_TO = 24;
 const TICK_MS = 200;
 
 const REST = { gain: 1, src: 1, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, delaySend: 0, reverbSend: 0 };
+const REST_PARAMS = Object.keys(REST);
+/** Moves that lay the incoming track over the outgoing one. */
+const OVERLAPS = ['bassSwap', 'eqBlend', 'filterBlend', 'reverbWash'];
 const STAGE_WEIGHT = { resolve: 0.15, fetch: 0.45, decode: 0.7, analyze: 0.85 };
 
 const clamp01 = (v) => (v > 0 ? (v < 1 ? v : 1) : 0);
@@ -123,6 +132,44 @@ export function nextCycleOrder(seed, cycle, alive, waiting, recent) {
   return fresh.filter((id) => !hold.has(id)).concat(fresh.filter((id) => hold.has(id)));
 }
 
+/**
+ * One deck of the per-frame UI state at set time t, written into `df` (no allocation): where the
+ * needle is, how fast it turns and where the strip's controls stand.
+ * A deck that is not sounding — cued and waiting for its start, or stopped — reports fader 0 and
+ * audible 0: its automation only begins with its first event, and until then the fader would read its
+ * default (fully up) while nothing can be heard. `startsIn` is the set time left until a cued deck
+ * starts (0 once it has): the view parks the waveform in its lane and counts it down with it.
+ * @param {{pos:number, rate:number, bpmNow:number, gain:number, low:number, mid:number, high:number, hpf:number, lpf:number, audible:number, startsIn:number}} df
+ * @param {object} play Play
+ * @param {{bpm:number, duration:number}} analysis
+ * @param {number} t set time
+ * @returns {boolean} true while the deck's source is running
+ */
+export function deckFrameAt(df, play, analysis, t) {
+  const ev = play.events;
+  const end = play.endAt;
+  df.pos = positionAt(play, t);
+  df.startsIn = t < play.startAt ? play.startAt - t : 0;
+  df.rate = t < play.startAt ? play.rate[0].v : rateAt(play, end != null && t > end ? end : t);
+  df.bpmNow = analysis.bpm * df.rate;
+  const running = t >= play.startAt && (end == null || t < end) && df.pos < analysis.duration;
+  df.gain = running ? evalParam(ev, 'gain', t, 1) : 0;
+  df.low = evalParam(ev, 'low', t, 0);
+  df.mid = evalParam(ev, 'mid', t, 0);
+  df.high = evalParam(ev, 'high', t, 0);
+  df.hpf = evalParam(ev, 'hpf', t, 20);
+  df.lpf = evalParam(ev, 'lpf', t, 20000);
+  if (running) {
+    // A rough "how much of this deck can you hear": fader × what the EQ and filters leave.
+    const eq = 0.5 * dbToGain(df.low) + 0.3 * dbToGain(df.mid) + 0.2 * dbToGain(df.high);
+    const hp = 1 - Math.log(Math.max(df.hpf, 20) / 20) / 9;
+    const lp = Math.log(Math.max(df.lpf, 40) / 20) / Math.log(1000);
+    const a = df.gain * eq * (hp > 0.25 ? hp : 0.25) * (lp > 0.3 ? (lp < 1 ? lp : 1) : 0.3);
+    df.audible = a < 1 ? a : 1;
+  } else df.audible = 0;
+  return running;
+}
+
 function newEntry(meta, idx) {
   return {
     id: meta.id,
@@ -188,10 +235,16 @@ export function createConductor(deps) {
   let entries = new Map();
   /** @type {string[]} */
   let ids = [];
-  let jobs = 0;
-  let bgJobs = 0;
+  /**
+   * Preparation work in flight. One object per crate: a decode or an analysis of an abandoned crate
+   * cannot be aborted, and when it finally ends it must give its slot back to its own crate's count,
+   * not take one from the crate that was loaded since.
+   */
+  let inFlight = { jobs: 0, bg: 0 };
   let stamp = 0;
   let longTracks = false;
+  /** This crate has produced a playable track at least once: the catalogues can be reached, so a network error is a hiccup to retry, never a verdict on the track. */
+  let everReady = false;
 
   // ── set state (lives as long as the seed) ────────────────────────────────────────────────────
   let setGen = 0;
@@ -205,13 +258,24 @@ export function createConductor(deps) {
   let order = [];
   /** @type {string[]} unplayed ids in base order; later cycles are appended */
   let queue = [];
+  /** @type {Map<string, number>} which pass through the crate (cycle) each queued id belongs to */
+  let queuePass = new Map();
   let cycle = 0;
   /** @type {any[]} PlayRec: {id, play, entry, tr, buffer, key, tricks, gone} */
   let plays = [];
   let started = false;
   let starting = false;
   let allowed = false;
+  /** The set is held: the user paused it, or the browser stopped (or never started) the audio. */
   let paused = false;
+  /** …and it was the user who did. Only then does it take the user to bring it back. */
+  let userPaused = false;
+  /** @type {Promise<void>|null} an engine.pause() still on its way */
+  let pausing = null;
+  /** Wait for the whole head before choosing the opener (a set that has to match its share link). */
+  let patient = false;
+  /** Wall-clock ms from which the announced transition should be planned again (Track length / Vibe changed); 0 = no. */
+  let replanAt = 0;
   /** @type {Promise<void>|null} serialises planning and Skip */
   let busy = null;
   /** @type {string|null} */
@@ -224,6 +288,7 @@ export function createConductor(deps) {
   let lastStatus = '';
   let offStart = null;
   let offEnd = null;
+  let offState = null;
 
   /** Per-frame data for the UI: the play record on each deck (null = empty). Same object every time. */
   const live = { /** @type {[any, any]} */ decks: [null, null] };
@@ -262,7 +327,7 @@ export function createConductor(deps) {
     }
     // Background: find out which of the remaining tracks have audio at all (cheap, keeps the setlist
     // honest). Bounded so slow catalogue fallbacks cannot starve the look-ahead above.
-    if (bgJobs < Math.min(2, concurrency() - 1)) {
+    if (inFlight.bg < Math.min(2, concurrency() - 1)) {
       for (const id of order) {
         const e = entries.get(id);
         if (e && !e.ref && !e.resolveTried && e.status === 'idle') return { kind: 'resolve', e };
@@ -273,7 +338,7 @@ export function createConductor(deps) {
 
   function schedule() {
     if (!playlist || fatal) return;
-    while (jobs < concurrency()) {
+    while (inFlight.jobs < concurrency()) {
       const job = pickJob();
       if (!job) break;
       run(job);
@@ -283,9 +348,10 @@ export function createConductor(deps) {
   function run(job) {
     const { e, kind } = job;
     const g = crateGen;
+    const w = inFlight;
     const signal = abort ? abort.signal : undefined;
-    jobs++;
-    if (kind === 'resolve') bgJobs++;
+    w.jobs++;
+    if (kind === 'resolve') w.bg++;
     e.status = 'working';
     e.stage = e.ref ? 'fetch' : 'resolve';
     bump();
@@ -295,8 +361,8 @@ export function createConductor(deps) {
         if (g === crateGen) failEntry(e, err);
       })
       .then(() => {
-        jobs--;
-        if (kind === 'resolve') bgJobs--;
+        w.jobs--;
+        if (kind === 'resolve') w.bg--;
         if (g !== crateGen) return;
         bump();
         pump();
@@ -365,7 +431,18 @@ export function createConductor(deps) {
     e.status = 'ready';
     e.stage = '';
     e.error = null;
+    e.tries = 0;
     if (!headSince) headSince = clock();
+    if (!everReady) {
+      everReady = true;
+      // The catalogues answer after all: tracks given up on while nothing got through get another go.
+      for (const x of entries.values()) {
+        if (x.dead && x.error && x.error.code === 'network') {
+          x.dead = false;
+          x.retryAt = clock();
+        }
+      }
+    }
   }
 
   function failEntry(e, err) {
@@ -381,7 +458,10 @@ export function createConductor(deps) {
     // Worth another go: the network hiccuped, or a catalogue was too busy to be asked.
     const network = code === 'network';
     const busyCatalogue = code === 'no-match' && err && err.final === false;
-    if (network && (started || e.tries < 3)) {
+    // Until the crate has produced a single track, three tries is all a track gets: that is how a
+    // first load that reaches nothing comes to an end (checkFatal). After that, losing the network
+    // never costs a track — not during a set, and not in the gap a New Set opens.
+    if (network && (everReady || e.tries < 3)) {
       e.retryAt = clock() + Math.min(60000, 4000 * 2 ** (e.tries - 1));
     } else if (busyCatalogue && e.tries < 3) {
       e.retryAt = clock() + 45000;
@@ -476,22 +556,39 @@ export function createConductor(deps) {
     return k;
   }
 
-  function commit(tr, head, e, buffer) {
+  /**
+   * Hand a plan to the engine and remember it as the newest play. `fresh` = the track is taken from
+   * the queue for this slot; false = the slot's plan is replaced (Skip, re-plan) and the track keeps
+   * its turn — the queue is left alone (in a small crate it may already hold the track's NEXT turn).
+   */
+  function commit(tr, head, e, buffer, fresh = true) {
     applyTransition(engine, head ? head.play : null, tr, buffer);
+    const round = fresh ? e.playCount++ : e.playCount - 1;
     const rec = {
       id: tr.play.id,
       play: { ...tr.play, events: tr.play.events.slice(), rate: tr.play.rate.slice() },
       entry: e,
       tr,
       buffer,
-      key: `${e.id}|${e.playCount}`,
+      round,
+      key: `${e.id}|${round}`,
       tricks: trickWindows(tr),
       gone: false,
     };
     plays.push(rec);
-    e.playCount++;
-    const at = queue.indexOf(e.id);
-    if (at >= 0) queue.splice(at, 1);
+    const at = fresh ? queue.indexOf(e.id) : -1;
+    if (at >= 0) {
+      const pass = queuePass.get(e.id);
+      queue.splice(at, 1);
+      queuePass.delete(e.id);
+      // The next pass was queued while this track was still waiting for its turn in this one, so it
+      // is not in it (an id is in the queue once). It joins that pass now, at the back: every pass
+      // plays every track exactly once.
+      if (pass < cycle) {
+        queue.push(e.id);
+        queuePass.set(e.id, cycle);
+      }
+    }
     // Big playlists let the compressed audio go once it is in the mix; it is fetched again if the
     // track comes round in a later pass.
     if (e.bytes && entries.size > KEEP_BYTES_UP_TO) {
@@ -517,8 +614,63 @@ export function createConductor(deps) {
       );
       if (!more.length) break;
       cycle++;
+      for (const id of more) queuePass.set(id, cycle);
       queue.push(...more);
       bump();
+    }
+  }
+
+  /**
+   * What the next slot is chosen from: the tracks of the crate window that are ready — but while the
+   * pass being finished still has any, only those. Without this a track the planner never favours
+   * (the one ballad in a crate of house) always loses to four better fits and is never played, and a
+   * small crate keeps coming back to the same favourites; with it every pass plays every track once.
+   * And while there is a choice, not the playing track again nor the one before it (A-B-A): a crate
+   * of three simply goes round in order.
+   */
+  function pool(win) {
+    let ready = win.filter(isReady);
+    if (ready.length < 2) return ready;
+    const pass = queuePass.get(win[0].id);
+    const due = ready.filter((e) => queuePass.get(e.id) === pass);
+    if (due.length) ready = due;
+    const n = plays.length;
+    const cur = n ? plays[n - 1].entry : null;
+    const prev = n > 1 ? plays[n - 2].entry : null;
+    const far = ready.filter((e) => e !== cur && e !== prev);
+    if (far.length) return far;
+    const other = ready.filter((e) => e !== cur);
+    return other.length ? other : ready;
+  }
+
+  /**
+   * Stand-ins when the crate window has nothing ready and nothing on its way either — every track in
+   * it has failed and waits for a retry, which is what a lost connection looks like: whatever else is
+   * in hand, in queue order. Playing those beats going silent until the network is back.
+   */
+  function spare(win, max) {
+    if (!win.length || !win.every((e) => e.status === 'failed')) return [];
+    return upcoming(Infinity).filter(isReady).slice(0, max);
+  }
+
+  /**
+   * planner.next for the conductor's records. The one case of its own: a track handed over to
+   * ITSELF (the only playable track in the crate coming round again) is never laid over itself —
+   * it plays out (full-length files: to their outro, whatever the track length says), echoes out or
+   * cuts, and starts over.
+   */
+  function plan(head, e, opts) {
+    const prev = { play: head.play, analysis: head.entry.analysis };
+    const incoming = { id: e.id, analysis: e.analysis };
+    if (e !== head.entry) return planner.next(prev, incoming, opts);
+    const mode = planner.mode;
+    if (mode !== 'preview' && !opts.quick) planner.setMode('full');
+    try {
+      let tr = planner.next(prev, incoming, { ...opts, force: { type: 'echoOut' } });
+      if (OVERLAPS.includes(tr.type)) tr = planner.next(prev, incoming, { ...opts, force: { type: 'cut' } });
+      return tr;
+    } finally {
+      planner.setMode(mode);
     }
   }
 
@@ -553,10 +705,11 @@ export function createConductor(deps) {
   function tryStart() {
     if (started || starting || !allowed || fatal || !planner) return;
     const head = upcoming(HEAD);
-    const ready = head.filter(isReady);
+    let ready = head.filter(isReady);
+    if (!ready.length) ready = spare(head, HEAD);
     if (!ready.length) return;
     const all = head.every(settled) && head.length >= Math.min(HEAD, ids.length);
-    if (!all && clock() - headSince < HEAD_GRACE_MS) return;
+    if (!all && clock() - headSince < (patient ? HEAD_PATIENT_MS : HEAD_GRACE_MS)) return;
     starting = true;
     const g = setGen;
     const idx = planner.chooseNext(null, ready.map(cand), { playIndex: 0, recentArtists: [] });
@@ -587,7 +740,11 @@ export function createConductor(deps) {
         }
         if (g !== setGen) return;
         started = true;
-        paused = false;
+        userPaused = false;
+        // An honest start: where the browser would not let the audio run without a tap (Safari once
+        // its file picker has closed, any browser after a drop) the set is cued, not playing — it
+        // waits at set time 0 for resume().
+        paused = !audioRunning();
         bump();
         emit('start', { seed, trackId: e.id });
       } finally {
@@ -633,7 +790,8 @@ export function createConductor(deps) {
     if (now < head.play.startAt - 0.5) return;
     const alive = ids.reduce((n, id) => n + (entries.get(id).dead ? 0 : 1), 0);
     const win = upcoming(WINDOW);
-    const ready = win.filter(isReady);
+    let ready = pool(win);
+    if (!ready.length) ready = spare(win, WINDOW);
     if (!ready.length) return;
     const full = win.length >= Math.min(WINDOW, alive) && win.every(settled);
     if (!full) {
@@ -658,7 +816,7 @@ export function createConductor(deps) {
         }
         if (g !== setGen || plays[plays.length - 1] !== head) return;
         const tNow = engine.now();
-        const tr = planner.next({ play: head.play, analysis: cur.analysis }, { id: e.id, analysis: e.analysis }, { earliest: earliestFor(head, tNow) });
+        const tr = plan(head, e, { earliest: earliestFor(head, tNow) });
         commit(tr, head, e, buffer);
       } finally {
         e.pinned--;
@@ -681,13 +839,15 @@ export function createConductor(deps) {
     }
     // The strip must be at rest: a cancel freezes whatever a trick was in the middle of.
     const ev = cur.play.events;
-    for (const p of Object.keys(REST)) {
+    for (const p of REST_PARAMS) {
       const v = evalParam(ev, p, now, REST[p]);
       const ok = p === 'hpf' ? v < 40 : p === 'lpf' ? v > 15000 : Math.abs(v - REST[p]) < 0.02;
       if (!ok) return null;
     }
     if (next) return { cur, next, entry: next.entry };
-    const ready = upcoming(WINDOW).filter(isReady);
+    const win = upcoming(WINDOW);
+    let ready = pool(win);
+    if (!ready.length) ready = spare(win, WINDOW);
     if (!ready.length) return null;
     return { cur, next: null, entry: null, ready };
   }
@@ -697,8 +857,19 @@ export function createConductor(deps) {
     if (!started) return false;
     const target = skipTarget(engine.now());
     if (!target) return false;
+    redo(target, true);
+    return true;
+  }
+
+  /**
+   * Take back what is scheduled from now on and plan the way out of the playing track again:
+   * `quick` = Skip (a short move on the next beat, into the announced track or a freshly chosen one);
+   * otherwise the announced transition is re-made under the current Track length / Vibe.
+   * Only ever called with a target skipTarget() vouched for: one track playing, its strip at rest.
+   */
+  function redo(target, quick) {
     const g = setGen;
-    exclusive(async () => {
+    return exclusive(async () => {
       const { cur } = target;
       let e = target.entry;
       if (!e) {
@@ -710,29 +881,40 @@ export function createConductor(deps) {
       try {
         const buffer = target.next && target.next.buffer ? target.next.buffer : await ensureBuffer(e);
         if (g !== setGen) return;
-        // Things may have moved while the audio was decoding: only act if Skip still means the same.
+        // Things may have moved while the audio was decoding: only act if the target still stands.
         const again = skipTarget0(engine.now());
         if (!again || again.cur !== cur || (again.next || null) !== (target.next || null)) return;
         // A hair ahead of the clock, so the engine and the planner cut at exactly the same instant.
         const T = engine.now() + 0.01;
         engine.cancelFrom(T);
-        if (target.next) {
-          plays.pop();
-          e.playCount--;
-        }
+        if (target.next) plays.pop();
         cur.play = engine.getPlay(cur.id) || holdPlayAt(cur.play, T);
-        const tr = planner.next(
-          { play: cur.play, analysis: cur.entry.analysis },
-          { id: e.id, analysis: e.analysis },
-          { earliest: T + 0.25, quick: true, cancelledAt: T },
-        );
-        commit(tr, cur, e, buffer);
-        emit('skip', { to: e.id });
+        const tr = plan(cur, e, quick ? { earliest: T + 0.25, quick: true, cancelledAt: T } : { earliest: T + MARGIN, cancelledAt: T });
+        commit(tr, cur, e, buffer, !target.next);
+        if (quick) emit('skip', { to: e.id });
       } finally {
         e.pinned--;
       }
     });
-    return true;
+  }
+
+  /**
+   * Track length or Vibe changed while a transition was already announced: plan it again, so the
+   * control answers now instead of one track later (with full-length files that is minutes). Same
+   * incoming track, same guards as Skip; a transition that is about to begin stands as it is.
+   */
+  function maybeReplan(now) {
+    if (!replanAt || busy || paused || clock() < replanAt) return;
+    const k = currentIndex(now);
+    const next = plays[k + 1];
+    if (!next || now > next.tr.tStart - 0.4) {
+      replanAt = 0; // nothing announced yet (the plan to come uses the new settings), or too late for this one
+      return;
+    }
+    const target = skipTarget(now);
+    if (!target || target.next !== next) return; // still mixing in, or mid-trick: try again on a later tick
+    replanAt = 0;
+    redo(target, false);
   }
   /** skipTarget without the "nothing else is planning" condition (used from inside the planning step). */
   function skipTarget0(now) {
@@ -767,15 +949,66 @@ export function createConductor(deps) {
         tryStart();
         checkFatal();
       } else {
+        audioState(true);
         const now = engine.now();
         retire(now);
         refill();
         schedule();
+        maybeReplan(now);
         maybePlan(now);
       }
       trimBuffers();
     }
     publish();
+  }
+
+  /**
+   * Is the engine's context producing sound? engine.state answers without creating a context (reading
+   * engine.ctx before the first tap would create one outside a user gesture); an engine without it is
+   * only asked once the set has started, when its context exists.
+   */
+  function audioRunning() {
+    if (typeof engine.state === 'string') return engine.state === 'running';
+    const c = engine.ctx;
+    return !c || typeof c.state !== 'string' || c.state === 'running';
+  }
+
+  /**
+   * Make `paused` say what is true of the AudioContext. Called on the engine's 'statechange' (see
+   * startTimer); every tick checks as well. A context that stops by itself — a phone call, another
+   * app taking the audio session ("interrupted" on iOS), a browser that never let it start — holds
+   * the set like Pause does (same button, no planning), but it may also come back by itself.
+   * @param {boolean} [quiet] called from pump(): do not pump again
+   */
+  function audioState(quiet) {
+    if (!started) return;
+    const running = audioRunning();
+    if (running && userPaused) {
+      // The user pressed Pause while a resume was still on its way; now that it has landed, hold again.
+      if (!pausing) holdEngine();
+      return;
+    }
+    if (running === !paused) return;
+    paused = !running;
+    bump();
+    if (!quiet) pump();
+  }
+
+  /** engine.pause(), remembered while it is on its way (resume() has to know). Never rejects. */
+  function holdEngine() {
+    let asked;
+    try {
+      asked = Promise.resolve(engine.pause());
+    } catch (err) {
+      asked = Promise.reject(err);
+    }
+    const task = asked
+      .catch((err) => console.warn('[conductor] pause', err))
+      .then(() => {
+        if (pausing === task) pausing = null;
+      });
+    pausing = task;
+    return task;
   }
 
   function publish() {
@@ -798,6 +1031,7 @@ export function createConductor(deps) {
       live.decks[1] ? live.decks[1].id : -1,
       trickNow(now, k) ? 1 : 0,
       started && !!skipTarget(now),
+      started && stalledFor(now) ? 1 : 0,
     ].join('|');
     if (sig !== lastSig) {
       lastSig = sig;
@@ -823,11 +1057,30 @@ export function createConductor(deps) {
     }
   }
 
+  /** The mid-solo trick to announce at `now`: from its start until it is over, and for at least TRICK_HOLD (never into the transition itself). */
   function trickNow(now, k) {
     const next = plays[k + 1];
     if (!started || !next) return null;
-    for (const w of next.tricks) if (now >= w.t0 - 0.05 && now <= w.t1) return w;
+    for (const w of next.tricks) {
+      if (now >= w.t0 - 0.05 && now <= Math.min(Math.max(w.t1, w.t0 + TRICK_HOLD), next.tr.tStart)) return w;
+    }
     return null;
+  }
+
+  /**
+   * The set is running but nothing is: the last track has played out and no next one could be
+   * planned (the connection dropped, or everything else is still loading). Returns why, or ''.
+   * @returns {''|'network'|'loading'}
+   */
+  function stalledFor(now) {
+    if (!started || paused || !plays.length) return '';
+    for (const rec of plays) {
+      if (rec.gone) continue;
+      const end = rec.play.endAt != null ? rec.play.endAt : audioEnd(rec);
+      if (now < end + 0.6) return '';
+    }
+    for (const e of upcoming(WINDOW)) if (e.status === 'failed' && e.error && e.error.code === 'network') return 'network';
+    return 'loading';
   }
 
   function status() {
@@ -857,12 +1110,21 @@ export function createConductor(deps) {
       title = 'Dropping the needle';
       detail = allowed ? 'Starting the set…' : 'Ready when you are.';
     }
+    // Nothing to start with and the reason is the connection: say that, not "starting".
+    if (!head.some(isReady) && head.some((e) => e.status === 'failed' && !e.dead && e.error && e.error.code === 'network')) {
+      title = 'Waiting for the connection';
+      detail = 'Can’t reach the music right now — trying again…';
+      done = 0;
+    }
     return { title, detail, progress: clamp01(done / total) };
   }
 
   // ── public: lifecycle ────────────────────────────────────────────────────────────────────────
 
   function startTimer() {
+    // The engine reports every change of its AudioContext's state (a phone call, another app taking
+    // the audio, a resume that lands late): mirror it at once instead of on the next tick.
+    if (!offState && engine.on) offState = engine.on('statechange', () => audioState());
     if (!useTimers || timer) return;
     timer = setInterval(pump, TICK_MS);
     if (!offStart && engine.on) {
@@ -875,11 +1137,14 @@ export function createConductor(deps) {
     planner = createPlanner({ seed, vibe, mode: planMode() });
     order = planner.order(ids);
     queue = order.slice();
+    queuePass = new Map(order.map((id) => [id, 0]));
     cycle = 0;
     plays = [];
     started = false;
     starting = false;
     paused = false;
+    userPaused = false;
+    replanAt = 0;
     busy = null;
     fatal = null;
     headSince = [...entries.values()].some(isReady) ? clock() : 0;
@@ -894,7 +1159,9 @@ export function createConductor(deps) {
    * Load a playlist and begin preparing it. Playback starts as soon as an opener is ready and
    * begin() has been called (autostart: true calls it for you; a share link waits for the tap).
    * @param {any} pl Playlist
-   * @param {{seed?: string, vibe?: number, mode?: string, autostart?: boolean}} [opts]
+   * @param {{seed?: string, vibe?: number, mode?: string, autostart?: boolean, patient?: boolean}} [opts]
+   *   patient: the seed comes from a share link — choose the opener from the whole head of the order,
+   *   as the sender's set did, even if one of its tracks takes a while to arrive (up to 10 s).
    */
   function load(pl, opts = {}) {
     stop();
@@ -909,9 +1176,10 @@ export function createConductor(deps) {
       entries.set(meta.id, newEntry(meta, ids.length));
       ids.push(meta.id);
     }
-    jobs = 0;
-    bgJobs = 0;
+    inFlight = { jobs: 0, bg: 0 };
     longTracks = false;
+    everReady = false;
+    patient = !!opts.patient;
     seed = String(opts.seed || randomSeed());
     if (Number.isFinite(opts.vibe)) vibe = clamp01(opts.vibe);
     if (MODES.includes(opts.mode)) userMode = opts.mode;
@@ -938,6 +1206,7 @@ export function createConductor(deps) {
     setGen++;
     resetDone = Promise.resolve(engine.reset()).catch(() => {});
     seed = String(nextSeed || randomSeed());
+    patient = false;
     newPlanner();
     allowed = true;
     pump();
@@ -963,6 +1232,8 @@ export function createConductor(deps) {
     starting = false;
     allowed = false;
     paused = false;
+    userPaused = false;
+    replanAt = 0;
     busy = null;
     fatal = null;
     live.decks[0] = live.decks[1] = null;
@@ -971,26 +1242,45 @@ export function createConductor(deps) {
     bump();
   }
 
+  /** The user pauses the set. It stays paused until resume(), whatever the AudioContext does meanwhile. */
   async function pause() {
-    if (!started || paused) return;
+    if (!started || userPaused) return;
+    userPaused = true;
     paused = true;
     bump();
     publish();
-    await engine.pause();
+    await holdEngine();
   }
 
+  /**
+   * Play: the user's pause is lifted and the context is asked to run — also when the conductor
+   * thought it was running already (the browser may have stopped it without telling anyone). Call it
+   * synchronously from the tap. The set only counts as playing if the context really runs afterwards:
+   * a resume the browser refuses (no user gesture, an interruption still going on) leaves it paused.
+   */
   async function resume() {
-    if (!started || !paused) return;
+    if (!started) return;
+    userPaused = false;
+    const held = pausing;
     await engine.resume();
-    paused = false;
-    bump();
-    pump();
+    if (held) {
+      // Play pressed while the Pause before it was still on its way: once that has landed, undo it.
+      await held;
+      if (!userPaused && started) await engine.resume();
+    }
+    audioState();
   }
 
   function setVibe(v) {
     if (!Number.isFinite(v)) return;
-    vibe = clamp01(v);
+    const next = clamp01(v);
+    if (next === vibe) return;
+    vibe = next;
     if (planner) planner.setVibe(vibe);
+    // Full-length sets: the announced transition may be minutes away — plan it again once the slider
+    // rests. Previews are left alone: the next one is seconds away, and re-planning would make a
+    // shared set depend on when its listener touched the slider.
+    if (started && isLocal()) replanAt = clock() + VIBE_SETTLE_MS;
     bump();
   }
 
@@ -998,9 +1288,12 @@ export function createConductor(deps) {
   function setMode(m) {
     if (!MODES.includes(m)) return;
     userMode = m;
-    if (planner) planner.setMode(planMode());
+    if (planner && planner.mode !== planMode()) {
+      planner.setMode(planMode());
+      if (started) replanAt = clock();
+    }
     bump();
-    publish();
+    pump();
   }
 
   function setVolume(v) {
@@ -1051,23 +1344,31 @@ export function createConductor(deps) {
     });
     if (now < cur.tr.tEnd) return view(cur, 'active');
     const next = plays[k + 1];
-    if (!next) return null;
-    const w = trickNow(now, k);
-    if (w) {
+    if (!next) {
+      const why = stalledFor(now);
+      if (!why) return null;
+      // Nothing is playing and nothing is planned: say what the set is waiting for, for as long as it waits.
+      const since = audioEnd(plays[plays.length - 1]);
       return {
-        type: 'trick',
-        label: w.label,
-        why: `A little something on ${cur.entry.meta.title}`,
+        type: 'wait',
+        label: 'Waiting for the next track',
+        why: why === 'network' ? 'Can’t reach the music right now — the set picks up when the connection is back.' : 'The set picks up as soon as it has loaded.',
+        reason: why,
         fromTitle: '',
         toTitle: '',
-        state: 'active',
-        tStart: w.t0,
-        tEnd: w.t1,
+        state: 'waiting',
+        tStart: since,
+        tEnd: since,
         marks: [],
         synced: false,
       };
     }
-    return view(next, 'upcoming');
+    // A mid-solo trick does not take the ticker over (it is gone in half a second, and what comes
+    // next would be announced all over again): it rides along on the upcoming transition.
+    const tv = view(next, 'upcoming');
+    const w = trickNow(now, k);
+    if (w) tv.trick = { label: w.label, on: cur.entry.meta.title, tStart: w.t0, tEnd: w.t1 };
+    return tv;
   }
 
   function setlistItems(now, k) {
@@ -1091,17 +1392,27 @@ export function createConductor(deps) {
       });
     };
     const mixing = started && k > 0 && now < plays[k].tr.tEnd;
+    /** Tracks in the mix or announced right now. */
+    const onAir = new Set();
     plays.forEach((rec, i) => {
       let state = 'played';
-      if (i === k) state = mixing ? 'mixing' : 'playing';
+      // (a track whose audio has run out is not "now" any more, even if nothing has followed it yet)
+      if (i === k) state = mixing ? 'mixing' : rec.gone ? 'played' : 'playing';
       else if (i === k - 1 && mixing) state = 'playing';
       else if (i > k) state = 'next';
-      row(rec.entry, rec.key, state, { via: rec.tr.label, deck: rec.play.deck });
+      if (state !== 'played') onAir.add(rec.entry);
+      // `again`: this track has been heard before in this set (the crate has come round).
+      row(rec.entry, rec.key, state, { via: rec.tr.label, deck: rec.play.deck, ...(rec.round > 0 ? { again: true } : {}) });
     });
+    // What is still to come in this pass through the crate. The next pass is queued behind it as soon
+    // as fewer than a window's worth remains; listing it too would show a short crate's tracks twice
+    // (and a track under itself while it is playing) — it appears when its turn comes.
+    const head = upcoming(1)[0];
+    const pass = head ? queuePass.get(head.id) : 0;
     for (const id of queue) {
       const e = entries.get(id);
-      if (!e || e.dead) continue;
-      row(e, `${e.id}|${e.playCount}`, e.status === 'working' ? 'loading' : 'queued');
+      if (!e || e.dead || queuePass.get(id) !== pass || onAir.has(e)) continue;
+      row(e, `${e.id}|${e.playCount}`, e.status === 'working' ? 'loading' : 'queued', e.playCount > 0 ? { again: true } : undefined);
     }
     for (const e of entries.values()) if (e.dead) row(e, `${e.id}|x`, 'failed');
     return items;
@@ -1112,13 +1423,15 @@ export function createConductor(deps) {
     let ready = 0;
     let failed = 0;
     let analysed = 0;
+    let pending = 0;
     for (const e of entries.values()) {
       if (e.ref) resolved++;
       if (isReady(e)) ready++;
       if (e.analysis) analysed++;
       if (e.dead) failed++;
+      else if (!e.ref) pending++; // (a track can be found and then fail: counted once, as failed)
     }
-    return { total: entries.size, resolved, ready, analysed, failed, pending: entries.size - resolved - failed };
+    return { total: entries.size, resolved, ready, analysed, failed, pending };
   }
 
   /** Everything the view needs outside the per-frame path. A fresh object each call. */
@@ -1132,6 +1445,8 @@ export function createConductor(deps) {
       started,
       playing: started && !paused,
       paused,
+      /** '' | 'network' | 'loading': the set is running but silent, waiting for a track */
+      stalled: stalledFor(now),
       fatal,
       seed,
       vibe,
@@ -1180,14 +1495,15 @@ export function createConductor(deps) {
       if (e.bytes) bytes += e.bytes.byteLength;
       if (e.status === 'failed' && e.error) failures[e.error.code] = (failures[e.error.code] || 0) + 1;
     }
-    return { buffers, bytes, failures, jobs, queue: queue.length, plays: plays.length, activePlays: plays.filter((r) => !r.gone).length, cycle, order: order.slice(), engine: engine.debug ? engine.debug() : null };
+    return { buffers, bytes, failures, jobs: inFlight.jobs, queue: queue.length, plays: plays.length, activePlays: plays.filter((r) => !r.gone).length, cycle, order: order.slice(), engine: engine.debug ? engine.debug() : null };
   }
 
   function destroy() {
     stop();
     if (offStart) offStart();
     if (offEnd) offEnd();
-    offStart = offEnd = null;
+    if (typeof offState === 'function') offState();
+    offStart = offEnd = offState = null;
     listeners.clear();
   }
 
@@ -1203,6 +1519,9 @@ export function createConductor(deps) {
     setVibe,
     setMode,
     setVolume,
+    audioState: () => audioState(),
+    /** Cheap enough for every animation frame: would Skip do something right now? */
+    canSkip: () => started && !!skipTarget(engine.now()),
     snapshot,
     history,
     debug,
@@ -1216,8 +1535,16 @@ export function createConductor(deps) {
     get started() {
       return started;
     },
+    /** Held: by the user, or because the browser stopped (or never started) the audio. */
     get paused() {
       return paused;
+    },
+    /** Held by the user's own Pause. */
+    get pausedByUser() {
+      return userPaused;
+    },
+    get vibe() {
+      return vibe;
     },
   };
 }

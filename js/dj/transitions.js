@@ -57,6 +57,15 @@ export const BRAKE_FLOOR = 0.03;
 export const FX_BUS_GUARD = 6;
 /** A bass swap is complete this long before its downbeat (kick transients start a little ahead of the grid). */
 export const SWAP_AHEAD_S = 0.02;
+/** Level range of the riser one-shot at its end (Fx.gain; see riserDrop). */
+export const RISER_GAIN = Object.freeze([0.42, 0.6]);
+/**
+ * A high-pass that reopens for a drop is fully open this long before the downbeat (see hpfBuild) — like
+ * SWAP_AHEAD_S, because the kick it makes room for starts a little ahead of the grid. (Measured on 16
+ * tricks: open 4 ms ahead the downbeat still peaked up to 0.4 dB over the record's own below 150 Hz,
+ * open 20 ms ahead it is the record's own to 0.0 dB.)
+ */
+export const REOPEN_AHEAD_S = 0.02;
 const MAX_DELAY_S = 0.9;
 const MAX_TAIL_S = 4;
 
@@ -178,6 +187,7 @@ function swapBass(A, B, t0, tDone) {
  * @property {number} pre              pre-roll seconds for drop-ins (0 if none)
  * @property {import('../util/rng.js').Rng} rng
  * @property {number} vibe
+ * @property {number} [inDb]           level of the incoming track where it enters, in dB against its own loud parts (≤ 0; 0 = full level or unknown)
  * @property {ReturnType<typeof createLane>} A    outgoing strip
  * @property {ReturnType<typeof createLane>} B    incoming strip
  * @property {ReturnType<typeof createLane>} bus  FX bus
@@ -201,6 +211,21 @@ function dropIn(c, over = {}) {
 function cutAt(lane, t) {
   lane.ramp('gain', t - CUT_S, t, 0);
 }
+
+/**
+ * Level of the impact one-shot (boom + crash) that stamps a drop. `lo … hi` suits an incoming track that
+ * enters at full level: there the boom sits at about the level of the music it announces (measured
+ * through the engine: its loudest 50 ms within a dB or two of the incoming programme) instead of
+ * doubling the downbeat. A track that enters quietly (an intro, a breakdown) gets a smaller boom: the
+ * first 3 dB under its loud parts are ordinary dynamics, beyond that the boom follows it down.
+ */
+function impactGain(c, lo, hi) {
+  const under = clamp(-(Number.isFinite(c.inDb) ? c.inDb : 0) - 3, 0, 15);
+  return c.rng.range(lo, hi) * dbToAmp(-0.7 * under);
+}
+
+/** Below "club" the percussive extras fade out: 0 at vibe 0, all there from vibe 0.2 up. */
+const edge = (vibe) => clamp(vibe / 0.2, 0, 1);
 
 /** A beat fraction that fits the delay line (long beats fall back to shorter fractions). */
 function delayTimeFor(beatSec, frac) {
@@ -253,22 +278,26 @@ function bassSwap(c) {
 /** EQ blend: three-band crossfade, highs first, then mids, bass last (handed over, never doubled). */
 function eqBlend(c) {
   const { A, B, at, L } = c;
-  // The bass is handed over last, across the beats leading into the three-quarter line (a bar line
-  // in 16- and 32-beat blends); with the kicks aligned, −8 dB each sums to about one full bass.
-  const lowX = 0.75 * L;
+  // The bass is handed over last, across the beats leading into a bar line: the three-quarter line of
+  // a 16- or 32-beat blend, the half-way line of an 8-beat one (its three-quarter line is beat 3 of a
+  // bar: the low end would change hands mid-phrase). With the kicks aligned, −8 dB each sums to about
+  // one full bass.
+  const lowX = L === 8 ? 4 : 0.75 * L;
   const lowW = Math.min(2, L / 4);
+  // (everything ahead of the bass keeps its place relative to it: highs, then mids, bass last)
+  const q = lowX / 0.75;
   B.init(c.bInit, { gain: 0, low: KILL_DB, mid: -15, high: -20 });
-  B.fade('gain', at(0), at(0.3 * L), 1, 'in');
-  A.eq('high', at(0.1 * L), at(0.45 * L), -22);
-  B.eq('high', at(0.1 * L), at(0.45 * L), 0);
-  A.eq('mid', at(0.35 * L), at(0.7 * L), -16);
-  B.eq('mid', at(0.35 * L), at(0.7 * L), 0);
+  B.fade('gain', at(0), at(0.3 * q), 1, 'in');
+  A.eq('high', at(0.1 * q), at(0.45 * q), -22);
+  B.eq('high', at(0.1 * q), at(0.45 * q), 0);
+  A.eq('mid', at(0.35 * q), at(0.7 * q), -16);
+  B.eq('mid', at(0.35 * q), at(0.7 * q), 0);
   swapBass(A, B, at(lowX - lowW), at(lowX) - SWAP_AHEAD_S);
   A.fade('gain', at(lowX), at(L), 0, 'out');
   c.marks.push(
     { t: at(0), label: 'Mix in' },
-    { t: at(0.1 * L), label: 'Highs' },
-    { t: at(0.35 * L), label: 'Mids' },
+    { t: at(0.1 * q), label: 'Highs' },
+    { t: at(0.35 * q), label: 'Mids' },
     { t: at(lowX - lowW), label: 'Bass' },
     { t: at(L), label: 'Mix out' },
   );
@@ -333,7 +362,7 @@ function cut(c) {
   }
   cutAt(A, X);
   dropIn(c);
-  if (rng.next() < 0.25 + 0.5 * c.vibe) c.fx.push({ kind: 'impact', t: X, gain: rng.range(0.45, 0.65) });
+  if (rng.next() < (0.25 + 0.5 * c.vibe) * edge(c.vibe)) c.fx.push({ kind: 'impact', t: X, gain: impactGain(c, 0.27, 0.39) });
   c.marks.push({ t: X, label: 'Cut' });
 }
 
@@ -359,9 +388,11 @@ function spinback(c) {
   }
   A.set('src', c.tS, 0);
   c.fx.push({ kind: 'reverse', playId: c.out.id, t: c.tS, dur, offset, len, rate0: r0, rate1: r1 });
-  A.ramp('gain', at(L * 0.5), X, 0);
+  // The fader only closes over the last quarter: closed any earlier, the spin has faded to nothing a
+  // few hundred ms before the drop it is supposed to wind into (measured: a hole of 150 – 300 ms).
+  A.ramp('gain', at(L * 0.75), X, 0);
   dropIn(c);
-  c.fx.push({ kind: 'impact', t: X, gain: rng.range(0.5, 0.7) });
+  c.fx.push({ kind: 'impact', t: X, gain: impactGain(c, 0.3, 0.42) });
   c.marks.push({ t: c.tS, label: 'Spinback' }, { t: X, label: 'Drop in' });
 }
 
@@ -369,7 +400,9 @@ function spinback(c) {
 function brake(c) {
   const { A, at, L, X } = c;
   c.aRate.push({ t: c.tS, v: c.out.rate(c.tS) }, { t: X, v: BRAKE_FLOOR, ramp: true });
-  A.ramp('gain', at(L * 0.45), X, 0);
+  // A stopping platter fades by itself (the pitch dives under what a speaker plays); the fader only
+  // tidies up the last fifth. Closing it from the middle left 100 – 300 ms of dead air before the drop.
+  A.ramp('gain', at(L * 0.8), X, 0);
   dropIn(c);
   c.marks.push({ t: c.tS, label: 'Brake' }, { t: X, label: 'Drop in' });
 }
@@ -397,16 +430,19 @@ function loopRoll(c) {
   A.ramp('hpf', c.tS, X, rng.range(1200, 2600));
   cutAt(A, X);
   dropIn(c);
-  if (rng.next() < 0.3 + 0.4 * c.vibe) c.fx.push({ kind: 'impact', t: X, gain: rng.range(0.45, 0.65) });
+  if (rng.next() < (0.3 + 0.4 * c.vibe) * edge(c.vibe)) c.fx.push({ kind: 'impact', t: X, gain: impactGain(c, 0.27, 0.39) });
   c.marks.push({ t: c.tS, label: 'Loop roll' }, { t: X, label: 'Drop' });
 }
 
 /** Riser → drop: noise riser into the bar line while the outgoing thins out; incoming drops on the one. */
 function riserDrop(c) {
   const { A, at, L, X, rng } = c;
-  // (gain 1 ≈ the riser's last moments as loud as a full track — measured through the engine; anything
-  // much lower disappears under the music it is supposed to lift)
-  c.fx.push({ kind: 'riser', t: c.tS, dur: X - c.tS, gain: rng.range(0.85, 1.2) });
+  // The riser is band-passed noise that ends up around 4 – 8 kHz, where the ear is at its most
+  // sensitive: judged by plain RMS a gain of 1 is "as loud as a full track", judged by loudness
+  // (K-weighted, measured through the engine) it is 5 – 9 LU hotter than the music and makes the drop
+  // it sets up sound like a step DOWN. At about half that its last moments sit level with the programme
+  // and still well above what is left of the thinned-out outgoing track.
+  c.fx.push({ kind: 'riser', t: c.tS, dur: X - c.tS, gain: rng.range(RISER_GAIN[0], RISER_GAIN[1]) });
   A.ramp('hpf', c.tS, X, rng.range(1000, 2600));
   // Sometimes pull the outgoing half a beat early: a breath of air before the drop.
   const gap = L >= 4 && rng.next() < 0.35 + 0.3 * c.vibe ? 0.5 : 0;
@@ -414,7 +450,7 @@ function riserDrop(c) {
   A.ramp('gain', at(L * 0.25), tCut - CUT_S, 0.7);
   A.ramp('gain', tCut - CUT_S, tCut, 0);
   dropIn(c);
-  c.fx.push({ kind: 'impact', t: X, gain: rng.range(0.5, 0.7) });
+  c.fx.push({ kind: 'impact', t: X, gain: impactGain(c, 0.3, 0.42) });
   c.marks.push({ t: c.tS, label: 'Riser' }, { t: X, label: 'Drop' });
 }
 
@@ -528,11 +564,18 @@ function beatRepeat(c) {
   c.marks.push({ t: at(k0), label: 'Beat repeat' });
 }
 
-/** High-pass build + drop: the lows drain away over the bar(s) and slam back on the downbeat. */
+/**
+ * High-pass build + drop: the lows drain away over the bar(s) and are back for the downbeat.
+ * The filter reopens during the last quarter beat BEFORE the drop and is fully open a moment ahead of
+ * it, so the kick on the one is the record's own. (Snapped open in 20 ms ON the downbeat, the moving
+ * filter rang with the kick: a thud up to 7 – 10 dB above the track's own low end, which the limiter
+ * then took out of the very beat that was meant to hit.)
+ */
 function hpfBuild(c) {
   const { A, at, rng, span } = c;
-  A.ramp('hpf', at(0), at(span), rng.range(700, 1300));
-  A.ramp('hpf', at(span), at(span) + 0.02, 20);
+  const open = at(span - 0.25);
+  A.ramp('hpf', at(0), open, rng.range(700, 1300));
+  A.ramp('hpf', open, at(span) - REOPEN_AHEAD_S, 20);
   c.marks.push({ t: at(0), label: 'Build' }, { t: at(span), label: 'Drop' });
 }
 

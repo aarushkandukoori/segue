@@ -172,6 +172,100 @@ test('censoredEqual: a star stands for one hidden letter', () => {
   assert.ok(accepted(W('Glow Up', 'Mara Vale', 200), W('Gl*w Up', 'Mara Vale', 200)));
 });
 
+const STAR = String.fromCharCode(42);
+
+test('censoredEqual: a star is zero or one letter or digit, never punctuation, a mark or two letters', () => {
+  const s = (text) => text.replaceAll('#', STAR);
+  for (const [a, b, want] of [
+    ['gl#w', 'glw', true], // the star may stand for nothing
+    ['gl#w', 'gloow', false], // …but not for two letters
+    ['gl##w', 'gloow', true],
+    ['gl###w', 'glow', true],
+    ['#low', 'glow', true],
+    ['glo#', 'glow', true],
+    ['glo#', 'glo', true],
+    ['track #', 'track 7', false], // a star on its own could be anything
+    ['tr#ck 7', 'track 7', true],
+    ['r#om 1#1', 'room 101', true], // digits count
+    ['gl#w', 'gl-w', false], // the plain side is two words there
+    ['gl#w up', 'glow', false], // word counts must agree
+    ['#l#w', 'blow', true],
+    ['#l#w', 'blown', false],
+    ['g#', 'go', true],
+    ['g#', 'no', false],
+    ['よるの#かり', 'よるのひかり', true],
+    ['よ#のひかり', 'よるのひかる', false],
+    ['gl#w', 'gl#w', true], // identical tokens are equal whatever they contain
+    ['gl#w', 'g#ow', false], // stars on both sides of one word: no guessing
+  ]) {
+    assert.equal(censoredEqual(s(a), b.includes('#') ? s(b) : b), want, `${a} / ${b}`);
+    assert.equal(censoredEqual(b.includes('#') ? s(b) : b, s(a)), want, `${b} / ${a} (other way round)`);
+  }
+  // A star hides a letter or a digit, not a combining mark (here a Devanagari vowel sign).
+  const KA = String.fromCodePoint(0x915);
+  const AA = String.fromCodePoint(0x93e);
+  assert.equal(censoredEqual(STAR + AA, KA + AA), true);
+  assert.equal(censoredEqual(KA + STAR, KA + AA), false, 'a star cannot stand for a vowel sign');
+});
+
+test('censoredEqual: agrees with the one-optional-letter-per-star definition on every short pattern', () => {
+  // Reference: the obvious regular expression. Only safe for a handful of stars, which is all this uses.
+  const reference = (pat, plain) => {
+    const body = Array.from(pat, (ch) => (ch === STAR ? '[\\p{L}\\p{N}]?' : ch)).join('');
+    return new RegExp(`^${body}$`, 'u').test(plain);
+  };
+  const alphabet = ['a', 'b', '7', STAR];
+  const plains = ['', 'a', 'b', 'ab', 'ba', 'a7', 'aab', 'abab', 'b7ab', 'aaaa'].filter(Boolean);
+  let checked = 0;
+  const walk = (prefix, depth) => {
+    if (prefix.includes(STAR) && /[ab7]/.test(prefix)) {
+      for (const plain of plains) {
+        if (plain === prefix) continue;
+        assert.equal(censoredEqual(prefix, plain), reference(prefix, plain), `${prefix.replaceAll(STAR, '#')} / ${plain}`);
+        checked++;
+      }
+    }
+    if (depth < 5) for (const ch of alphabet) walk(prefix + ch, depth + 1);
+  };
+  walk('', 0);
+  assert.ok(checked > 5000, `${checked} pairs`);
+});
+
+test('censoredEqual / scoreCandidate: a long run of stars cannot stall the page', async () => {
+  // Runs in a child process with a kill timer: the old implementation built a regular expression
+  // with one optional group per star, which never came back for ~40 stars — and a regex that is
+  // stuck cannot be interrupted from inside its own thread.
+  const { spawnSync } = await import('node:child_process');
+  const matchUrl = new URL('../js/sources/match.js', import.meta.url).href;
+  const code = `
+    import { censoredEqual, scoreCandidate, bestMatch } from ${JSON.stringify(matchUrl)};
+    const star = String.fromCharCode(42);
+    const out = [];
+    const t0 = performance.now();
+    for (const n of [30, 45, 60, 299, 5000]) {
+      const title = star.repeat(n) + 'z';
+      out.push(censoredEqual(title, 'wonderful'), censoredEqual('wonderful', title), censoredEqual(title + ' night', 'wonderful night'));
+      out.push(scoreCandidate({ title, artist: 'Mara Vale', durationMs: 200000 }, { title: 'Wonderful', artist: 'Mara Vale', durationMs: 200000 }).score < 0.7);
+      out.push(scoreCandidate({ title: 'Wonderful', artist: 'Mara Vale' }, { title, artist: 'Mara Vale' }).score < 0.7);
+      const page = Array.from({ length: 15 }, (_, i) => ({ title: 'Wonderful ' + i, artist: 'Mara Vale', durationMs: 200000 }));
+      out.push(bestMatch({ title, artist: 'Mara Vale', durationMs: 200000 }, page).score < 0.7);
+    }
+    // Many starred words, and stars that do match: still instant, still right.
+    out.push(censoredEqual(Array.from({ length: 60 }, () => 'w' + star.repeat(3) + 'd').join(' '), Array.from({ length: 60 }, () => 'word').join(' ')));
+    out.push(censoredEqual('w' + star.repeat(40) + 'd', 'word'));
+    // …while a "word" of hundreds of characters is not a censored word at all.
+    out.push(censoredEqual('w' + star.repeat(250) + 'd', 'word'));
+    console.log(JSON.stringify({ ms: performance.now() - t0, out }));
+  `;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { timeout: 20000, encoding: 'utf8' });
+  assert.equal(run.error, undefined, `did not finish: ${run.error && run.error.message}`);
+  assert.equal(run.status, 0, run.stderr);
+  const { ms, out } = JSON.parse(run.stdout);
+  const perSize = [false, false, false, true, true, true];
+  assert.deepEqual(out, [...perSize, ...perSize, ...perSize, ...perSize, ...perSize, true, true, false]);
+  assert.ok(ms < 1500, `took ${ms.toFixed(0)} ms`);
+});
+
 test('dice / durationScore: basic shape', () => {
   assert.equal(dice('night', 'night'), 1);
   assert.equal(dice('', ''), 0);

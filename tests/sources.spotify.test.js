@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   RELAYS,
   SPOTIFY_EMBED_CAP,
+  SPOTIFY_MAX_TRACKS,
   hedgedChain,
   loadSpotify,
   nextDataFromHtml,
@@ -290,6 +292,174 @@ test('playlistFromMarkdown: last-resort parse of the jina markdown shape', () =>
   }
 });
 
+/* ---------- answers built to be slow, or simply enormous ---------- */
+
+// Tags are put together from pieces so this file never contains one.
+const OPEN = ['<', 'script'].join('');
+const CLOSE = ['</', 'script>'].join('');
+const lean = (i) => ({ uri: `spotify:track:${String(i).padStart(22, 'a')}`, title: `Song ${i}`, subtitle: 'Mara Vale', duration: 200000 + i });
+
+test('nextDataFromHtml: tag case, quotes and attribute order do not matter; only a script tag with that id counts', () => {
+  const json = '{"props":{"n":1}}';
+  const want = { props: { n: 1 } };
+  const up = (text) => text.toUpperCase();
+  for (const html of [
+    `${OPEN} id="__NEXT_DATA__">${json}${CLOSE}`,
+    `${OPEN} id='__NEXT_DATA__' type="application/json">${json}${CLOSE}`,
+    `${OPEN} defer type="application/json" id="__NEXT_DATA__"\n crossorigin>${json}${CLOSE}`,
+    `${up(OPEN)} ID="__NEXT_DATA__">${json}${up(CLOSE)}`,
+    `<p>1 > 0</p>${OPEN} src="a.js">${CLOSE}${OPEN}>var s = "${OPEN} id=x";${CLOSE}${OPEN} id="__NEXT_DATA__">${json}${CLOSE}${OPEN} id="__NEXT_DATA__">{"second":true}${CLOSE}`,
+    `${OPEN} ${OPEN} id="__NEXT_DATA__">${json}${CLOSE}`,
+  ]) {
+    assert.deepEqual(nextDataFromHtml(html), want, html.slice(0, 60));
+  }
+  for (const html of [
+    '',
+    `${OPEN} id="__NEXT_DATA__">${json}`, // never closed
+    `${OPEN} id="__NEXT_DATA__"`, // tag never ends
+    `${OPEN}s id="__NEXT_DATA__">${json}${CLOSE}`, // some other element
+    `<div id="__NEXT_DATA__">${json}</div>`,
+    `${OPEN} id="__NEXT_DATA_">${json}${CLOSE}`,
+    `${OPEN} id="__NEXT_DATA__">[1,2`,
+    `${OPEN} id="__NEXT_DATA__">7${CLOSE}`, // JSON, but not an object
+  ]) {
+    assert.equal(nextDataFromHtml(html), null, html.slice(0, 60));
+  }
+});
+
+test('nextDataFromHtml: agrees with the one-pattern definition on every short page', () => {
+  // Reference: the single regular expression this used to be. Fine on a handful of fragments,
+  // which is all it gets here; hopeless on a large hostile page (next test).
+  const pattern = new RegExp(`${OPEN}\\b[^>]*\\bid=["']__NEXT_DATA__["'][^>]*>([\\s\\S]*?)<\\/script>`, 'i');
+  const reference = (html) => {
+    const m = pattern.exec(html);
+    if (!m) return null;
+    try {
+      const v = JSON.parse(m[1]);
+      return v && typeof v === 'object' ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  const pieces = [OPEN, OPEN.toUpperCase(), ' ', ' id="__NEXT_DATA__"', " id='__NEXT_DATA__'", ' type="x"', '>', '{"a":1}', CLOSE, CLOSE.toUpperCase(), 'x'];
+  let checked = 0;
+  let found = 0;
+  const walk = (html, depth) => {
+    if (html) {
+      const want = reference(html);
+      const got = nextDataFromHtml(html);
+      if (JSON.stringify(got) !== JSON.stringify(want)) assert.fail(`${JSON.stringify(html)}: got ${JSON.stringify(got)}, reference says ${JSON.stringify(want)}`);
+      checked++;
+      if (want) found++;
+    }
+    if (depth < 6) for (const piece of pieces) walk(html + piece, depth + 1);
+  };
+  walk('', 0);
+  assert.ok(checked > 1500000 && found > 500, `${checked} pages, ${found} with data`);
+});
+
+test('playlistFromEntity: keeps the first SPOTIFY_MAX_TRACKS songs and counts the rest', () => {
+  assert.ok(SPOTIFY_MAX_TRACKS >= SPOTIFY_EMBED_CAP, 'a real embed page is never cut');
+  const rows = [];
+  for (let i = 0; i < 5000; i++) {
+    rows.push(lean(i));
+    if (i % 10 === 0) rows.push(lean(i), null, { uri: 'spotify:episode:4rOoJ6Egrf8K2IrywzwOMk', title: 'A podcast' }); // a repeat, junk, an episode
+  }
+  const { playlist, rawCount, found } = playlistFromEntity(entity({ trackList: rows }), REF);
+  assert.equal(rawCount, 6500);
+  assert.equal(found, 5000, 'songs, not rows');
+  assert.equal(playlist.tracks.length, SPOTIFY_MAX_TRACKS);
+  assert.deepEqual(playlist.tracks.map((t) => t.title), Array.from({ length: SPOTIFY_MAX_TRACKS }, (_, i) => `Song ${i}`));
+  // Nothing is counted that was not kept when the list is short.
+  const small = playlistFromEntity(entity(), REF);
+  assert.equal(small.found, small.playlist.tracks.length);
+});
+
+test('playlistFromMarkdown: spacing, line endings and over-long lines', () => {
+  const md = ['Title: Night Drive | Spotify', '', '  1.\t###   First Light   ', '', '\t####   E   Mara Vale , Juno Reyes  ', '', '  3:07  ', '2. ## Second Wind', '### Dusk Unit', '1:02:03', `3. #### ${'Long '.repeat(200)}`, '#### Mara Vale', '0:45'].join('\r\n');
+  const got = playlistFromMarkdown(md, REF);
+  assert.equal(got.kind, 'playlist');
+  assert.equal(got.playlist.title, 'Night Drive');
+  assert.deepEqual(got.playlist.tracks.slice(0, 2), [
+    { id: 'spotify:md:0', title: 'First Light', artist: 'Mara Vale, Juno Reyes', explicit: true, durationMs: 187000 },
+    { id: 'spotify:md:1', title: 'Second Wind', artist: 'Dusk Unit', explicit: false, durationMs: 3723000 },
+  ]);
+  const long = got.playlist.tracks[2];
+  assert.ok(long.title.startsWith('Long Long') && long.title.length <= 300, `a very long title is cut, not dropped (${long.title.length} chars)`);
+  assert.equal(long.artist, 'Mara Vale');
+  assert.equal(long.durationMs, 45000);
+  for (const head of ['Title: Night Drive - Spotify', 'Title: Night Drive | Spotify | Spotify', 'Title:Night Drive', 'Title:   Night Drive   ']) {
+    assert.equal(playlistFromMarkdown(`${head}\n1. ### First Light\n`, REF).playlist.title, 'Night Drive', head);
+  }
+  assert.equal(playlistFromMarkdown('no title line\n1. ### First Light\n', REF).playlist.title, 'Spotify playlist');
+  for (const notFound of ['# Page not found', '##Page not found', '   ### page NOT found   ']) {
+    assert.equal(playlistFromMarkdown(`Title: x\n${notFound}\n1. ### First Light\n`, REF).kind, 'not-found', notFound);
+  }
+  // A numbered heading without a title is skipped, and the lines after it are not the previous song's.
+  const gap = playlistFromMarkdown('1. ### First Light\n2. ###\n#### Somebody Else\n9:59\n3. ### Second Wind\n', REF).playlist.tracks;
+  assert.deepEqual(gap, [
+    { id: 'spotify:md:0', title: 'First Light', artist: 'Unknown artist', explicit: false },
+    { id: 'spotify:md:1', title: 'Second Wind', artist: 'Unknown artist', explicit: false },
+  ]);
+  // A song may be called that; a heading inside a numbered item is not the 404 page.
+  assert.equal(playlistFromMarkdown('1. ### Page not found\n#### Mara Vale\n', REF).kind, 'playlist');
+  assert.equal(playlistFromMarkdown('#### Page not found\n1. ### First Light\n', REF).kind, 'playlist');
+});
+
+test('playlistFromMarkdown: keeps the first SPOTIFY_MAX_TRACKS songs and counts the rest', () => {
+  const md = Array.from({ length: 1000 }, (_, i) => `${i + 1}.   ### Song ${i}\n\n#### Mara Vale\n\n03:0${i % 10}\n`).join('\n');
+  const got = playlistFromMarkdown(md, REF);
+  assert.equal(got.playlist.tracks.length, SPOTIFY_MAX_TRACKS);
+  assert.equal(got.found, 1000);
+  assert.equal(got.rawCount, 1000);
+  assert.deepEqual(got.playlist.tracks[SPOTIFY_MAX_TRACKS - 1], { id: `spotify:md:${SPOTIFY_MAX_TRACKS - 1}`, title: `Song ${SPOTIFY_MAX_TRACKS - 1}`, artist: 'Mara Vale', explicit: false, durationMs: 189000 });
+});
+
+test('parsers: two megabytes of anything are read in a blink (nothing here can stall the page)', () => {
+  // In a child process with a kill timer. The patterns these parsers used to be took 8 s for
+  // 400 kB of unclosed tags and half a minute for 60 kB of unclosed tags carrying the id, and a
+  // pattern that is busy cannot be interrupted from its own thread.
+  const spotifyUrl = new URL('../js/sources/spotify.js', import.meta.url).href;
+  const code = `
+    import { nextDataFromHtml, playlistFromMarkdown, playlistFromEntity } from ${JSON.stringify(spotifyUrl)};
+    const REF = { type: 'playlist', id: ${JSON.stringify(PID)} };
+    const open = ['<', 'script'].join('');
+    const close = ['</', 'script>'].join('');
+    const SIZE = 2 * 1024 * 1024;
+    const fill = (unit) => unit.repeat(Math.ceil(SIZE / unit.length));
+    const space = ' '.repeat(SIZE);
+    const block = (n) => open + ' id="__NEXT_DATA__">{"n":' + n + '}' + close;
+    const out = [];
+    const t0 = performance.now();
+    out.push(nextDataFromHtml(fill(open + ' ')));
+    out.push(nextDataFromHtml(fill(open + ' x id="__NEXT_DATA__" ')));
+    out.push(nextDataFromHtml(fill(open + ' id="__NEXT_DATA__">')));
+    out.push(nextDataFromHtml(fill(open + ' id="__NEXT_DATA__">' + close.slice(0, -1))));
+    out.push(nextDataFromHtml(fill(open + '>') + block(1)));
+    out.push(nextDataFromHtml(fill(open + ' x') + '>' + block(2)));
+    out.push(nextDataFromHtml(fill('<') + block(3)));
+    out.push(playlistFromMarkdown('Title: x' + space + 'y\\n1. ### First Light\\n', REF).kind);
+    out.push(playlistFromMarkdown('1. ### a' + space + 'b\\n', REF).kind);
+    out.push(playlistFromMarkdown('1. ### a' + space + 'b' + String.fromCharCode(0x2028) + 'c\\n', REF).kind);
+    out.push(playlistFromMarkdown(fill('1. ' + ' '.repeat(390) + '##\\n'), REF).kind);
+    out.push(playlistFromMarkdown(fill('#' + ' '.repeat(397) + 'x\\n'), REF).kind);
+    out.push(playlistFromMarkdown(fill('1.' + '#'.repeat(397) + '\\n'), REF).kind);
+    out.push(playlistFromMarkdown(fill('Title:' + ' - Spotify'.repeat(39) + ' \\n'), REF).kind);
+    out.push(playlistFromMarkdown(fill('1. ### a\\n'), REF).playlist.tracks.length);
+    out.push(playlistFromMarkdown('\\n'.repeat(SIZE) + '1. ### too far down to be a playlist\\n', REF).kind);
+    const rows = Array.from({ length: 40000 }, (_, i) => ({ uri: 'spotify:track:' + String(i).padStart(22, 'a'), title: 'Song ' + i, subtitle: space.slice(0, 20) + 'x' }));
+    rows.push({ uri: 'spotify:track:' + 'b'.repeat(22), title: space + 'x' + space, subtitle: fill('a,') });
+    out.push(playlistFromEntity({ trackList: rows, title: space }, REF).playlist.tracks.length);
+    console.log(JSON.stringify({ ms: performance.now() - t0, out }));
+  `;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { timeout: 30000, encoding: 'utf8' });
+  assert.equal(run.error, undefined, `did not finish: ${run.error && run.error.message}`);
+  assert.equal(run.status, 0, run.stderr);
+  const { ms, out } = JSON.parse(run.stdout);
+  assert.deepEqual(out, [null, null, null, null, { n: 1 }, { n: 2 }, { n: 3 }, 'playlist', 'playlist', 'playlist', 'bad', 'bad', 'bad', 'bad', SPOTIFY_MAX_TRACKS, 'bad', SPOTIFY_MAX_TRACKS]);
+  assert.ok(ms < 3000, `took ${ms.toFixed(0)} ms`);
+});
+
 /* ---------- the chain ---------- */
 
 test('loadSpotify: relay 1 answers → one request, playlist returned, status reported', async () => {
@@ -445,6 +615,99 @@ test('loadSpotify: rejects ids that are not Spotify ids before touching the netw
     await assert.rejects(loadSpotify(/** @type {any} */ (ref), { fetchImpl: f.fetchImpl }), (err) => err instanceof SourceError && err.code === 'unsupported');
   }
   assert.equal(f.calls.length, 0);
+});
+
+/**
+ * A 200 answer that never ends: 64 kB per read for as long as anyone keeps reading. (Not quite
+ * never: a reader that has swallowed 48 MB is not going to stop, so the stream fails there rather
+ * than let a broken limit eat the machine's memory.)
+ */
+function endless(headers = {}) {
+  const seen = { served: 0, cancelled: false };
+  const respond = () =>
+    new Response(
+      new ReadableStream({
+        pull(c) {
+          if (seen.served >= 48 * 1024 * 1024) return c.error(new Error('nobody stopped reading'));
+          seen.served += 65536;
+          c.enqueue(new Uint8Array(65536).fill(120));
+        },
+        cancel() {
+          seen.cancelled = true;
+        },
+      }),
+      { status: 200, headers },
+    );
+  return { respond, seen };
+}
+
+test('loadSpotify: an answer far too big to be a playlist is dropped unread and the next relay is asked', async () => {
+  const flood = endless();
+  let f = fakeFetch({ scraper: flood.respond, jina: () => ok(jinaHtmlBody(nextData())) });
+  const pl = await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 });
+  assert.deepEqual(f.calls, ['scraper', 'jina']);
+  assert.equal(pl.tracks.length, 3);
+  assert.equal(flood.seen.cancelled, true, 'the oversized answer was let go');
+  assert.ok(flood.seen.served < 4 * 1024 * 1024, `gave up after ${flood.seen.served} bytes`);
+
+  // Announced up front: refused before the first byte.
+  const announced = endless({ 'content-length': String(50 * 1024 * 1024) });
+  f = fakeFetch({ scraper: announced.respond, jina: () => ok(jinaHtmlBody(nextData())) });
+  await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 });
+  assert.equal(announced.seen.cancelled, true);
+  assert.ok(announced.seen.served <= 2 * 65536, `read ${announced.seen.served} bytes`);
+
+  // Every route answering like that is "unreachable", with the reason in the log detail — not a frozen page.
+  const all = endless();
+  f = fakeFetch({ scraper: all.respond, jina: all.respond, microlink: all.respond, markdown: all.respond });
+  await assert.rejects(loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 }), (err) => {
+    assert.ok(err instanceof SourceError);
+    assert.equal(err.code, 'unreachable');
+    assert.match(err.detail, /scraper: too-large.*jina: too-large.*microlink: too-large.*jina-markdown: too-large/);
+    return true;
+  });
+
+  // A real answer with a megabyte of something extra in it still loads.
+  f = fakeFetch({ scraper: () => ok(scraperBody(nextData(entity({ extra: 'x'.repeat(1024 * 1024) })))) });
+  assert.equal((await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 })).tracks.length, 3);
+});
+
+test('loadSpotify: thousands of rows in one answer → the first SPOTIFY_MAX_TRACKS, and the count that was claimed', async () => {
+  const body = scraperBody(nextData(entity({ trackList: Array.from({ length: 5000 }, (_, i) => lean(i)) })));
+  for (const [count, total] of [
+    [undefined, 5000], // the real count cannot be had: say what the answer held
+    [() => ok(JSON.stringify({ result: '9000' })), 9000],
+    [() => ok(JSON.stringify({ result: '300' })), 5000],
+  ]) {
+    const f = fakeFetch({ scraper: () => ok(body), ...(count ? { count } : {}) });
+    const pl = await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 });
+    assert.equal(pl.tracks.length, SPOTIFY_MAX_TRACKS);
+    assert.equal(pl.tracks[SPOTIFY_MAX_TRACKS - 1].title, `Song ${SPOTIFY_MAX_TRACKS - 1}`);
+    assert.equal(pl.total, total);
+  }
+  // Same through the markdown route.
+  const md = Array.from({ length: 700 }, (_, i) => `${i + 1}. ### Song ${i}\n#### Mara Vale\n03:00\n`).join('\n');
+  const f = fakeFetch({ markdown: () => ok(md) });
+  const pl = await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 });
+  assert.equal(pl.tracks.length, SPOTIFY_MAX_TRACKS);
+  assert.equal(pl.total, 700);
+});
+
+test('loadSpotify: oversized side answers (song count, oEmbed) count as no answer', async () => {
+  const many = Array.from({ length: SPOTIFY_EMBED_CAP }, (_, i) => lean(i));
+  const flood = endless();
+  let f = fakeFetch({ scraper: () => ok(scraperBody(nextData(entity({ trackList: many })))), count: flood.respond });
+  let pl = await loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 });
+  assert.equal(pl.tracks.length, 100);
+  assert.equal(pl.total, undefined);
+  assert.equal(flood.seen.cancelled, true);
+  assert.ok(flood.seen.served < 1024 * 1024, `gave up on the count after ${flood.seen.served} bytes`);
+
+  // A relay showing the 404 page, and an oEmbed that floods instead of vouching: believed as "not found".
+  const flood2 = endless();
+  f = fakeFetch({ scraper: () => ok(scraperBody(notFoundData())), oembed: flood2.respond });
+  await assert.rejects(loadSpotify(REF, { fetchImpl: f.fetchImpl, ...fast, timeoutMs: 5000 }), (err) => err instanceof SourceError && err.code === 'not-found');
+  assert.equal(flood2.seen.cancelled, true);
 });
 
 test('hedgedChain: order, hedging and failure collection', async () => {

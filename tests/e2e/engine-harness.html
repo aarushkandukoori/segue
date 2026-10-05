@@ -10,8 +10,9 @@
     </style>
   </head>
   <body>
-    <!-- Driven by tests/e2e/engine.e2e.mjs in headless Chrome. Open it in a browser (npm run serve, then
-         /tests/e2e/engine-harness.html?run) to run the same groups by hand and read the report here. -->
+    <!-- Driven by tests/e2e/engine.e2e.mjs in headless Chrome and Firefox. Open it in any browser (npm run
+         serve, then /tests/e2e/engine-harness.html?run) to run the same groups by hand and read the report
+         here; groups the browser cannot run (Firefox: those built on OfflineAudioContext.suspend) are left out. -->
     <div id="out">engine harness: window.engineTests.run(group)</div>
     <script type="module" src="./engine/run.js"></script>
   </body>

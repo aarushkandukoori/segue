@@ -7,13 +7,23 @@
 //   node tests/e2e/sources.e2e.mjs resolve --full  resolve EVERY track of every playlist (minutes; scorer audit)
 //   node tests/e2e/sources.e2e.mjs resolve --full --only=tokyo,kpop   …of just these playlists (keys below)
 //
-// Groups: relays chain outage notfound examples demos deezer resolve audio expiry local jsonp
+// Groups: relays chain outage notfound examples demos deezer resolve audio expiry local jsonp hostile slow
+//   hostile  answers built to freeze the page (a title of stars, relay bodies that are huge or slow to
+//            parse): the main thread must stay responsive. Mostly in-page fakes, one real download.
+//   slow     real previews over a really slow line (a second Chrome behind a throttling proxy, so the
+//            CDN's own ordering of parallel responses shows), two at once: neither may be cut off
+//            and restarted. Takes about a minute.
 // Prints a short report (counts, timings, suspicious matches) and writes the full "wanted → matched"
 // table to tests/fixtures/sources-report.txt (git-ignored). Exit code 0 = pass. Skips (exit 0) when
 // Chrome or the network is unavailable.
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import http from 'node:http';
+import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import puppeteer from 'puppeteer-core';
 import { startServer } from './serve.mjs';
 import { launch } from './browser.mjs';
 
@@ -31,7 +41,7 @@ if (!online) {
   process.exit(0);
 }
 
-const GROUPS = ['relays', 'chain', 'outage', 'notfound', 'examples', 'demos', 'deezer', 'resolve', 'audio', 'expiry', 'local', 'jsonp'];
+const GROUPS = ['relays', 'chain', 'outage', 'notfound', 'examples', 'demos', 'deezer', 'resolve', 'audio', 'expiry', 'local', 'jsonp', 'hostile', 'slow'];
 const args = process.argv.slice(2);
 const flags = new Set(args.filter((a) => a.startsWith('--')));
 const only = args.filter((a) => !a.startsWith('--'));
@@ -86,6 +96,108 @@ const pad = (s, n) => String(s).padEnd(n);
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s));
 /** Titles of explicit tracks are not echoed to the console (the full text is in the report file). */
 const shy = (row, text) => (row.explicit ? `[explicit, ${String(text).length} chars]` : clip(text, 38));
+
+/**
+ * Wait for something the page is doing, but not for ever: a main thread stuck in one pattern match
+ * never answers, and without this the whole run would hang with it instead of failing.
+ */
+const answered = (promise, ms, what) => {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what}: the page did not answer within ${ms / 1000} s — its main thread is stuck`)), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
+
+/**
+ * A slow line: an HTTP CONNECT proxy on localhost whose server → browser bytes, over all tunnels
+ * together, pass through one token bucket. It sits below TLS and HTTP/2, so the browser and the CDN
+ * behave as they do on a slow connection — DevTools throttling does not show that: it paces each
+ * response separately inside the browser, after the network has delivered them all in parallel.
+ * `setRate(bytesPerSecond)`; Infinity = not throttled.
+ */
+async function slowLine() {
+  let rate = Infinity;
+  let budget = 0;
+  const queue = []; // {client, chunk, up}: one chunk per tunnel at a time, the rest waits in the kernel
+  const sockets = new Set();
+  const TICK = 50;
+  const pump = setInterval(() => {
+    if (rate === Infinity) budget = Infinity;
+    else budget = Math.min(budget + (rate * TICK) / 1000, (rate * TICK * 2) / 1000);
+    while (queue.length && budget > 0) {
+      const item = queue[0];
+      const n = Math.min(Math.ceil(budget), item.chunk.length);
+      if (!item.client.destroyed) item.client.write(item.chunk.subarray(0, n));
+      budget -= n;
+      if (n < item.chunk.length) item.chunk = item.chunk.subarray(n);
+      else {
+        queue.shift();
+        item.up.resume();
+      }
+    }
+  }, TICK);
+  const proxy = http.createServer((req, res) => res.writeHead(405).end());
+  proxy.on('connect', (req, client, head) => {
+    const [host, port] = req.url.split(':');
+    const up = net.connect(Number(port) || 443, host);
+    sockets.add(client).add(up);
+    const drop = () => {
+      client.destroy();
+      up.destroy();
+      sockets.delete(client);
+      sockets.delete(up);
+    };
+    up.once('connect', () => {
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length) up.write(head);
+      client.pipe(up); // browser → server is not throttled
+      up.on('data', (chunk) => {
+        up.pause();
+        queue.push({ client, chunk, up });
+      });
+    });
+    up.on('error', drop);
+    client.on('error', drop);
+    up.on('close', drop);
+    client.on('close', drop);
+  });
+  await new Promise((ready) => proxy.listen(0, '127.0.0.1', ready));
+  return {
+    port: proxy.address().port,
+    setRate: (bytesPerSecond) => {
+      rate = bytesPerSecond;
+      budget = 0;
+    },
+    close: async () => {
+      clearInterval(pump);
+      for (const sock of sockets) sock.destroy();
+      await new Promise((done) => proxy.close(() => done()));
+    },
+  };
+}
+
+/** A second Chrome whose every request (except to localhost) goes through `proxyPort`. */
+async function launchBehind(proxyPort) {
+  const profile = await mkdtemp(join(tmpdir(), 'segue-chrome-slow-'));
+  const browser = await puppeteer.launch({
+    executablePath: chrome,
+    headless: 'new',
+    userDataDir: profile,
+    args: ['--autoplay-policy=no-user-gesture-required', '--mute-audio', '--no-first-run', '--no-default-browser-check', '--disable-background-timer-throttling', '--disable-background-networking', '--disable-component-update', '--disable-sync', `--proxy-server=http://127.0.0.1:${proxyPort}`],
+  });
+  const tab = await browser.newPage();
+  const failed = [];
+  tab.on('requestfailed', (req) => failed.push(`${req.url()} ${req.failure()?.errorText || ''}`));
+  return {
+    page: tab,
+    failed,
+    close: async () => {
+      await browser.close().catch(() => {});
+      await rm(profile, { recursive: true, force: true }).catch(() => {});
+    },
+  };
+}
 
 const srv = await startServer();
 const { page, errors, logs, close } = await launch({ width: 1000, height: 700 });
@@ -569,6 +681,211 @@ try {
     check(out.errorCode === 'error 800', 'Deezer error payloads arrive as data', out.errorCode);
     check(out.rightAfter.scripts === 0, 'no Deezer <script> tag left in the document', `${out.rightAfter.scripts} tags, ${out.rightAfter.globals.length} tombstone(s) pending`);
     check(out.settled.globals.length === 0 && out.settled.scripts === 0 && out.stray.length === 0, 'no JSONP globals left behind', `clean after ${out.waited} ms; before the whole run: ${out.before.globals.length} globals / ${out.before.scripts} tags`);
+  }
+
+  /* ---------------------------------------------------------------- hostile answers */
+  if (wants('hostile')) {
+    say('\nhostile — titles and relay answers built to freeze the page');
+    const FROZEN_MS = 1000; // the page used to be gone for 20 s to for ever on each of these
+    const out = await answered(
+      page.evaluate(async () => {
+        const H = window.H;
+        const star = String.fromCharCode(42);
+        const open = ['<', 'script'].join('');
+        const fill = (unit, size) => unit.repeat(Math.ceil(size / unit.length));
+        const res = {};
+
+        // 1. A title that is a run of stars and a letter, scored against a page of one-word titles.
+        {
+          const stop = H.heartbeat();
+          const t0 = performance.now();
+          const wanted = { title: star.repeat(45) + 'z', artist: 'Mara Vale', durationMs: 200000 };
+          const hits = Array.from({ length: 15 }, (_, i) => ({ id: 9000 + i, readable: true, title: i ? `Wonderful ${i}` : 'Wonderful', duration: 200, preview: `https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/${9000 + i}.mp3`, artist: { name: 'Mara Vale' } }));
+          const best = H.match.bestMatch(wanted, hits.map((h) => ({ title: h.title, artist: h.artist.name, durationMs: 200000 })));
+          // …and the way a pasted line reaches it: the real resolver, with a catalogue that answers at once.
+          const r = H.resolver.createResolver({ deezer: { search: async () => hits, track: async () => ({}) }, itunes: { search: async () => [] } });
+          const pasted = await H.timed(() => r.resolveTrack({ id: 'text:0', title: wanted.title, artist: wanted.artist }));
+          res.stars = { ms: Math.round(performance.now() - t0), frozen: stop(), score: best ? best.score : 0, pasted: pasted.ok ? 'matched' : pasted.error.code, censored: H.match.censoredEqual(`gl${star}w up`, 'glow up') };
+        }
+
+        // 2. Relay answers. Routed by relay, like the outage group, but nothing leaves the page.
+        const routes = (handlers) => (url, init = {}) => {
+          const html = init.headers && init.headers['X-Return-Format'] === 'html';
+          const who = url.startsWith('https://web.scraper.workers.dev') ? (url.includes('scrape=attr') ? 'count' : 'scraper') : url.startsWith('https://api.microlink.io') ? 'microlink' : url.startsWith('https://r.jina.ai') ? (html ? 'jina' : 'markdown') : url.startsWith('https://open.spotify.com/oembed') ? 'oembed' : 'other';
+          const h = handlers[who];
+          return h ? Promise.resolve(h()) : Promise.reject(new TypeError('blocked by test'));
+        };
+        const ref = { type: 'playlist', id: '37i9dQZF1DXcBWIGoYBM5M' };
+        const load = async (handlers) => {
+          const stop = H.heartbeat();
+          const r = await H.timed(async () => {
+            const p = await H.spotify.loadSpotify(ref, { fetchImpl: routes(handlers) });
+            return { n: p.tracks.length, total: p.total, first: p.tracks[0].title, last: p.tracks[p.tracks.length - 1].title };
+          });
+          return { ...r, frozen: stop() };
+        };
+        const entityPage = (rows) => JSON.stringify({ result: { 'script#__NEXT_DATA__': [JSON.stringify({ props: { pageProps: { state: { data: { entity: { type: 'playlist', id: ref.id, title: 'Night Drive', trackList: rows } } } } } })] } });
+        const row = (i) => ({ uri: `spotify:track:${String(i).padStart(22, 'a')}`, title: `Song ${i}`, subtitle: 'Mara Vale', duration: 200000 + i });
+
+        // 2a. Pages that are slow to read for a pattern: unclosed tags carrying the id, and markdown
+        //     made of long runs of spaces. Under the size limit, so they do get parsed.
+        const SIZE = 1600 * 1024;
+        res.slowPages = await load({
+          scraper: () => new Response('upstream error', { status: 502 }),
+          jina: () => new Response(fill(`${open} x id="__NEXT_DATA__" `, SIZE)),
+          microlink: () => new Response(fill(`${open} `, SIZE)),
+          markdown: () => new Response(`Title: x${' '.repeat(600000)}y\n${fill(`1. ${' '.repeat(390)}##\n`, 900000)}`),
+        });
+
+        // 2b. Twelve thousand rows in one answer (1.4 MB: under the size limit, so it is read), and
+        //     forty thousand (over it: refused unread).
+        res.manyRows = await load({ scraper: () => new Response(entityPage(Array.from({ length: 12000 }, (_, i) => row(i)))) });
+        res.tooManyRows = await load({ scraper: () => new Response(entityPage(Array.from({ length: 40000 }, (_, i) => row(i)))) });
+
+        // 2c. An answer that never ends, then a relay with a sane one.
+        const flood = { served: 0, cancelled: false };
+        res.endless = await load({
+          scraper: () =>
+            new Response(
+              new ReadableStream({
+                pull(c) {
+                  if (flood.served >= 48 * 1024 * 1024) return c.error(new Error('nobody stopped reading'));
+                  flood.served += 65536;
+                  c.enqueue(new Uint8Array(65536).fill(120));
+                },
+                cancel() {
+                  flood.cancelled = true;
+                },
+              }),
+            ),
+          jina: () => new Response(`<html><body>${open} id="__NEXT_DATA__" type="application/json">${JSON.parse(entityPage([row(1), row(2), row(3)])).result['script#__NEXT_DATA__'][0]}</${'script'}></body></html>`),
+        });
+        res.endless.flood = flood;
+
+        // 3. The byte limit against a real response: a ~480 kB preview read as text with a 50 kB limit.
+        const chart = await H.index.loadPlaylist('deezer:chart:0');
+        const url = chart.tracks[30].preview.url;
+        res.realLimit = await H.timed(() => H.util.request(url, { as: 'text', maxBytes: 50000 }));
+        res.realWhole = await H.timed(async () => (await H.util.download(url, { maxBytes: 5 * 1024 * 1024 })).body.byteLength);
+        return res;
+      }),
+      60000,
+      'hostile answers',
+    );
+    const st = out.stars;
+    check(st.score < 0.7 && st.pasted === 'no-match' && st.ms < 2000 && st.frozen < FROZEN_MS, 'a title of 45 stars is scored and rejected at once', `${st.ms} ms, page frozen ${st.frozen} ms at most, pasted line → ${st.pasted}`);
+    check(st.censored === true, 'a single censoring star still matches its word');
+    const sp = out.slowPages;
+    timings.push(['spotify, three 1.6 MB hostile answers → error', sp.ms]);
+    check(!sp.ok && sp.error.code === 'unreachable' && sp.ms < 5000 && sp.frozen < FROZEN_MS, 'relay pages built to be slow to read → "Couldn\'t reach Spotify", page stays alive', `${sp.ok ? 'loaded?!' : sp.error.code} after ${sp.ms} ms, page frozen ${sp.frozen} ms at most [${sp.ok ? '' : sp.error.detail}]`);
+    const mr = out.manyRows;
+    check(mr.ok && mr.value.n === 200 && mr.value.total === 12000 && mr.value.first === 'Song 0' && mr.value.last === 'Song 199' && mr.frozen < FROZEN_MS, '12,000 rows in one answer → the first 200, "of 12000"', mr.ok ? `${mr.value.n} tracks of ${mr.value.total}, ${mr.ms} ms, page frozen ${mr.frozen} ms at most` : `${mr.error.code}: ${mr.error.message} [${mr.error.detail}]`);
+    const tm = out.tooManyRows;
+    check(!tm.ok && tm.error.code === 'unreachable' && /scraper: too-large/.test(tm.error.detail) && tm.frozen < FROZEN_MS, '40,000 rows (4 MB) in one answer → refused unread', tm.ok ? `loaded ${tm.value.n} tracks?!` : `${tm.error.code} [${tm.error.detail}], ${tm.ms} ms`);
+    const en = out.endless;
+    check(en.ok && en.value.n === 3 && en.flood.cancelled && en.flood.served < 4 * 1024 * 1024 && en.frozen < FROZEN_MS, 'an answer that never ends is dropped at the size limit and the next relay is asked', en.ok ? `${(en.flood.served / 1048576).toFixed(1)} MB read, then ${en.value.n} tracks from relay 2, ${en.ms} ms` : `${en.error.code}: ${en.error.message} [${en.error.detail}]`);
+    check(!out.realLimit.ok && out.realLimit.error.code === 'too-large' && out.realLimit.ms < 8000, 'real response over the limit → SourceError("too-large")', out.realLimit.ok ? 'was read whole' : `${out.realLimit.error.code} after ${out.realLimit.ms} ms`);
+    check(out.realWhole.ok && out.realWhole.value > 100000, 'the same file under a generous limit downloads whole', out.realWhole.ok ? `${(out.realWhole.value / 1024).toFixed(0)} KB, ${out.realWhole.ms} ms` : `${out.realWhole.error.code}: ${out.realWhole.error.message}`);
+  }
+
+  /* ---------------------------------------------------------------- slow connection */
+  if (wants('slow')) {
+    // Two previews at once at 160 kbit/s: the first takes 24 s, and the second hears nothing — not
+    // even headers — for most of that. (The app runs three at once; two show the same thing sooner.)
+    const KBPS = 160;
+    const AT_ONCE = 2;
+    say(`\nslow — real previews over a ${KBPS} kbit/s line: slow, or waiting in line, is not the same as dead`);
+    const line = await slowLine();
+    const far = await launchBehind(line.port);
+    try {
+      await far.page.goto(`${srv.url}/tests/e2e/sources-harness.html`, { waitUntil: 'load' });
+      await far.page.waitForFunction('window.harnessReady === true', { timeout: 15000 });
+      const got = await far.page
+        .evaluate(async () => {
+          const chart = await window.H.index.loadPlaylist('deezer:chart:0');
+          window.SLOW = [];
+          for (const t of chart.tracks.slice(40, 43)) window.SLOW.push({ ...(await window.H.shared.resolveTrack(t)) });
+          return window.SLOW.length;
+        })
+        .catch(() => 0);
+      if (got < 3) warn('could not reach Deezer through the test proxy; nothing checked', String(got));
+      else {
+        const failedDownloads = () => far.failed.filter((text) => /dzcdn\.net/.test(text)).length;
+        line.setRate((KBPS * 1000) / 8);
+        // 1. Side by side through the shipped resolver code, the way the conductor asks for them.
+        const r = await answered(
+          far.page.evaluate((atOnce) =>
+            window.H.timed(async () => {
+              const t0 = performance.now();
+              const headersAfter = [];
+              const fetchImpl = async (url, init) => {
+                const res = await fetch(url, init);
+                headersAfter.push(Math.round(performance.now() - t0));
+                return res;
+              };
+              const r = window.H.resolver.createResolver({ fetchImpl });
+              const sizes = await Promise.all(window.SLOW.slice(0, atOnce).map(async (ref) => (await r.fetchAudio(ref)).byteLength));
+              return { sizes, headersAfter };
+            }),
+            AT_ONCE,
+          ),
+          170000,
+          'downloads over the slow line',
+        );
+        const cutOff = failedDownloads();
+        const v = r.value || { sizes: [], headersAfter: [] };
+        timings.push([`${AT_ONCE} previews at once, ${KBPS} kbit/s`, r.ms]);
+        check(r.ok && v.sizes.length === AT_ONCE && v.sizes.every((n) => n > 100000), `${AT_ONCE} previews at once over ${KBPS} kbit/s both arrive`, r.ok ? `${v.sizes.map((n) => `${(n / 1024).toFixed(0)} KB`).join(', ')} in ${(r.ms / 1000).toFixed(1)} s` : `${r.error.code}: ${r.error.message}`);
+        check(cutOff === 0 && v.headersAfter.length === AT_ONCE, 'no download was cut off and started again', `${cutOff} request(s) aborted, ${v.headersAfter.length} responses for ${AT_ONCE} files`);
+        // What makes this a test of the idle rule: a file that heard nothing for longer than the 15 s
+        // limit because it was queued behind the others, and a total no fixed 20 s deadline allows.
+        const longestWait = Math.max(0, ...v.headersAfter);
+        if (r.ok && longestWait > 15500 && r.ms > 21000) check(true, 'one waited in line for longer than the idle limit, and was left alone', `first byte of the response after ${v.headersAfter.map((ms) => `${(ms / 1000).toFixed(1)} s`).join(', ')}`);
+        else if (r.ok) warn('the line or the CDN did not make any download wait long enough to prove anything', `responses began after ${v.headersAfter.join(', ')} ms; ${r.ms} ms in all`);
+
+        // 2. A real download whose body stops arriving half-way (the stream is held back in the page;
+        //    the request underneath is real and, on this line, still under way when it is given up
+        //    on — so its cancellation shows). 800 kbit/s: the response starts well inside the short
+        //    idle limit used here, and the file still takes five seconds.
+        line.setRate(100000);
+        const stall = await answered(
+          far.page.evaluate(() =>
+            window.H.timed(async () => {
+              let passed = 0;
+              let lastByteAt = 0;
+              const fetchImpl = async (url, init) => {
+                const res = await fetch(url, init);
+                const hold = new TransformStream({
+                  transform(chunk, c) {
+                    if (passed >= 60000) return new Promise(() => {}); // nothing more comes through
+                    passed += chunk.byteLength;
+                    lastByteAt = performance.now();
+                    c.enqueue(chunk);
+                  },
+                });
+                return new Response(res.body.pipeThrough(hold), { status: res.status });
+              };
+              try {
+                await window.H.util.download(window.SLOW[2].url, { idleMs: 1500, totalMs: 60000, fetchImpl });
+                return { outcome: 'completed' };
+              } catch (e) {
+                return { outcome: e.code || e.name, passed, afterStall: Math.round(performance.now() - lastByteAt) };
+              }
+            }),
+          ),
+          60000,
+          'a stalled download',
+        );
+        await new Promise((done) => setTimeout(done, 500)); // let Chrome report the cancelled request
+        const cancelled = failedDownloads() - cutOff;
+        const sv = stall.value || {};
+        check(stall.ok && sv.outcome === 'timeout' && sv.passed >= 60000 && sv.afterStall >= 1400 && sv.afterStall < 4000, 'a download that goes silent half-way is given up on after the idle limit', stall.ok ? `${sv.outcome} ${sv.afterStall} ms after the last byte (limit 1500 ms), ${sv.passed} bytes in` : `${stall.error.code}: ${stall.error.message}`);
+        check(cancelled === 1, 'giving up cancels the request underneath', `${cancelled} request(s) aborted`);
+      }
+    } finally {
+      await far.close();
+      await line.close();
+    }
   }
 
   /* ---------------------------------------------------------------- page hygiene */

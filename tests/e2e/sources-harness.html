@@ -6,7 +6,7 @@
          that JSONP to api.deezer.com and every fetch the sources make are allowed in production. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' https://api.deezer.com 'nonce-sourcesharness'; connect-src https:; img-src 'self' https: data: blob:; media-src https: blob: data:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:"
+      content="default-src 'self'; script-src 'self' https://api.deezer.com 'nonce-sourcesharness'; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>Segue · sources harness</title>
   </head>
@@ -21,6 +21,7 @@
       import * as jsonp from '../../js/sources/jsonp.js';
       import * as match from '../../js/sources/match.js';
       import * as local from '../../js/sources/local.js';
+      import * as util from '../../js/sources/util.js';
 
       const errInfo = (e) => ({ name: e && e.name, code: e && e.code, message: e && e.message, detail: e && e.detail, final: e && e.final });
 
@@ -100,13 +101,33 @@
         return new File([bytes.buffer], name, { type: 'audio/wav', lastModified: 1700000000000 });
       }
 
+      /**
+       * Start watching the main thread; the returned function stops and reports the longest stretch
+       * (ms) in which a 10 ms timer could not run — i.e. how long the page was frozen at worst.
+       */
+      function heartbeat() {
+        let last = performance.now();
+        let worst = 0;
+        const beat = () => {
+          const now = performance.now();
+          worst = Math.max(worst, now - last);
+          last = now;
+        };
+        const id = setInterval(beat, 10);
+        return () => {
+          clearInterval(id);
+          beat();
+          return Math.round(worst);
+        };
+      }
+
       const leftovers = () => ({
         globals: jsonp.jsonpGlobals(window),
         scripts: [...document.querySelectorAll('script')].filter((s) => /deezer/i.test(s.src)).length,
         scriptTags: document.querySelectorAll('script').length,
       });
 
-      window.H = { index, spotify, deezer, itunes, resolver, jsonp, match, local, timed, checkPlaylist, decode, wavFile, leftovers, errInfo, shared: resolver.createResolver() };
+      window.H = { index, spotify, deezer, itunes, resolver, jsonp, match, local, util, timed, checkPlaylist, decode, wavFile, heartbeat, leftovers, errInfo, shared: resolver.createResolver() };
       window.harnessReady = true;
     </script>
   </body>

@@ -1,7 +1,7 @@
 {
   "name": "Segue — your playlist, DJ'd live",
   "short_name": "Segue",
-  "description": "Paste a Spotify playlist link and get a live, beat-matched DJ set in your browser. Never the same set twice.",
+  "description": "Paste a Spotify playlist link and get a live DJ set in your browser: beat-matched blends, echo-outs and drops. Never the same set twice.",
   "start_url": "../",
   "scope": "../",
   "display": "standalone",

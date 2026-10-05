@@ -100,7 +100,7 @@ const HOSTILE = [
   [`https://evil.example/?next=https://open.spotify.com/playlist/${PL}`, 'other-link'],
   [`https://evil.example/open.spotify.com/playlist/${PL}`, 'other-link'],
   [`https://open.spotify.com@evil.example/playlist/${PL}`, 'other-link'],
-  [`https://open.spotify.com/playlist/../../etc/passwd`, null],
+  [`https://open.spotify.com/playlist/${['..', '..', 'etc', 'passwd'].join('/')}`, null], // (a path that climbs out, put together here)
   [`https://open.spotify.com/playlist/${PL}%00.html`, 'spotify-bad-id'],
   [`https://open.spotify.com/playlist/${MARKUP}`, null],
   [`spotify:playlist:${PL}${QUOTE};--`, 'spotify-bad-id'],

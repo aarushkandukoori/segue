@@ -22,6 +22,7 @@ export const ICONS = {
   text: svg(stroke('M5 6.5h14M5 11h14M5 15.5h9M5 20h5')),
   lock: svg(stroke('M7.5 10.5V8a4.5 4.5 0 0 1 9 0v2.5') + '<rect x="5.5" y="10.5" width="13" height="9.5" rx="2" fill="currentColor"/>'),
   arrow: svg(stroke('M5 12h14M13 6l6 6-6 6')),
+  back: svg(stroke('M14.5 5.5 8 12l6.5 6.5'), 'ic ic-back'),
 };
 
 /** The Segue mark: one record, half warm and half cool, split by the playhead. */
@@ -105,7 +106,7 @@ export const TEMPLATE = `
 
   <section class="l-hero">
     <h1 class="l-title"><span class="l-title-1">Your playlist,</span> <span class="l-title-2">DJ’d live.</span></h1>
-    <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue beat-matches, blends and drops every track — a different mix each time you press play.</p>
+    <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue mixes every track into the next: beat-matched blends where the tempos line up, echo-outs, cuts and drops where they don’t. A different mix each time you press play.</p>
 
     <form class="l-form" data-ref="form" novalidate>
       <label class="sr-only" for="segue-input">Spotify playlist link</label>
@@ -146,7 +147,8 @@ export const TEMPLATE = `
       <button type="button" class="btn btn-ghost" data-ref="text-toggle" aria-expanded="false" aria-controls="segue-text-panel">Paste a track list</button>
       <div class="l-text-panel" id="segue-text-panel" data-ref="text-panel" hidden>
         <label class="sr-only" for="segue-text">Track list, one “Artist - Title” per line</label>
-        <textarea id="segue-text" data-ref="text" rows="5" spellcheck="false" autocapitalize="off" placeholder="Artist - Title&#10;Artist - Title&#10;Artist - Title"></textarea>
+        <textarea id="segue-text" data-ref="text" rows="5" spellcheck="false" autocapitalize="off" placeholder="Artist - Title&#10;Artist - Title&#10;Artist - Title" aria-describedby="segue-text-hint"></textarea>
+        <p class="l-hint l-text-hint" id="segue-text-hint" data-ref="text-hint" role="status"></p>
         <button type="button" class="btn btn-primary btn-sm" data-ref="text-go"><span>Mix this list</span>${ICONS.arrow}</button>
       </div>
     </div>
@@ -202,7 +204,7 @@ export const TEMPLATE = `
 
 <div class="screen stage" data-screen="stage" tabindex="-1" hidden>
   <header class="topbar">
-    <button type="button" class="wordmark wordmark-btn" data-ref="home" aria-label="Segue — back to start" title="Back to start">${WORDMARK}</button>
+    <button type="button" class="wordmark wordmark-btn wordmark-back" data-ref="home" aria-label="Change playlist — back to the start screen" title="Change playlist (back to the start screen)">${ICONS.back}${WORDMARK}</button>
     <div class="pl" data-ref="pl">
       <span class="pl-art"><img alt="" draggable="false"></span>
       <div class="pl-text">
@@ -223,7 +225,7 @@ export const TEMPLATE = `
 
   <!-- Before the booth in the DOM (after it on screen) so Tab reaches play / skip / New set without first
        walking every link in the setlist. -->
-  <div class="transport" role="group" aria-label="Transport">
+  <div class="transport" data-ref="transport" role="group" aria-label="Transport">
     <div class="tp-main">
       <button type="button" class="tp-round tp-play" data-ref="play" aria-label="Play" title="Play / pause (Space)">${ICONS.play}${ICONS.pause}</button>
       <button type="button" class="tp-round tp-skip" data-ref="skip" aria-label="Skip to the next track" title="Skip to the next track (→)">${ICONS.skip}</button>
@@ -238,15 +240,22 @@ export const TEMPLATE = `
       </div>
     </div>
 
+    <!-- The legend names the group for assistive tech; the label the eye sees is an ordinary element, so
+         it can sit above the options (wide) or beside them (compact) without fighting <legend> layout. -->
     <fieldset class="tp-mode" data-ref="mode">
-      <legend class="lbl">Track length<span class="tp-mode-lock" data-ref="mode-lock">${ICONS.lock}</span></legend>
-      <div class="seg">
-        <label><input type="radio" name="segue-mode" value="preview"><span>Preview</span></label>
-        <label><input type="radio" name="segue-mode" value="short"><span>Short</span></label>
-        <label><input type="radio" name="segue-mode" value="medium"><span>Medium</span></label>
-        <label><input type="radio" name="segue-mode" value="full"><span>Full</span></label>
+      <legend class="sr-only">Track length</legend>
+      <div class="tp-mode-body">
+        <span class="lbl tp-mode-lbl" aria-hidden="true">Track length<span class="tp-mode-lock" data-ref="mode-lock">${ICONS.lock}</span></span>
+        <div class="seg">
+          <label><input type="radio" name="segue-mode" value="preview"><span>Preview</span></label>
+          <label><input type="radio" name="segue-mode" value="short"><span>Short</span></label>
+          <label><input type="radio" name="segue-mode" value="medium"><span>Medium</span></label>
+          <label><input type="radio" name="segue-mode" value="full"><span>Full</span></label>
+        </div>
       </div>
     </fieldset>
+    <!-- Stands in for the locked control on compact layouts: one labelled thing to tap, which says why. -->
+    <button type="button" class="tp-mode-note" data-ref="mode-note" hidden>${ICONS.lock}<span>30 s previews</span></button>
 
     <div class="tp-vol">
       <button type="button" class="iconbtn" data-ref="mute" aria-label="Mute" aria-pressed="false">${ICONS.volume}</button>
@@ -272,12 +281,13 @@ ${deck(1, 'B')}
       <span class="tk-tag" data-ref="tk-tag">On air</span>
       <div class="tk-main">
         <p class="tk-label"><span data-ref="tk-label">Warming up</span><span class="tk-to" data-ref="tk-to"></span></p>
-        <p class="tk-why" data-ref="tk-why">Lining up the first track…</p>
+        <p class="tk-why"><b class="tk-trick" data-ref="tk-trick" hidden></b><span data-ref="tk-why">Lining up the first track…</span></p>
       </div>
       <ol class="tk-marks" data-ref="tk-marks" aria-hidden="true"></ol>
       <div class="tk-count"><span class="lbl" data-ref="tk-count-lbl"></span><b data-ref="tk-count"></b></div>
       <div class="tk-bar" aria-hidden="true"><i class="tk-fill" data-ref="tk-fill"></i><div class="tk-notches" data-ref="tk-notches"></div></div>
       <p class="sr-only" aria-live="polite" data-ref="tk-live"></p>
+      <p class="sr-only" aria-live="polite" data-ref="tk-trick-live"></p>
     </section>
 
     <section class="mixer" data-ref="mixer" aria-label="Mixer — the DJ moves these, you watch">

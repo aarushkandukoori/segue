@@ -127,8 +127,10 @@ test('JSON / structured-clone friendly: plain data only', () => {
   const clone = structuredClone(a);
   assert.deepEqual(clone, a);
   assert.ok(clone.wave.low instanceof Uint8Array);
-  assert.deepEqual(Object.keys(a).sort(), ['beats', 'bpm', 'bpmConfidence', 'cues', 'downbeat', 'duration', 'energy', 'energyCurve', 'key', 'loudness', 'v', 'wave']);
+  assert.deepEqual(Object.keys(a).sort(), ['beats', 'bpm', 'bpmConfidence', 'cues', 'downbeat', 'duration', 'energy', 'energyCurve', 'grid', 'key', 'loudness', 'v', 'wave']);
   assert.deepEqual(Object.keys(a.wave).sort(), ['cols', 'high', 'low', 'mid', 'perSec']);
+  assert.deepEqual(Object.keys(a.grid).sort(), ['head', 'perBeat', 'phase', 'slots', 'tail']);
+  assert.ok(clone.grid.slots instanceof Uint8Array);
 });
 
 test('performance budgets: 30 s clip ≤ 250 ms, 5-minute track ≤ 3 s', () => {

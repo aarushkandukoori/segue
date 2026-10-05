@@ -76,6 +76,9 @@ function fakeItunes(answer) {
 const noItunes = () => fakeItunes(() => []);
 const kindOf = (q) => (/^artist:"/.test(q) ? 'precise' : /^track:"/.test(q) ? 'title' : 'free');
 const coded = (code) => (err) => err instanceof ResolveError && err.code === code;
+// For tests that run on mocked timers: a promise that waits for a timer nobody advances would
+// otherwise hang the whole run instead of failing this one test.
+const BOUNDED = { timeout: 10000 };
 const isAbortError = (err) => err && err.name === 'AbortError';
 
 const WANTED = spotify(1, 'Paper Lanterns', 'Mara Vale, Juno Reyes', 201);
@@ -504,7 +507,7 @@ test('fetchAudio: renewal happens once — a second 403 is "no-audio"; a vanishe
   await assert.rejects(createResolver({ deezer: lookupDown, itunes: noItunes(), fetchImpl: async () => res(403) }).fetchAudio(refOf()), coded('network'));
 });
 
-test('fetchAudio: iTunes links are not renewed — one retry for a dropped connection, then "network"', async (t) => {
+test('fetchAudio: iTunes links are not renewed — one retry for a dropped connection, then "network"', BOUNDED, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const deezer = fakeDeezer(() => []);
   let calls = 0;
@@ -551,7 +554,7 @@ test('fetchAudio: refuses anything that is not https; junk refs are typed errors
   for (const junk of [null, undefined, 'x', 7]) await assert.rejects(r.fetchAudio(junk), coded('no-audio'));
 });
 
-test('fetchAudio: abort and timeout', async (t) => {
+test('fetchAudio: abort and timeout', BOUNDED, async (t) => {
   const hang = (url, init) =>
     new Promise((_, reject) => {
       init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
@@ -568,7 +571,7 @@ test('fetchAudio: abort and timeout', async (t) => {
   pre.abort();
   await assert.rejects(r.fetchAudio(itunesRef, { signal: pre.signal }), isAbortError);
 
-  // A download that never finishes is cut off (20 s per try, two tries) and reported as "network".
+  // A download that never even starts is cut off (15 s of silence per try, two tries) and reported as "network".
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const stuck = r.fetchAudio(itunesRef).catch((e) => e);
   for (let step = 0; step < 6; step++) {
@@ -577,6 +580,311 @@ test('fetchAudio: abort and timeout', async (t) => {
   }
   for (let i = 0; i < 10; i++) await new Promise((r2) => setImmediate(r2));
   assert.ok(coded('network')(await stuck));
+});
+
+/* ------------------------------------------------------------------ fetchAudio on slow / stalled / hostile connections */
+
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+};
+const ITUNES_REF = () => refOf({ provider: 'itunes', key: 'itunes:902', url: 'https://audio-ssl.itunes.apple.com/p902.m4a' });
+
+/**
+ * A fetch double whose response body is a real ReadableStream that the test feeds by hand, and that
+ * fails the stream when the request is aborted, the way fetch does.
+ */
+function streamFetch({ status = 200, headers = {} } = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    let ctl;
+    const call = { url, aborted: false, cancelled: false, push: (n, fill = 7) => ctl.enqueue(new Uint8Array(n).fill(fill)), end: () => ctl.close() };
+    const body = new ReadableStream({
+      start(c) {
+        ctl = c;
+      },
+      cancel() {
+        call.cancelled = true;
+      },
+    });
+    init.signal.addEventListener('abort', () => {
+      call.aborted = true;
+      try {
+        ctl.error(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      } catch {
+        /* already closed */
+      }
+    });
+    calls.push(call);
+    return { status, ok: status >= 200 && status < 300, headers: new Headers(headers), body, arrayBuffer: () => assert.fail('the body must be read as a stream'), text: () => assert.fail('the body must be read as a stream') };
+  };
+  return { fetchImpl, calls };
+}
+
+test('fetchAudio: a slow download that keeps delivering is left to finish — there is no fixed deadline', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { fetchImpl, calls } = streamFetch();
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const p = r.fetchAudio(ITUNES_REF());
+  await flush();
+  // 480 kB in 60 s, a chunk every 5 s: one of three clips sharing a 200 kbit/s connection.
+  for (let i = 0; i < 12; i++) {
+    calls[0].push(40000, i);
+    await flush();
+    t.mock.timers.tick(5000);
+    await flush();
+    assert.equal(calls[0].aborted, false, `still downloading after ${(i + 1) * 5} s`);
+  }
+  calls[0].end();
+  const buf = await p;
+  assert.ok(buf instanceof ArrayBuffer);
+  assert.equal(buf.byteLength, 480000);
+  const bytes = new Uint8Array(buf);
+  assert.deepEqual([bytes[0], bytes[39999], bytes[40000], bytes[479999]], [0, 0, 1, 11], 'chunks are joined in order');
+  assert.equal(calls.length, 1, 'never thrown away and started again');
+});
+
+test('fetchAudio: a download that goes silent is cut off after 15 s without a byte, retried once, then "network"', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { fetchImpl, calls } = streamFetch();
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const p = r.fetchAudio(ITUNES_REF()).catch((e) => e);
+  await flush();
+  calls[0].push(100000);
+  await flush();
+  t.mock.timers.tick(10000);
+  await flush();
+  assert.equal(calls[0].aborted, false, '10 s of silence is not a stall yet');
+  calls[0].push(1000); // any byte restarts the clock
+  await flush();
+  t.mock.timers.tick(14000);
+  await flush();
+  assert.equal(calls[0].aborted, false);
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(calls[0].aborted, true, 'cut off 15 s after the last byte');
+  t.mock.timers.tick(300); // the pause before the one retry
+  await flush();
+  assert.equal(calls.length, 2);
+  t.mock.timers.tick(14999);
+  await flush();
+  assert.equal(calls[1].aborted, false);
+  t.mock.timers.tick(1);
+  const err = await p;
+  assert.ok(coded('network')(err));
+  assert.equal(err.cause.code, 'timeout');
+  assert.equal(calls.length, 2);
+});
+
+test('fetchAudio: a server that drips a byte now and then forever hits the two-minute backstop', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { fetchImpl, calls } = streamFetch();
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const p = r.fetchAudio(ITUNES_REF()).catch((e) => e);
+  await flush();
+  for (let s = 10; s <= 120; s += 10) {
+    calls[0].push(1);
+    await flush();
+    assert.equal(calls[0].aborted, false, `still tolerated before ${s} s`);
+    t.mock.timers.tick(10000);
+    await flush();
+  }
+  assert.equal(calls[0].aborted, true);
+  // …and the retry gets the same treatment before the caller hears "network".
+  t.mock.timers.tick(300);
+  await flush();
+  t.mock.timers.tick(15000);
+  assert.ok(coded('network')(await p));
+});
+
+/**
+ * A fetch double for a server that answers when the test says so: `headers()` lets the response
+ * begin, `push(n)` / `end()` feed its body. Until `headers()` the request just waits — which is all
+ * the second and third of three parallel downloads see on a slow HTTP/2 connection.
+ */
+function queuedFetch() {
+  const calls = [];
+  const fetchImpl = (url, init) =>
+    new Promise((resolve, reject) => {
+      let ctl;
+      const body = new ReadableStream({
+        start(c) {
+          ctl = c;
+        },
+      });
+      const call = { url, aborted: false, headers: () => resolve({ status: 200, ok: true, headers: new Headers(), body }), push: (n) => ctl.enqueue(new Uint8Array(n)), end: () => ctl.close() };
+      init.signal.addEventListener('abort', () => {
+        call.aborted = true;
+        const err = Object.assign(new Error('aborted'), { name: 'AbortError' });
+        reject(err);
+        try {
+          ctl.error(err);
+        } catch {
+          /* already closed */
+        }
+      });
+      calls.push(call);
+    });
+  return { fetchImpl, calls };
+}
+const threeRefs = () => [904, 905, 906].map((n) => refOf({ provider: 'itunes', key: `itunes:${n}`, url: `https://audio-ssl.itunes.apple.com/p${n}.m4a` }));
+
+test('fetchAudio: three at once on a slow line, sent one after the other — the ones waiting their turn are not given up on', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { fetchImpl, calls } = queuedFetch();
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const all = Promise.all(threeRefs().map((ref) => r.fetchAudio(ref)));
+  await flush();
+  assert.equal(calls.length, 3);
+  const second = async (work) => {
+    work();
+    await flush();
+    t.mock.timers.tick(1000);
+    await flush();
+    assert.deepEqual(calls.map((c) => c.aborted), [false, false, false]);
+  };
+  // What a real 240 kbit/s line did (2026-10): the first file takes 17 s, and until it is through
+  // the other two requests get nothing at all, not even headers.
+  calls[0].headers();
+  for (let s = 0; s < 17; s++) await second(() => calls[0].push(28000));
+  calls[0].end();
+  // Then the other two share the line, each silent for seconds at a time while the other is served.
+  calls[1].headers();
+  calls[2].headers();
+  for (let s = 0; s < 36; s++) await second(() => calls[s < 12 ? 1 : s < 24 ? 2 : 1 + (s % 2)].push(26000));
+  calls[1].end();
+  calls[2].end();
+  const sizes = (await all).map((b) => b.byteLength);
+  assert.deepEqual(sizes, [476000, 468000, 468000]);
+  assert.equal(calls.length, 3, 'nothing was thrown away and asked for again');
+});
+
+test('fetchAudio: when nothing arrives for any of them, all of them are given up on together', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { fetchImpl, calls } = queuedFetch();
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const all = threeRefs().map((ref) => r.fetchAudio(ref).catch((e) => e));
+  await flush();
+  calls[0].headers();
+  await flush();
+  t.mock.timers.tick(9000);
+  calls[0].push(5000); // the last sign of life, 9 s in
+  await flush();
+  t.mock.timers.tick(14999);
+  await flush();
+  assert.deepEqual(calls.map((c) => c.aborted), [false, false, false]);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(calls.slice(0, 3).map((c) => c.aborted), [true, true, true], '15 s after the last byte on any of them');
+  // Each gets its one retry; those hear nothing either.
+  t.mock.timers.tick(300);
+  await flush();
+  assert.equal(calls.length, 6);
+  t.mock.timers.tick(15000);
+  for (const err of await Promise.all(all)) {
+    assert.ok(coded('network')(err));
+    assert.equal(err.cause.code, 'timeout');
+  }
+  // Another resolver's downloads are no sign of life for this one's.
+  const a = queuedFetch();
+  const b = queuedFetch();
+  const ra = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl: a.fetchImpl });
+  const rb = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl: b.fetchImpl });
+  const pa = ra.fetchAudio(threeRefs()[0]).catch((e) => e);
+  const pb = rb.fetchAudio(threeRefs()[1]).catch((e) => e);
+  await flush();
+  b.calls[0].headers();
+  for (let s = 0; s < 15; s++) {
+    b.calls[0].push(4000);
+    await flush();
+    t.mock.timers.tick(1000);
+    await flush();
+  }
+  assert.equal(a.calls[0].aborted, true);
+  assert.equal(b.calls[0].aborted, false);
+  b.calls[0].end();
+  assert.equal((await pb).byteLength, 60000);
+  t.mock.timers.tick(300);
+  await flush();
+  t.mock.timers.tick(15000);
+  assert.ok(coded('network')(await pa));
+});
+
+test('fetchAudio: where the body cannot be read as a stream, only the overall limit applies', BOUNDED, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let deliver = null;
+  let calls = 0;
+  // No `body`, and it ignores the abort signal: the worst kind of test double / old engine.
+  const fetchImpl = async () => (calls++, { status: 200, ok: true, arrayBuffer: () => new Promise((done) => (deliver = () => done(audio()))), text: async () => '' });
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl });
+  const p = r.fetchAudio(ITUNES_REF());
+  await flush();
+  t.mock.timers.tick(45000); // well past the old 20 s deadline
+  await flush();
+  deliver();
+  assert.equal((await p).byteLength, 4096);
+  assert.equal(calls, 1);
+
+  // Never delivered at all: given up on after two minutes per try.
+  deliver = null;
+  const stuck = r.fetchAudio(ITUNES_REF()).catch((e) => e);
+  await flush();
+  t.mock.timers.tick(119000);
+  await flush();
+  assert.equal(calls, 2, 'first try still running');
+  t.mock.timers.tick(1000);
+  await flush();
+  t.mock.timers.tick(300);
+  await flush();
+  assert.equal(calls, 3, 'second try started');
+  t.mock.timers.tick(120000);
+  assert.ok(coded('network')(await stuck));
+});
+
+test('fetchAudio: something far too large to be a preview is refused, not downloaded, not retried', async () => {
+  const deezer = fakeDeezer(() => [], { tracks: { 12: { id: 12, preview: preview(12, 2099999999) } } });
+  // Announced up front.
+  const big = streamFetch({ headers: { 'content-length': String(60 * 1024 * 1024) } });
+  const e1 = await createResolver({ deezer, itunes: noItunes(), fetchImpl: big.fetchImpl }).fetchAudio(refOf()).catch((e) => e);
+  assert.ok(coded('no-audio')(e1));
+  assert.equal(big.calls.length, 1);
+  assert.equal(big.calls[0].cancelled, true, 'the body was let go, not read');
+  assert.equal(deezer.trackCalls.length, 0, 'no fresh link asked for: the next copy would be as big');
+
+  // Not announced: an endless stream is dropped once it passes the limit.
+  let served = 0;
+  let cancelled = false;
+  const endless = async () => ({
+    status: 200,
+    ok: true,
+    headers: new Headers(),
+    body: new ReadableStream({
+      pull(c) {
+        served += 1 << 20;
+        c.enqueue(new Uint8Array(1 << 20));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+  });
+  const e2 = await createResolver({ deezer, itunes: noItunes(), fetchImpl: endless }).fetchAudio(ITUNES_REF()).catch((e) => e);
+  assert.ok(coded('no-audio')(e2));
+  assert.equal(cancelled, true);
+  assert.ok(served > 25 * 1024 * 1024 && served < 40 * 1024 * 1024, `read ${served} bytes before giving up`);
+});
+
+test('fetchAudio: an error page is not downloaded; a real Response works end to end', async () => {
+  const gone = streamFetch({ status: 404 });
+  const r = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl: gone.fetchImpl });
+  await assert.rejects(r.fetchAudio(ITUNES_REF()), coded('no-audio'));
+  assert.equal(gone.calls.length, 1);
+  assert.equal(gone.calls[0].cancelled, true);
+
+  const payload = Uint8Array.from({ length: 70000 }, (_, i) => i % 251);
+  const real = createResolver({ deezer: fakeDeezer(() => []), itunes: noItunes(), fetchImpl: async () => new Response(payload, { status: 200 }) });
+  const buf = await real.fetchAudio(ITUNES_REF());
+  assert.ok(buf instanceof ArrayBuffer);
+  assert.deepEqual(new Uint8Array(buf), payload);
 });
 
 /* ------------------------------------------------------------------ cross-script guesses */

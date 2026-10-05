@@ -22,9 +22,10 @@ import {
 } from './tempo.js';
 import { chromagram, globalChroma, detectKey, harmonicChange, camelotCode, keyName } from './key.js';
 import { blockEnergy, loudness, energyCurve, usableRegion, waveform, energyScore, findDrop, toDb } from './features.js';
+import { attackEnvelope, lowBand, alignGrid, halfBeatEvidence, isHalfBeatOff, edgeTrust, marginToTrust, onOff, slotPattern, SLOTS_PER_BEAT } from './grid.js';
 
 /** Bump whenever the output for the same audio can change: cached analyses are keyed by it. */
-export const ANALYSIS_VERSION = 1;
+export const ANALYSIS_VERSION = 2;
 
 /** Internal analysis sample rate (re-exported for the client's downsampler). */
 export const ANALYSIS_RATE = FS;
@@ -42,12 +43,19 @@ const KICK_FLIP_RATIO = 1.6;
 const SLOW_READING_BPM = 90;
 const BACKBEAT_RATIO = 2;
 
+// Analysis.grid.phase from which the attacks themselves vouch for the grid (see run(): bpmConfidence).
+const PHASE_PROOF = 0.5;
+
+/** Beats judged at each edge of the usable region for Analysis.grid.head / .tail. */
+export const GRID_EDGE_BEATS = 16;
+
 /**
  * @typedef {Object} Analysis   (SPEC.md §3)
  * @property {number} v              ANALYSIS_VERSION
  * @property {number} duration       seconds
  * @property {number} bpm            global tempo in [70, 180)
- * @property {number} bpmConfidence  0..1; ≥ 0.5 = the grid is trustworthy enough to beat-match
+ * @property {number} bpmConfidence  0..1; ≥ 0.5 = the grid is trustworthy enough to beat-match (never below
+ *                                   grid.phase once that reaches 0.5: attacks that sit on the beats prove a grid)
  * @property {number[]} beats        beat times (s), strictly increasing, covering the whole track
  * @property {number} downbeat       index (0..3) of the first bar start: i is a downbeat iff (i − downbeat) % 4 === 0
  * @property {{pc:number, mode:'major'|'minor', name:string, camelot:string, confidence:number}} key
@@ -56,15 +64,30 @@ const BACKBEAT_RATIO = 2;
  * @property {number[]} energyCurve  one value per second, 0..1 relative to the track's own maximum
  * @property {{start:number, end:number, in:number, drop:number|null}} cues
  * @property {{cols:number, perSec:number, low:Uint8Array, mid:Uint8Array, high:Uint8Array}} wave
+ * @property {{phase:number, head:number, tail:number, perBeat:number, slots:Uint8Array}} grid
+ *           How far the beat PHASE can be trusted (bpmConfidence is about the tempo; a track can have a
+ *           rock-solid tempo and still carry its loud hits between the beats).
+ *           phase = 0..1, over the whole usable region: do the loud attacks sit on the beats, clearly and
+ *                   all the way through?   0 = as much between the beats as on them · 1 = on the beats only
+ *           head / tail = 0..1, the same question for the first / last 16 beats of the usable region —
+ *                   where a preview is blended into and out of (the 8 beats nearest the edge count double).
+ *                   ≥ 0.5 = "this end can be overlapped beat on beat with another clear one" (calibrated on
+ *                   real previews: node tests/helpers/mix-eval.js --calibrate).
+ *           slots = the attacks themselves, beat-synchronous: perBeat (16) values per beat, 0..255 — the
+ *                   mean attack strength in each sixteenth of every beat, slot 0 centred on the beat
+ *                   (grid.js slotPattern). The planner lays two tracks' slots over each other before it
+ *                   overlaps them.
+ *           All zero when there is no tempo to speak of.
  */
 
 /**
  * @param {Float32Array} mono        mono PCM, any sample rate
  * @param {number} sampleRate
- * @param {{bpmHint?:number, peak?:number, duration?:number}} [opts]
+ * @param {{bpmHint?:number, peak?:number, duration?:number, debug?:object}} [opts]
  *   bpmHint  — provider-supplied tempo (weak prior, used as the grid tempo when the audio has no beat)
  *   peak     — true sample peak of the original multi-channel audio, if the caller measured it
  *   duration — exact duration (s) of the original buffer when `mono` is a resampled copy of it
+ *   debug    — (tools, tests) an object that receives the grid stage's working notes: debug.polish, debug.grid
  * @returns {Analysis}
  */
 export function analyzeTrack(mono, sampleRate, opts = {}) {
@@ -105,12 +128,13 @@ function neutral(duration, bpmHint) {
   const d = duration > 0 && isFinite(duration) ? duration : 0;
   const bpm = bpmHint > 0 && isFinite(bpmHint) ? foldBpm(bpmHint) : 120;
   const cols = Math.max(1, Math.ceil(d * 100));
+  const beats = regularBeats(bpm, d);
   return {
     v: ANALYSIS_VERSION,
     duration: d,
     bpm,
     bpmConfidence: 0,
-    beats: regularBeats(bpm, d),
+    beats,
     downbeat: 0,
     key: neutralKey(),
     loudness: { rms: 0, peak: 0, trimDb: 0 },
@@ -118,7 +142,13 @@ function neutral(duration, bpmHint) {
     energyCurve: new Array(Math.max(1, Math.ceil(d))).fill(0),
     cues: { start: 0, end: d, in: 0, drop: null },
     wave: { cols, perSec: 100, low: new Uint8Array(cols), mid: new Uint8Array(cols), high: new Uint8Array(cols) },
+    grid: noGrid(beats.length),
   };
+}
+
+/** Analysis.grid of a track whose beat phase nothing can be said about. */
+function noGrid(beatCount) {
+  return { phase: 0, head: 0, tail: 0, perBeat: SLOTS_PER_BEAT, slots: new Uint8Array(beatCount * SLOTS_PER_BEAT) };
 }
 
 function run(mono, sampleRate, duration, opts) {
@@ -143,6 +173,8 @@ function run(mono, sampleRate, duration, opts) {
   let fluxMean = 0;
   let key = neutralKey();
   let chroma = null;
+  /** @type {Float32Array|null} attack envelope, kept for the grid trust once the cues are known */
+  let att = null;
 
   if (!silent) {
     try {
@@ -168,7 +200,8 @@ function run(mono, sampleRate, duration, opts) {
         if (tempo.strength > 0) {
           const lowEnv = prepareEnvelope(on.low).env;
           const midEnv = prepareEnvelope(on.mid).env;
-          const result = buildBeats(x, env, tempo, duration, region, kickEnvelope(on), midEnv);
+          att = attackEnvelope(x, FS);
+          const result = buildBeats(x, env, tempo, duration, region, kickEnvelope(on), midEnv, att, opts.debug);
           beats = result.beats;
           bpm = result.bpm;
           bpmConfidence = result.confidence;
@@ -190,6 +223,7 @@ function run(mono, sampleRate, duration, opts) {
       bpmConfidence = 0;
       beats = regularBeats(bpm, duration);
       downbeat = 0;
+      att = null;
     }
   }
 
@@ -234,6 +268,24 @@ function run(mono, sampleRate, duration, opts) {
     drop = findDrop(blocks.ms, lowMs, hopSec, beats, downbeat, region.start, region.end);
   }
 
+  // ---- grid trust ------------------------------------------------------------------------------
+  let grid = noGrid(beats.length);
+  if (att && bpmConfidence > 0) {
+    try {
+      grid = gridTrust(att, beats, region, cueIn, opts.debug);
+    } catch (err) {
+      grid = noGrid(beats.length);
+    }
+  }
+  // A second witness for the tempo. buildBeats judges the grid by how periodic the onset envelope is
+  // and how many beats carry an onset, which marks sparse productions down (half-time pop, ballads with
+  // a kick every other beat: a quarter of a current chart playlist came out below 0.5 that way). But
+  // when the loud attacks sit clearly ON the beats in (nearly) every part of the clip, the grid is
+  // demonstrably right, however thin the evidence looked from the other side. Audio without a beat
+  // never gets here: where the first witness found none, the phase trust is next to nothing as well
+  // (≤ 0.1 on every beatless fixture below 0.5; noise, pads and solo piano: 0).
+  if (grid.phase >= PHASE_PROOF && bpmConfidence < grid.phase) bpmConfidence = grid.phase;
+
   return {
     v: ANALYSIS_VERSION,
     duration,
@@ -247,7 +299,82 @@ function run(mono, sampleRate, duration, opts) {
     energyCurve: energyCurve(x, FS, duration),
     cues: { start: region.start, end: region.end, in: cueIn, drop },
     wave: { cols: wave.cols, perSec: wave.perSec, low: wave.low, mid: wave.mid, high: wave.high },
+    grid,
   };
+}
+
+const round3 = (v) => Math.round(clamp(v, 0, 1) * 1000) / 1000;
+
+/**
+ * Analysis.grid: the beat grid against the audible attacks (see grid.js).
+ * @param {Float32Array} att  attack envelope
+ * @param {number[]} beats
+ * @param {{start:number, end:number}} region  usable region (s)
+ * @param {number} cueIn  where the track is entered (first downbeat of the region)
+ */
+function gridTrust(att, beats, region, cueIn, debug) {
+  let i0 = 0;
+  while (i0 < beats.length && beats[i0] < region.start - 1e-3) i0++;
+  let i1 = beats.length;
+  while (i1 > i0 && beats[i1 - 1] > region.end + 1e-3) i1--;
+  const whole = edgeTrust(att, beats, i0, i1);
+  // consistency: the same question asked of every 8 beats on their own (hop 4)
+  let segs = 0;
+  let onGrid = 0;
+  for (let i = i0; i + 8 <= i1; i += 4) {
+    const m = edgeTrust(att, beats, i, i + 8);
+    if (!(m.on > 0)) continue;
+    segs++;
+    if (m.margin > 0.5) onGrid++;
+  }
+  const steadiness = segs ? onGrid / segs : 0;
+  let j = i0;
+  while (j < i1 && beats[j] < cueIn - 1e-3) j++;
+  // An edge is judged over its 16 beats and over the 8 nearest the edge (a short blend lives in those),
+  // the two margins averaged.
+  const edge = (a8, b8, a16, b16) => {
+    const m16 = edgeTrust(att, beats, a16, b16);
+    const m8 = edgeTrust(att, beats, a8, b8);
+    const margin = m16.count >= 6 && m8.count >= 6 ? 0.5 * (m8.margin + m16.margin) : 0;
+    return { margin, trust: marginToTrust(margin), m8, m16 };
+  };
+  const head = edge(j, Math.min(i1, j + GRID_EDGE_BEATS / 2), j, Math.min(i1, j + GRID_EDGE_BEATS));
+  const tail = edge(Math.max(i0, i1 - GRID_EDGE_BEATS / 2), i1, Math.max(i0, i1 - GRID_EDGE_BEATS), i1);
+  // phase: clear over the whole region AND in (nearly) every part of it
+  const phase = whole.trust * clamp((steadiness - 0.5) / 0.4, 0, 1);
+  if (debug) debug.grid = { whole, head, tail, steadiness, segs };
+  return { phase: round3(phase), head: round3(head.trust), tail: round3(tail.trust), perBeat: SLOTS_PER_BEAT, slots: slotPattern(att, beats) };
+}
+
+/** Half a beat later: a constant grid moves by half its period, any other grid to its own mid-points. */
+function halfBeatLater(beats, steady, duration) {
+  const n = beats.length;
+  if (n < 2) return beats;
+  const out = [];
+  if (steady) {
+    const p = (beats[n - 1] - beats[0]) / (n - 1);
+    let t = beats[0] + p / 2;
+    t -= Math.floor(t / p) * p;
+    for (let i = 0; t + i * p < duration; i++) out.push(t + i * p);
+    return out;
+  }
+  const first = beats[0] - 0.5 * (beats[1] - beats[0]);
+  if (first >= 0) out.push(first);
+  for (let i = 0; i + 1 < n; i++) out.push(0.5 * (beats[i] + beats[i + 1]));
+  const last = beats[n - 1] + 0.5 * (beats[n - 1] - beats[n - 2]);
+  if (last < duration) out.push(last);
+  return out;
+}
+
+/** A shifted list of beats, back inside [0, duration) and still reaching both ends of the track. */
+function coverTrack(beats, duration) {
+  const out = beats.filter((t) => t >= 0 && t < duration);
+  if (out.length < 2) return out;
+  const head = out[1] - out[0];
+  while (out[0] - head >= 0 && out.length < 200000) out.unshift(out[0] - head);
+  const tail = out[out.length - 1] - out[out.length - 2];
+  while (out[out.length - 1] + tail < duration && out.length < 200000) out.push(out[out.length - 1] + tail);
+  return out;
 }
 
 /**
@@ -255,7 +382,7 @@ function run(mono, sampleRate, duration, opts) {
  * @returns {{beats:number[], frames:Float64Array, bpm:number, confidence:number, steady:boolean}}
  *   frames = the same beats in envelope frames (before latency / attack alignment), for the downbeat picker
  */
-function buildBeats(x, env, tempo, duration, region, kick = null, midEnv = null) {
+function buildBeats(x, env, tempo, duration, region, kick = null, midEnv = null, att = null, debug = null) {
   const n = env.length;
   const smooth = gaussianSmooth(env, 1.5);
   const local = beatLocalScore(env, tempo.period);
@@ -373,6 +500,17 @@ function buildBeats(x, env, tempo, duration, region, kick = null, midEnv = null)
     frames = Float64Array.from(beats, (t) => t * FPS);
   }
 
+  // ---- the grid against the audible attacks (grid.js) ----
+  if (att && beats.length >= 8) {
+    const polished = polishGrid(x, att, beats, steady, duration, region, debug);
+    if (polished) {
+      beats = polished.beats;
+      // envelope frame of each beat: its time minus the two fine shifts (not minus a half-beat move)
+      const latency = shift / FS + polished.shift;
+      frames = Float64Array.from(beats, (t) => (t - latency) * FPS);
+    }
+  }
+
   // ---- confidence ----
   // strength: how periodic the onset envelope is at the chosen tempo (autocorrelation comb, 0..1).
   //           Real drums land at 0.3 – 0.8, rubato piano / pads / strings below 0.2.
@@ -401,6 +539,48 @@ function buildBeats(x, env, tempo, duration, region, kick = null, midEnv = null)
   // few beats = little evidence
   const span = Math.min(duration, region.end - region.start);
   confidence *= clamp((span - 2) / 8, 0.2, 1);
+  if (debug) debug.confidence = { strength: tempo.strength, margin: tempo.margin, coverage, steady, span, value: confidence };
 
   return { beats, frames, bpm, confidence, steady };
+}
+
+/**
+ * Last word on the beat phase, from the audible attacks:
+ *   1. Half a beat off? Only if the loudest attacks sit half-way between the beats AND the kick band and
+ *      the band above it both say so, in most 8-beat segments of the clip (grid.js isHalfBeatOff).
+ *   2. Fine alignment: slide the grid onto the attacks (alignGrid).
+ * @returns {null | {beats:number[], shift:number, flipped:boolean}}
+ */
+function polishGrid(x, att, beats, steady, duration, region, debug) {
+  let flipped = false;
+  let evidence = null;
+  const before = onOffRegion(att, beats, region);
+  const period = (beats[beats.length - 1] - beats[0]) / (beats.length - 1);
+  const nearHalf = Math.abs(Math.abs(before.offAtMs) / 1000 - period / 2) < 0.12 * period;
+  if (before.count >= 16 && nearHalf && before.off > before.on) {
+    const low = lowBand(x, FS);
+    const rest = new Float32Array(x.length);
+    for (let i = 0; i < x.length; i++) rest[i] = x[i] - low[i];
+    evidence = halfBeatEvidence(attackEnvelope(low, FS), attackEnvelope(rest, FS), beats, region.start, region.end);
+    if (isHalfBeatOff(evidence)) {
+      const moved = halfBeatLater(beats, steady, duration);
+      if (moved.length >= 8) {
+        beats = moved;
+        flipped = true;
+      }
+    }
+  }
+  const al = alignGrid(att, beats, region.start, region.end);
+  const out = coverTrack(al.beats, duration);
+  if (debug) debug.polish = { flipped, evidence, shift: al.shift, sharp: al.sharp, before, steady };
+  if (out.length < 2) return flipped ? { beats, shift: 0, flipped } : null;
+  return { beats: out, shift: al.shift, flipped };
+}
+
+function onOffRegion(att, beats, region) {
+  let i0 = 0;
+  while (i0 < beats.length && beats[i0] < region.start - 1e-3) i0++;
+  let i1 = beats.length;
+  while (i1 > i0 && beats[i1 - 1] > region.end + 1e-3) i1--;
+  return onOff(att, beats, i0, i1);
 }

@@ -25,6 +25,25 @@ import {
 export const MODES = Object.freeze(['preview', 'short', 'medium', 'full']);
 
 const TRUST = 0.5; // bpmConfidence from which a grid may be beat-matched (SPEC Analysis)
+// Overlapping two tracks beat on beat takes more than matching tempos: bpmConfidence vouches for the
+// tempo, Analysis.grid for the beat PHASE where the two would meet (see canOverlap).
+const GRID_TRUST = 0.5; // grid.head / .tail / .phase from which an end is "clear" (SPEC Analysis)
+const GRID_SOFT = 0.15; // below this at either end, nothing is overlapped whatever the patterns say
+const CONTRAST_MIN = 1.05; // attack patterns laid beat on beat must match this much better than at any other lag
+const EDGE_BEATS = 16; // beats at each end of the usable audio that grid.head / grid.tail describe
+// chooseNext: what a pair that can really be blended is worth over one that only matches in tempo.
+const BLEND_BONUS = 0.6;
+// chooseNext looks one track further: a candidate that can itself be blended into another track of the
+// window is worth this much more than one that leads nowhere. Half the blend bonus and no more: a blend
+// that is on offer now is certain, the one after it is a forecast (the window will have changed).
+const LOOKAHEAD_BONUS = 0.3;
+// chooseNext, when nothing in the window can be blended with the playing track anyway: that hand-over
+// is best spent on a track that could never be beat-matched (so it stops occupying the window).
+const DUMP_BONUS = 0.25;
+// Ticker wording (Transition.why) for the two reasons that are the DJ's doing rather than the tempos'.
+const WHY_HELD = 'tempos match, but the drums would clash — kept apart';
+const WHY_VARIETY = 'chosen for variety';
+const HARD_FLOOR = 0.15; // what is left of the percussive hand-overs' odds at vibe 0 (see typeWeights)
 const SYNC_TOL = 0.08; // max tempo change we ask of a track
 // A track that drops in on the one (no overlap) only takes over the outgoing tempo if that costs it
 // less than this: speed is pitch here, and a solo track well off its own pitch is worse than a tempo step.
@@ -81,7 +100,14 @@ function norm(an) {
   if (key && typeof key.camelot === 'string' && key.camelot) cam = key.camelot;
   else if (key && fin(key.pc)) cam = camelot(key.pc, key.mode);
   const trim = an.loudness && fin(an.loudness.trimDb) ? an.loudness.trimDb : 0;
+  // Grid trust is optional: an analysis without it (hand-made, tests) is taken at its bpmConfidence.
+  const g = an.grid && typeof an.grid === 'object' ? an.grid : null;
+  const unit = (v) => (fin(v) ? clamp(v, 0, 1) : 0);
+  // (the slot pattern is indexed by beat: only usable if no beat had to be dropped above)
+  const perBeat = g && Number.isInteger(g.perBeat) && g.perBeat >= 2 && g.perBeat % 2 === 0 ? g.perBeat : 0;
+  const slots = perBeat && g.slots && an.beats && beats.length === an.beats.length && g.slots.length >= beats.length * perBeat ? g.slots : null;
   return {
+    grid: g ? { phase: unit(g.phase), head: unit(g.head), tail: unit(g.tail), perBeat, slots } : null,
     duration,
     beats,
     period,
@@ -91,6 +117,8 @@ function norm(an) {
     key,
     cam,
     energy: fin(an.energy) ? clamp(an.energy, 0, 1) : 0.5,
+    // (per-second level against the track's own loudest second; optional)
+    curve: an.energyCurve && an.energyCurve.length > 0 ? an.energyCurve : null,
     trimDb: clamp(trim, -12, 6),
     cueStart: start,
     cueEnd: end,
@@ -170,6 +198,18 @@ function lsGrid(N, i0, i1) {
   return { period: N.period, pos: (i) => base + (i - ref) * N.period };
 }
 
+/**
+ * How loud a track is over the two seconds from buffer position `pos`, in dB against its own loudest
+ * second (≤ 0): Analysis.energyCurve spans 30 dB. 0 when the analysis carries no curve.
+ */
+function levelDbAt(N, pos) {
+  if (!N.curve) return 0;
+  const last = N.curve.length - 1;
+  const k = clamp(Math.floor(pos), 0, last);
+  const v = Math.max(Number(N.curve[k]), Number(N.curve[Math.min(last, k + 1)]));
+  return fin(v) ? -30 * (1 - clamp(v, 0, 1)) : 0;
+}
+
 /** The downbeat a track is normally entered on: first bar line at/after cues.in. */
 function cueIndex(N) {
   let j = downAtOrAfter(N, idxAtOrAfter(N, N.cueIn - 0.05));
@@ -181,6 +221,83 @@ function cueIndex(N) {
     if (beatPos(N, j) > N.duration - END_GUARD) j = idxAtOrAfter(N, 0);
   }
   return j;
+}
+
+/**
+ * How far the beat phase can be trusted over the beats i0 … i1 of a track (0..1): Analysis.grid.head or
+ * .tail where the stretch lies at that end of the usable audio (where previews are mixed), the
+ * whole-track value anywhere else. 1 when the analysis carries no grid trust at all.
+ */
+function gridTrust(N, i0, i1) {
+  if (!N.grid) return 1;
+  const span = Math.max(1e-9, i1 - i0);
+  const shared = (a, b) => Math.max(0, Math.min(i1, b) - Math.max(i0, a)) / span;
+  const h0 = idxAtOrAfter(N, N.cueIn - 1e-3);
+  const t1 = idxAtOrBefore(N, N.cueEnd + 1e-3);
+  let trust = 1;
+  let edge = false;
+  if (shared(h0, h0 + EDGE_BEATS) >= 0.5) {
+    trust = Math.min(trust, N.grid.head);
+    edge = true;
+  }
+  if (shared(t1 - EDGE_BEATS, t1) >= 0.5) {
+    trust = Math.min(trust, N.grid.tail);
+    edge = true;
+  }
+  return edge ? trust : N.grid.phase;
+}
+
+/**
+ * The two tracks' attack patterns (Analysis.grid.slots) laid over each other the way a blend would lay
+ * the audio: A's beats iS … iS+L on B's beats j0 … j0+L. Returns how much better they correlate beat on
+ * beat than at the best other lag up to half a beat either way (1 = no better; < 1 = they would fit
+ * better shifted, i.e. the drums of the two would come out interleaved). null when a pattern is missing.
+ */
+function overlapContrast(A, iS, B, j0, L) {
+  const ga = A.grid;
+  const gb = B.grid;
+  if (!ga || !gb || !ga.slots || !gb.slots || ga.perBeat !== gb.perBeat) return null;
+  const P = ga.perBeat;
+  const n = Math.round(L * P);
+  const a0 = Math.round(iS * P);
+  const b0 = Math.round(j0 * P);
+  const at = (arr, k) => (k >= 0 && k < arr.length ? arr[k] : 0);
+  let na = 0;
+  for (let k = 0; k < n; k++) na += at(ga.slots, a0 + k) ** 2;
+  if (!(na > 0)) return 0;
+  let zero = 0;
+  let other = 0;
+  for (let d = -P / 2; d <= P / 2; d++) {
+    let dot = 0;
+    let nb = 0;
+    for (let k = 0; k < n; k++) {
+      const v = at(gb.slots, b0 + k + d);
+      dot += at(ga.slots, a0 + k) * v;
+      nb += v * v;
+    }
+    const c = nb > 0 ? dot / Math.sqrt(na * nb) : 0;
+    if (d === 0) zero = c;
+    else if (c > other) other = c;
+  }
+  return other > 0 ? zero / other : zero > 0 ? 9 : 0;
+}
+
+/**
+ * May A's beats iS … iS+L and B's beats j0 … j0+L be overlapped beat on beat?
+ *   - neither end may be one the analysis calls unclear (grid trust below GRID_SOFT), and
+ *   - the two attack patterns must agree that "beat on beat" is where they fit (CONTRAST_MIN);
+ *     without patterns, both ends must be clear on their own (GRID_TRUST).
+ * Analyses without any grid trust (hand-made, tests) pass: bpmConfidence is then all there is.
+ * @returns {{ok:boolean, out:number, in:number, contrast?:number}}  contrast only when both patterns exist
+ */
+function canOverlap(A, iS, B, j0, L) {
+  if (!A.grid || !B.grid) return { ok: true, out: 1, in: 1 };
+  const out = gridTrust(A, iS, iS + L);
+  const inn = gridTrust(B, j0, j0 + L);
+  const contrast = overlapContrast(A, iS, B, j0, L);
+  const low = Math.min(out, inn);
+  if (contrast === null) return { ok: low >= GRID_TRUST, out, in: inn };
+  return { ok: low >= GRID_SOFT && contrast >= CONTRAST_MIN, out, in: inn, contrast: Math.round(contrast * 1000) / 1000 };
 }
 
 /** Best ×1 / ×2 / ÷2 reading of B's beat against A's (A possibly off-speed by rA). c = rate ratio B/A. */
@@ -267,6 +384,32 @@ function tempoScore(a, b) {
   return 0.35 + (raw - 0.35) * trust;
 }
 
+/** Grid trust where a track is normally left: its tail, or (short / medium sets leave mid-track) the whole. */
+const exitTrust = (S, N) => (!N.grid ? 1 : S.mode === 'short' || S.mode === 'medium' ? N.grid.phase : N.grid.tail);
+
+/**
+ * Would a blend out of `cur` into `N` pass canOverlap where the planner would normally put it? In
+ * preview mode that place is known in advance (last bar line of the usable audio into the first bar of
+ * the next track); in the longer modes the exit depends on the play, so the two ends are judged on
+ * their own.
+ */
+function blendableNext(S, cur, N) {
+  if (S.mode !== 'preview') return Math.min(exitTrust(S, cur), N.grid.head) >= GRID_TRUST;
+  const iX = downAtOrBefore(cur, idxAtOrBefore(cur, Math.min(cur.cueEnd + 1e-3, cur.duration - END_GUARD)));
+  const j0 = cueIndex(N);
+  return [8, 16].some((L) => canOverlap(cur, iX - L, N, j0, L).ok);
+}
+
+/**
+ * Could a blend out of `a` into `b` be planned: both grids trusted, tempos within reach at the same beat
+ * level, and (where the analyses carry grid trust) an overlap the gate would let through?
+ */
+function canBlendInto(S, a, b) {
+  if (Math.min(a.conf, b.conf) < TRUST) return false;
+  if (!(a.period > 0) || Math.abs(b.period / a.period - 1) > SYNC_TOL) return false;
+  return !a.grid || !b.grid || blendableNext(S, a, b);
+}
+
 function chooseNext(S, current, candidates, ctx) {
   if (!candidates || !candidates.length) return -1;
   const playIndex = ctx && fin(ctx.playIndex) ? ctx.playIndex : 0;
@@ -274,17 +417,26 @@ function chooseNext(S, current, candidates, ctx) {
   for (const a of (ctx && ctx.recentArtists) || []) for (const tok of artistTokens(a)) recent.add(tok);
   const target = energyArc(S.seed, playIndex);
   const cur = current ? norm(current.analysis) : null;
+  const Ns = candidates.map((c) => norm((c || {}).analysis));
+  const idOf = (k) => (candidates[k] || {}).id;
+  // What each candidate leads to: can it be blended into another track of the window afterwards?
+  // (A set is a chain of hand-overs; a track that is a dead end costs the next one as well.)
+  const leads = Ns.map((N, k) => Ns.some((M, m) => m !== k && idOf(m) !== idOf(k) && canBlendInto(S, N, M)));
+  const blendNow = Ns.map((N, k) => !!cur && idOf(k) !== current.id && canBlendInto(S, cur, N));
+  // Nothing here can be blended with the playing track: this hand-over is a plain one whatever is picked.
+  const lost = !!cur && !blendNow.some(Boolean);
   let best = 0;
   let bestScore = -Infinity;
   for (let k = 0; k < candidates.length; k++) {
     const cand = candidates[k] || {};
-    const N = norm(cand.analysis);
+    const N = Ns[k];
     // Noise is keyed by track, not by list position, so the pick does not depend on candidate order.
     const noise = createRng(`${S.seed}|pick|${playIndex}|${cand.id}`).range(-1, 1) * (0.15 + 0.2 * S.vibe);
     let score;
     if (!cur) {
       // Opener: nothing extreme, and a grid we can trust for the first blend.
       score = 1 - 1.6 * Math.abs(N.energy - Math.min(target, 0.5)) + 0.5 * N.conf + noise;
+      if (N.grid && N.conf >= TRUST) score += 0.3 * exitTrust(S, N);
     } else {
       const fit = 1 - Math.min(1, Math.abs(N.energy - target) * 2);
       const jump = Math.max(0, Math.abs(N.energy - cur.energy) - 0.35) * 0.8;
@@ -293,8 +445,14 @@ function chooseNext(S, current, candidates, ctx) {
       const matchable = Math.min(cur.conf, N.conf) >= TRUST && Math.abs(c - 1) <= SYNC_TOL;
       const harmony = keyCompat(cur.key, N.key, matchable ? rateToSemitones(c) : 0);
       score = 1.5 * tempoScore(cur, N) + 0.6 * harmony + 0.7 * fit - jump + noise;
+      // Of the tracks that match in tempo, go for one we can really overlap: same beat level, and a
+      // beat phase the analysis vouches for where the two would meet.
+      if (blendNow[k]) score += BLEND_BONUS;
+      // A hand-over that is plain anyway is the moment for a track nothing could be matched with.
+      if (lost && N.conf < TRUST) score += DUMP_BONUS;
       if (cand.id === current.id) score -= 3;
     }
+    if (leads[k]) score += LOOKAHEAD_BONUS;
     if (artistTokens(cand.artist).some((tok) => recent.has(tok))) score -= 0.8;
     if (score > bestScore) {
       bestScore = score;
@@ -467,25 +625,31 @@ export function glideBeats(rate, period, mode) {
 }
 
 /** Relative odds of each transition type for this pair (before the feasibility filter). */
-function typeWeights(env, sync, kc, bShort) {
+function typeWeights(env, matched, kc, bShort) {
   const v = env.S.vibe;
   const s = 1 - v;
-  const m = !!sync;
+  const m = !!matched;
   const clash = 1 + 1.2 * Math.max(0, 0.5 - kc); // clashing keys: get out quickly, percussively
-  // Matchable pairs are blended most of the time (about 85 % / 70 % / 55 % at vibe 0 / 0.5 / 1 when the
-  // keys agree); the other moves are the spice. Unmatchable pairs only have the right-hand column.
+  // "Smooth" means it: below vibe 0.2 the percussive hand-overs (cut, spinback, brake, roll, riser drop)
+  // thin out with the slider, down to about one transition in fifty at 0 (they used to keep a floor
+  // that added up to one in seven). Never to nothing: for some pairs they are all that can be built.
+  const hard = clamp(v / 0.2, HARD_FLOOR, 1);
+  // Pairs that may be overlapped (tempo AND grid trust, see canOverlap) are blended most of the time —
+  // about 92 % / 84 % / 73 % at vibe 0 / 0.5 / 1 when the keys agree: far from every tempo match may be,
+  // so where a blend is on offer it is usually taken, and the other moves are the spice. Every other
+  // pair only has the right-hand column.
   const w = {
-    bassSwap: 3.0 * (0.7 + 0.6 * kc),
-    eqBlend: 2.2 * (0.4 + 1.2 * s) * (0.5 + kc),
+    bassSwap: 6.0 * (0.7 + 0.6 * kc),
+    eqBlend: 4.4 * (0.4 + 1.2 * s) * (0.5 + kc),
     // the two spectra barely overlap in a filter blend, which makes it the kindest one to clashing keys
-    filterBlend: 2.0 * (1.4 - 0.8 * kc),
+    filterBlend: 4.0 * (1.4 - 0.8 * kc),
     echoOut: (m ? 0.65 : 2.2) * clash,
     reverbWash: (m ? 0.4 : 1.6) * (0.5 + 1.2 * s),
-    cut: (m ? 0.4 : 1.0) * (0.3 + 1.6 * v) * clash,
-    spinback: (m ? 0.25 : 0.8) * (0.15 + 2.15 * v),
-    brake: (m ? 0.22 : 0.8) * (0.2 + 1.8 * v),
-    loopRoll: (m ? 0.45 : 0.5) * (0.2 + 2 * v) * clash,
-    riserDrop: (m ? 0.5 : 1.4) * (0.3 + 1.8 * v) * clash,
+    cut: (m ? 0.4 : 1.0) * (0.3 + 1.6 * v) * clash * hard,
+    spinback: (m ? 0.25 : 0.8) * (0.15 + 2.15 * v) * hard,
+    brake: (m ? 0.22 : 0.8) * (0.2 + 1.8 * v) * hard,
+    loopRoll: (m ? 0.45 : 0.5) * (0.2 + 2 * v) * clash * hard,
+    riserDrop: (m ? 0.5 : 1.4) * (0.3 + 1.8 * v) * clash * hard,
   };
   for (const type of TYPES) {
     if (RECIPES[type].overlap && bShort) w[type] *= 0.5; // a short incoming clip should not be spent inside a blend
@@ -678,35 +842,59 @@ function build(env) {
     if (type === 'loopRoll') return A.conf >= 0.4; // a roll off the grid just sounds like a glitch
     return true;
   };
+  // Two tracks are overlapped beat on beat only where the analysis vouches for the beat phase of both:
+  // the outgoing track's beats under the blend and the incoming track's first ones. Anything less
+  // (a syncopated intro, a grid that may sit half a beat off) and the drums of the two can end up
+  // interleaved, which is the one thing a blend must not do. A ×2 / ÷2 tempo fold is left alone too:
+  // it puts the faster track's "two" on the slower one's "and" as often as not.
+  const overlapOk = (L) => !!sync && sync.f === 1 && canOverlap(A, startOf(L), B, jIn, L).ok;
+  const isBlend = (type) => RECIPES[type].overlap && RECIPES[type].sync === 'required';
   // Harmony as it will be heard: a beat-matched incoming track is transposed by its rate change
   // (no key lock); an unmatched one plays at its own pitch against wherever the outgoing deck is.
   const kc = keyCompat(A.key, B.key, sync ? rateToSemitones(sync.c) : -rateToSemitones(R(tNom)));
-  const w = typeWeights(env, sync, kc, bAvail < 12);
-  const feas = {};
-  const weights = TYPES.map((type) => {
-    feas[type] = RECIPES[type].lengths.filter((L) => ok(type, L));
-    return feas[type].length ? w[type] : 0;
-  });
-  if (!weights.some((x) => x > 0)) return null;
-  let type = rng.weighted(TYPES, weights);
-  // opts.force (tests, demos): honoured only when that move is actually buildable here.
-  const force = env.force || {};
-  if (force.type && feas[force.type] && feas[force.type].length) type = force.type;
-  const Rc = RECIPES[type];
 
-  // How long: leave the outgoing track some solo time if the clip allows, then follow the recipe's taste.
+  // How long a move may be: leave the outgoing track some solo time if the clip allows, then follow
+  // the recipe's taste. → the lengths to choose between (its liked ones that fit, else one fallback).
   const soloMin = S.mode === 'preview' ? 8 : 16;
-  const roomy = feas[type].filter((L) => urgent || L <= maxL - soloMin);
-  const pool = roomy.length ? roomy : [Math.min(...feas[type])];
-  const liked = preferredLengths(type, S.mode, urgent, beatNom);
-  const prefs = liked.filter((L) => pool.includes(L));
-  const uLen = rng.next();
-  let L;
-  if (!prefs.length) {
+  // `short`: only the shortest of the liked lengths.
+  const lengthChoices = (type, list, short) => {
+    const roomy = list.filter((L) => urgent || L <= maxL - soloMin);
+    const pool = roomy.length ? roomy : [Math.min(...list)];
+    let liked = preferredLengths(type, S.mode, urgent, beatNom);
+    if (short) liked = [Math.min(...liked)];
+    const prefs = liked.filter((L) => pool.includes(L));
+    if (prefs.length) return prefs;
     const cap = Math.max(...liked);
     const under = pool.filter((x) => x <= cap);
-    L = under.length ? Math.max(...under) : Math.min(...pool);
-  } else if (Rc.overlap && Math.min(...prefs) !== Math.max(...prefs)) {
+    return [under.length ? Math.max(...under) : Math.min(...pool)];
+  };
+  const feas = {};
+  const choices = {};
+  for (const type of TYPES) {
+    feas[type] = RECIPES[type].lengths.filter((L) => ok(type, L));
+    // A blend is on offer only at a length it would really be played at AND may be overlapped at.
+    if (isBlend(type)) choices[type] = feas[type].length ? lengthChoices(type, feas[type], false).filter(overlapOk) : [];
+  }
+  const blendable = TYPES.some((type) => isBlend(type) && choices[type].length);
+  // Matchable in tempo and a blend would fit, but no overlap is allowed here: the pair is treated like
+  // one that cannot be matched — the moves left all hand over on one line (or wash across briefly).
+  const held = !!sync && !blendable && TYPES.some((type) => isBlend(type) && feas[type].length);
+  const w = typeWeights(env, !!sync && !held, kc, bAvail < 12);
+  const weights = TYPES.map((type) => ((isBlend(type) ? choices[type] : feas[type]).length ? w[type] : 0));
+  // opts.force (tests, demos): honoured when that move can be built here at all — it is not asked
+  // whether the grids deserve it.
+  const force = env.force || {};
+  const forced = !!(force.type && feas[force.type] && feas[force.type].length);
+  if (!forced && !weights.some((x) => x > 0)) return null;
+  let type = rng.weighted(TYPES, weights.some((x) => x > 0) ? weights : TYPES.map((t) => (t === force.type ? 1 : 0)));
+  if (forced) type = force.type;
+  const Rc = RECIPES[type];
+
+  // (a wash is the one unsynced move that overlaps: where the beats may be half a beat apart, keep it short)
+  const prefs = isBlend(type) && !forced ? choices[type] : lengthChoices(type, feas[type], held && type === 'reverbWash');
+  const uLen = rng.next();
+  let L;
+  if (Rc.overlap && Math.min(...prefs) !== Math.max(...prefs)) {
     // Long blends when the keys agree and the vibe is smooth; short ones when they clash or it is wild.
     const pLong = clamp(0.2 + 0.6 * kc - 0.35 * S.vibe + (S.mode === 'preview' ? 0 : 0.1), 0.05, 0.9);
     L = uLen < pLong ? Math.max(...prefs) : Math.min(...prefs);
@@ -729,6 +917,8 @@ function build(env) {
     const need = { short: 27, medium: 54, full: 60 }[S.mode] + (Rc.overlap ? L * beatNom : 0);
     const pEnter = { short: 0.7, medium: 0.5, full: 0.2 }[S.mode];
     if (u1 < pEnter && jc > jIn && B.cueEnd - beatPos(B, jc) >= need) j0 = jc;
+    // (a blend that enters anywhere but the head needs the grid to be trusted there as well)
+    if (j0 !== jIn && isBlend(type) && !forced && !canOverlap(A, startOf(L), B, j0, L).ok) j0 = jIn;
   }
 
   // The outgoing track's beat clock for this transition (least-squares grid around it).
@@ -810,6 +1000,7 @@ function build(env) {
     pre,
     rng: rng.fork(type),
     vibe: S.vibe,
+    inDb: levelDbAt(B, cuePos),
     A: laneA,
     B: laneB,
     bus,
@@ -844,15 +1035,30 @@ function build(env) {
   const tStart = Math.min(bStart, laneA.events.reduce((mn, ev) => Math.min(mn, ev.t), tS));
   const bpmA = (60 / A.period) * R(tS);
   const names = `${round1(A.bpm * R(tS))} → ${round1(B.bpm)} BPM`;
+  // The ticker line. Whenever the move is not a beat-matched blend it ends with the reason, and the
+  // reason is what is actually true of THIS pair — never a guess about the music:
+  //   no trusted tempo on one side → that side is named (the other one's beat may be perfectly steady)
+  //   both trusted, too far apart  → the tempos
+  //   matchable, held by the gate  → the drums (canOverlap would not vouch for them beat on beat)
+  //   matchable, no blend fits     → room
+  //   a blend was on offer         → the DJ's choice
+  const fold = !sync || sync.f === 1 ? '' : sync.f === 2 ? 'double-time' : 'half-time';
+  let reason = '';
+  if (isBlend(type)) reason = '';
+  else if (!sync) reason = A.conf < TRUST || B.conf < TRUST ? `no steady beat detected in ${A.conf >= TRUST ? 'the incoming track' : B.conf >= TRUST ? 'the outgoing track' : 'either track'}` : 'tempos too far apart to match';
+  else if (fold) reason = useSync ? '' : `${fold} apart, not blended`; // (a carried fold is labelled below)
+  else if (held) reason = WHY_HELD;
+  else if (!blendable) reason = 'no room left for a blend';
+  else reason = WHY_VARIETY;
   let why;
   if (useSync) {
-    const pct = (rate[0].v - 1) * 100;
-    const fold = sync.f === 2 ? ' · double-time' : sync.f === 0.5 ? ' · half-time' : '';
-    why = `${names} (${pct >= 0 ? '+' : '−'}${Math.abs(pct).toFixed(1)}%)${fold} · ${A.cam} → ${B.cam}`;
+    // Rounded before the sign is chosen: a pitch move below 0.05 % is none ("±0.0%"), not "−0.0%".
+    const pct = Number(((rate[0].v - 1) * 100).toFixed(1));
+    why = `${names} (${pct > 0 ? '+' : pct < 0 ? '−' : '±'}${Math.abs(pct).toFixed(1)}%)${fold ? ` · ${fold}` : ''} · ${A.cam} → ${B.cam}`;
   } else {
-    const reason = sync ? '' : A.conf < TRUST || B.conf < TRUST ? ' · no steady beat to lock to' : ' · tempos too far apart to blend';
-    why = `${names} · ${A.cam} → ${B.cam}${reason}`;
+    why = `${names} · ${A.cam} → ${B.cam}`;
   }
+  if (reason) why += ` · ${reason}`;
   const byT = (x, y) => x.t - y.t;
   return {
     id,
@@ -885,6 +1091,8 @@ function build(env) {
     fx: [...tricks.fx, ...ctx.fx].sort(byT),
     fxEvents: sortEvents([...flush, ...tricks.bus, ...bus.events]),
     marks: [...tricks.marks, ...ctx.marks].sort(byT),
+    // Blends only: what canOverlap made of these two stretches (a forced blend carries it too).
+    ...(isBlend(type) ? { trust: canOverlap(A, iS, B, j0, L) } : {}),
   };
 }
 

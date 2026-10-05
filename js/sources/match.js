@@ -413,6 +413,46 @@ const starTokens = (s) =>
     .split(' ')
     .filter(Boolean);
 
+const LETTER_OR_DIGIT = /^[\p{L}\p{N}]$/u;
+// Nobody stars out a word this long. Past it the answer is "not the same" without looking, which
+// (with the table below being rows × columns) bounds the work for any input.
+const MAX_CENSORED_WORD = 64;
+
+/**
+ * One censored word against one plain word: every star stands for one letter or digit, or for
+ * nothing; everything else has to be identical. `pat` and `plain` are arrays of code points.
+ *
+ * Deliberately a table and not a regular expression. The obvious regex (one optional group per
+ * star) backtracks through every way of leaving stars empty when the word does not match: 40
+ * stars against a nine-letter word is ~10^9 tries, on the main thread, from one track title.
+ * Here row i says which prefixes of `plain` the first i symbols of `pat` can spell, so the cost
+ * is pat.length × plain.length steps whatever the input.
+ * @param {string[]} pat @param {string[]} plain
+ */
+function censoredWordMatches(pat, plain) {
+  const n = plain.length;
+  let row = new Array(n + 1).fill(false);
+  row[0] = true;
+  for (const ch of pat) {
+    const next = new Array(n + 1).fill(false);
+    let any = false;
+    if (ch === '*') {
+      for (let j = 0; j <= n; j++) {
+        next[j] = row[j] || (j > 0 && row[j - 1] && LETTER_OR_DIGIT.test(plain[j - 1]));
+        any = any || next[j];
+      }
+    } else {
+      for (let j = 1; j <= n; j++) {
+        next[j] = row[j - 1] && plain[j - 1] === ch;
+        any = any || next[j];
+      }
+    }
+    if (!any) return false;
+    row = next;
+  }
+  return row[n];
+}
+
 /**
  * Stores that censor titles write "Gl*w" or "G**w" for "Glow". True when the two titles are the
  * same once every star may stand for one letter (or none).
@@ -426,12 +466,19 @@ export function censoredEqual(a, b) {
   return ta.every((x, i) => {
     const y = tb[i];
     if (x === y) return true;
-    const [pat, plain] = x.includes('*') ? [x, y] : [y, x];
-    if (!pat.includes('*') || plain.includes('*')) return false;
-    const letters = Array.from(pat).filter((ch) => ch !== '*');
-    if (!letters.length) return false; // "****" could be anything
-    const re = new RegExp(`^${Array.from(pat, (ch) => (ch === '*' ? '[\\p{L}\\p{N}]?' : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('')}$`, 'u');
-    return re.test(plain);
+    // Either title may be the censored one, word by word.
+    const [patText, plainText] = x.includes('*') ? [x, y] : [y, x];
+    if (!patText.includes('*') || plainText.includes('*')) return false;
+    if (patText.length > MAX_CENSORED_WORD * 2 || plainText.length > MAX_CENSORED_WORD * 2) return false; // UTF-16 units: cheap first cut
+    const pat = Array.from(patText);
+    const plain = Array.from(plainText);
+    if (pat.length > MAX_CENSORED_WORD) return false;
+    let letters = 0;
+    for (const ch of pat) if (ch !== '*') letters++;
+    if (!letters) return false; // "****" could be anything
+    // Each star hides at most one character, each letter exactly one.
+    if (plain.length < letters || plain.length > pat.length) return false;
+    return censoredWordMatches(pat, plain);
   });
 }
 

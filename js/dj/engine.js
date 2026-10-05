@@ -24,6 +24,10 @@ import { positionAt, timeAtPosition, evalParam, sortEvents, dbToGain } from './t
 import {
   createFxBus,
   probeLoopLatency,
+  probeCompressorEmphasis,
+  emphasisFilters,
+  sanitizeBuffer,
+  sanitizeBufferAsync,
   makeImpulseResponse,
   makeNoiseBuffer,
   scheduleRiser,
@@ -35,7 +39,7 @@ import {
   lockAudio,
 } from './fx.js';
 
-export { unlockAudio, lockAudio };
+export { unlockAudio, lockAudio, sanitizeBuffer, sanitizeBufferAsync };
 
 /** Master gain at volume 1: room for two overlapping tracks before the limiter has to work. */
 export const HEADROOM = 0.85;
@@ -44,6 +48,8 @@ export const HEADROOM = 0.85;
  * Limiter = DynamicsCompressorNode with a hard knee and the steepest ratio it offers. `lookahead` is the
  * node's fixed pre-delay (6 ms in every engine derived from the original WebKit code): it delays the
  * whole mix by a constant and is why the UI clock (uiTime) subtracts it.
+ * Where the browser's compressor still pre-emphasises the treble in front of its detector (Firefox) the
+ * engine cancels that with a filter pair around the node, see fx.js probeCompressorEmphasis().
  */
 export const LIMITER = { threshold: -3, knee: 0, ratio: 20, attack: 0.003, release: 0.15, lookahead: 0.006 };
 
@@ -196,11 +202,13 @@ export function truncatePlay(play, T) {
 // ---------------------------------------------------------------------------------------------------
 
 /**
- * @param {{context?: BaseAudioContext, cancelAndHold?: boolean}} [opts]
- *   context        render into this context (AudioContext or OfflineAudioContext). Omitted: an
- *                  AudioContext({latencyHint: 'playback'}) is created on first use and closed by destroy().
- *   cancelAndHold  false = never use AudioParam.cancelAndHoldAtTime (forces the code path Firefox takes;
- *                  exists so that path can be tested in Chrome).
+ * @param {{context?: BaseAudioContext, cancelAndHold?: boolean, limiterEmphasis?: boolean}} [opts]
+ *   context          render into this context (AudioContext or OfflineAudioContext). Omitted: an
+ *                    AudioContext({latencyHint: 'playback'}) is created on first use and closed by destroy().
+ *   cancelAndHold    false = never use AudioParam.cancelAndHoldAtTime (forces the code path Firefox takes;
+ *                    exists so that path can be tested in Chrome).
+ *   limiterEmphasis  true / false = wrap / do not wrap the limiter in the filters that cancel a compressor's
+ *                    treble pre-emphasis, instead of measuring whether this browser needs them (tests).
  */
 export function createEngine(opts = {}) {
   /** @type {BaseAudioContext|null} */
@@ -236,7 +244,9 @@ export function createEngine(opts = {}) {
   /** loop / reverse FX whose play has not been added yet (the caller sent the FX first). */
   let waitingFx = [];
   let busLanes = null;
-  const listeners = { playstart: new Set(), playend: new Set() };
+  const listeners = { playstart: new Set(), playend: new Set(), statechange: new Set() };
+  /** The context state last reported through 'statechange'. */
+  let lastState = null;
 
   let nodeCount = 0;
   let baseline = 0;
@@ -279,9 +289,30 @@ export function createEngine(opts = {}) {
         ctx = new AC();
       }
       offline = false;
+      watchState();
     }
     return ctx;
   }
+
+  /**
+   * 'statechange' listeners hear every change of the context's state exactly once: 'running',
+   * 'suspended', 'closed', and on iOS 'interrupted' (a phone call, another app taking the audio).
+   * Fed by the context's own event, by pause() / resume(), and by the housekeeping timer, because
+   * not every browser fires the event for a state it changed by itself.
+   */
+  function checkState() {
+    if (destroyed || !ctx) return;
+    const state = ctx.state;
+    if (state === lastState) return;
+    lastState = state;
+    emit('statechange', { state });
+  }
+
+  function watchState() {
+    lastState = ctx.state;
+    if (typeof ctx.addEventListener === 'function') ctx.addEventListener('statechange', checkState);
+  }
+  if (ctx) watchState();
 
   function graph() {
     if (g) return g;
@@ -330,10 +361,51 @@ export function createEngine(opts = {}) {
     analyser.connect(c.destination);
     const impulse = makeImpulseResponse(c);
     const noise = makeNoiseBuffer(c);
-    g = { bus, master, limiter, post, analyser, keepAlive, fx: null, impulse, noise, tap: null };
+    g = { bus, master, limiter, post, analyser, keepAlive, fx: null, impulse, noise, tap: null, emphasis: null, ready: null };
     buildFx();
     baseline = nodeCount;
+    // Does this browser's compressor need its pre-emphasis cancelled? Measured once per page (a few
+    // ms); start() waits for the answer, so the two filters are in place before anything plays.
+    if (opts.limiterEmphasis === true) flattenLimiter();
+    else if (opts.limiterEmphasis !== false) {
+      g.ready = probeCompressorEmphasis(c.sampleRate, LIMITER).then((needed) => {
+        if (needed) flattenLimiter();
+      });
+    }
     return g;
+  }
+
+  /**
+   * master ─▶ CUT ─▶ limiter ─▶ BOOST ─▶ post instead of master ─▶ limiter ─▶ post: the limiter then
+   * detects on the signal itself, not on a treble-boosted copy (see fx.js). Transparent while the
+   * limiter is idle and adds no latency.
+   */
+  function flattenLimiter() {
+    if (destroyed || !g || g.emphasis || typeof ctx.createIIRFilter !== 'function') return;
+    let pair;
+    try {
+      const k = emphasisFilters(ctx.sampleRate);
+      pair = [ctx.createIIRFilter(k.cut.feedforward, k.cut.feedback), ctx.createIIRFilter(k.boost.feedforward, k.boost.feedback)];
+      for (const node of pair) {
+        // Pinned to stereo like the limiter itself: no filter state is rebuilt when a mono source joins.
+        node.channelCount = 2;
+        node.channelCountMode = 'explicit';
+      }
+      g.master.disconnect(g.limiter);
+      g.limiter.disconnect(g.post);
+    } catch {
+      // Whatever failed, the plain path is whole again (connecting twice is a no-op).
+      g.master.connect(g.limiter);
+      g.limiter.connect(g.post);
+      return;
+    }
+    const [cut, boost] = pair;
+    g.master.connect(cut);
+    cut.connect(g.limiter);
+    g.limiter.connect(boost);
+    boost.connect(g.post);
+    g.emphasis = [mk(cut), mk(boost)];
+    baseline += 2;
   }
 
   /** (Re)create the delay / reverb buses; old tails vanish with the old nodes. */
@@ -423,11 +495,17 @@ export function createEngine(opts = {}) {
       // audible changes yet), then cancel everything after it, then pin the value (covers an old event
       // sitting exactly on the cut). Every intermediate timeline is a valid one, so it does not matter
       // whether the browser applies these three calls together or one by one.
+      // "After it" has to mean at least a whole sample frame later: Firefox's audio thread keeps event
+      // times in frames, so a cancel a microsecond behind the hold point lands on the same frame and
+      // takes the hold point with it — the very snap-back this is here to prevent.
+      const eps = 2 / ctx.sampleRate;
       if (cut.k === 'lin') param.linearRampToValueAtTime(cut.held, tc);
       else if (cut.k === 'exp' && cut.held > 0) param.exponentialRampToValueAtTime(cut.held, tc);
       else param.setValueAtTime(cut.held, tc);
-      param.cancelScheduledValues(tc + 1e-6);
+      param.cancelScheduledValues(tc + eps);
       param.setValueAtTime(cut.held, tc);
+      // An old event inside those two frames escapes the cancel: bury it under the held value.
+      if (lane.events.some((e) => e.t > T && e.t <= T + eps)) param.setValueAtTime(cut.held, tc + eps);
     }
     lane.events = cut.events;
     return cut.held;
@@ -448,10 +526,10 @@ export function createEngine(opts = {}) {
 
   // ----- events / housekeeping -----------------------------------------------------------------
 
-  function emit(type, playId) {
+  function emit(type, detail) {
     for (const fn of [...listeners[type]]) {
       try {
-        fn({ playId });
+        fn(detail);
       } catch (err) {
         console.error('[engine] listener failed', err);
       }
@@ -487,7 +565,7 @@ export function createEngine(opts = {}) {
     for (const strip of [...strips.values()]) {
       if (!strip.started && n >= strip.tBegin) {
         strip.started = true;
-        emit('playstart', strip.id);
+        emit('playstart', { playId: strip.id });
       }
       if (!strip.ended && (strip.bufferEnded || n >= strip.effEnd)) {
         strip.ended = true;
@@ -495,9 +573,9 @@ export function createEngine(opts = {}) {
         halt([strip.source]);
         if (!strip.started) {
           strip.started = true;
-          emit('playstart', strip.id);
+          emit('playstart', { playId: strip.id });
         }
-        emit('playend', strip.id);
+        emit('playend', { playId: strip.id });
       }
       if (strip.ended && n >= Math.max(strip.endTime, strip.fxUntil) + STRIP_TAIL) teardown(strip);
     }
@@ -576,6 +654,13 @@ export function createEngine(opts = {}) {
    */
   function addPlay(play, buffer) {
     if (destroyed || !play || !buffer) return;
+    // Before the first source ever holds this buffer: no NaN / Infinity may enter the graph, where one
+    // would sit in a filter's or the delay loop's state for good (a no-op for a buffer seen before).
+    try {
+      sanitizeBuffer(buffer);
+    } catch (err) {
+      console.error('[engine] could not check a buffer', err);
+    }
     if (!started) {
       pending.push({ kind: 'play', play, buffer });
       return;
@@ -612,8 +697,8 @@ export function createEngine(opts = {}) {
       // Nothing left to hear. Listeners still get a complete start/end pair, after this call returns.
       Promise.resolve().then(() => {
         if (destroyed) return;
-        emit('playstart', play.id);
-        emit('playend', play.id);
+        emit('playstart', { playId: play.id });
+        emit('playend', { playId: play.id });
       });
       return;
     }
@@ -942,6 +1027,7 @@ export function createEngine(opts = {}) {
     const resuming = wake(); // synchronously, before any await: this is the part that needs the gesture
     if (resuming) resuming.catch(() => {}); // awaited further down; a closed context must not surface as an unhandled rejection meanwhile
     if (loopLatency == null) await probeLoopLatency(); // a few ms, once per page; buildFx applies the result
+    if (g && g.ready) await settled(g.ready); // likewise: the limiter is complete before the first play
     if (resetting) await resetting; // the old set is still fading out: its cleanup must not eat the new one
     if (destroyed) return;
     if (!started) {
@@ -957,7 +1043,12 @@ export function createEngine(opts = {}) {
         else if (op.kind === 'extend') extendPlay(op.playId, op.more);
         else addFx(op.fx, op.fxEvents);
       }
-      if (!offline && !timer) timer = setInterval(tick, 50);
+      if (!offline && !timer) {
+        timer = setInterval(() => {
+          checkState();
+          tick();
+        }, 50);
+      }
     }
     if (resuming) await settled(resuming);
   }
@@ -968,6 +1059,7 @@ export function createEngine(opts = {}) {
   async function pause() {
     if (destroyed || offline || !ctx || ctx.state !== 'running') return;
     await ctx.suspend();
+    checkState(); // listeners know before the caller goes on (the context's own event comes a task later)
   }
 
   async function resume() {
@@ -975,6 +1067,7 @@ export function createEngine(opts = {}) {
     if (unlocked) unlockAudio({ owner: token }); // iOS pauses the silent element when the page is backgrounded
     if (ctx.state === 'running') return;
     await settled(ctx.resume());
+    checkState();
     tick();
   }
 
@@ -990,6 +1083,16 @@ export function createEngine(opts = {}) {
   /** Output meter. Returns the same object and arrays every call. */
   function levels() {
     if (!g) return lv;
+    // A context that is not running (paused, interrupted, never allowed to start) puts out nothing,
+    // but its analyser keeps answering with the last block it saw: the meter would stay lit over a
+    // silent set. (An OfflineAudioContext is 'suspended' until it renders and is left alone.)
+    if (!offline && ctx.state !== 'running') {
+      lv.rms = 0;
+      lv.peak = 0;
+      lv.bands.fill(0);
+      lv.wave.fill(128);
+      return lv;
+    }
     const a = g.analyser;
     a.getByteFrequencyData(lv.bands);
     a.getByteTimeDomainData(lv.wave);
@@ -1029,6 +1132,13 @@ export function createEngine(opts = {}) {
         const ts = ctx.getOutputTimestamp();
         if (ts && ts.performanceTime > 0 && Number.isFinite(ts.contextTime)) {
           t = ts.contextTime + (performance.now() - ts.performanceTime) / 1000;
+          // Chrome's timestamp is the sample at the speakers, so it already trails currentTime by the
+          // device latency and more. Firefox (which moves both halves of the pair back by the latency)
+          // and Safari (the sample being rendered, a quantum back) extrapolate to currentTime itself:
+          // there the device latency still has to come off, or playheads lead the sound by it —
+          // a quarter of a second on Bluetooth.
+          const device = ctx.outputLatency || 0;
+          if (cur - t < 0.5 * device) t -= device;
         }
       } catch {
         /* keep the estimate */
@@ -1051,6 +1161,10 @@ export function createEngine(opts = {}) {
     return g.tap.stream;
   }
 
+  /**
+   * 'playstart' | 'playend' → fn({playId}); 'statechange' → fn({state}), the AudioContext's state each
+   * time it changes (see checkState). Returns the function that removes the listener.
+   */
   function on(type, fn) {
     const set = listeners[type];
     if (!set || typeof fn !== 'function') return () => {};
@@ -1153,12 +1267,12 @@ export function createEngine(opts = {}) {
       clearAll();
       halt(g.fx.sources.concat([g.keepAlive]));
       drop(g.fx.nodes);
-      drop([g.bus, g.master, g.limiter, g.post, g.analyser, g.keepAlive].concat(g.tap ? [g.tap] : []));
+      drop([g.bus, g.master, g.limiter, g.post, g.analyser, g.keepAlive].concat(g.tap ? [g.tap] : [], g.emphasis || []));
     }
     destroyed = true;
     if (unlocked) lockAudio(token);
-    listeners.playstart.clear();
-    listeners.playend.clear();
+    for (const set of Object.values(listeners)) set.clear();
+    if (ctx && typeof ctx.removeEventListener === 'function') ctx.removeEventListener('statechange', checkState);
     if (owned && ctx && ctx.state !== 'closed' && typeof ctx.close === 'function') {
       ctx.close().catch(() => {});
     }
@@ -1168,6 +1282,14 @@ export function createEngine(opts = {}) {
     /** Created on first access when the engine owns the context (never after destroy()). */
     get ctx() {
       return destroyed ? ctx : getCtx();
+    },
+    /**
+     * The AudioContext's state ('suspended' | 'running' | 'closed', on iOS also 'interrupted') without
+     * creating the context: 'suspended' while there is none yet, 'closed' once destroyed.
+     */
+    get state() {
+      if (destroyed) return 'closed';
+      return ctx ? ctx.state : 'suspended';
     },
     start,
     unlock,

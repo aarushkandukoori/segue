@@ -3,6 +3,12 @@
 //
 // set() rebuilds the (few) DOM nodes when the transition changes; frame() only moves the bar and flips
 // classes. Screen-reader announcements happen once per state change, never per frame.
+//
+// Two more things a TransitionView can say:
+//   state 'waiting' — the set is running but nothing can play (the crate ran dry: the connection is
+//     gone, or the next track is still loading). The ticker says so, and why, for as long as it lasts.
+//   trick — a mid-solo trick ("Beat repeat") on the track that is playing, while the next transition
+//     is already announced. It shows as a pill for its second or two and never replaces "Next: …".
 
 import { clamp01, el, fmtTime, setText } from './dom.js';
 
@@ -21,6 +27,7 @@ export function createTicker(root, R) {
   let qFill = -1;
   let qCount = -1;
   let idleTitle = '';
+  let trickSig = '';
 
   function clearMarks() {
     R['tk-marks'].textContent = '';
@@ -37,19 +44,33 @@ export function createTicker(root, R) {
     R['tk-fill'].style.clipPath = `inset(0 ${(100 - q / 10).toFixed(1)}% 0 0)`;
   }
 
+  /** The pill for a mid-solo trick: shown while tv.trick is there, announced once, gone with it. */
+  function paintTrick() {
+    const trick = tv && tv.state === 'upcoming' && tv.trick && tv.trick.label ? tv.trick : null;
+    const next = trick ? `${trick.label}@${trick.tStart}` : '';
+    if (next === trickSig) return;
+    trickSig = next;
+    setText(R['tk-trick'], trick ? String(trick.label) : '');
+    R['tk-trick'].hidden = !trick;
+    // Its own live region: "Next: …" was announced when the transition appeared and is not said again.
+    if (trick) setText(R['tk-trick-live'], `${trick.label}${trick.on ? ` on ${trick.on}` : ''}.`);
+  }
+
   /**
    * @param {any|null} v TransitionView
    * @param {{from: number, to: number}} [sides] deck index (0/1) of the outgoing / incoming track, −1 if unknown
    */
   function set(v, sides) {
+    const waiting = !!v && v.state === 'waiting';
     const next = v
-      ? `${v.state}|${v.type}|${v.label}|${v.fromTitle}|${v.toTitle}|${v.tStart}|${v.tEnd}|${(v.marks || []).length}`
+      ? `${v.state}|${v.type}|${v.label}|${v.fromTitle}|${v.toTitle}|${v.tStart}|${v.tEnd}|${(v.marks || []).length}${waiting ? `|${v.why}` : ''}`
       : '';
     tv = v || null;
     if (sides) {
       root.dataset.from = String(sides.from);
       root.dataset.to = String(sides.to);
     }
+    paintTrick(); // comes and goes while the transition itself (and so `sig`) stays the same
     if (next === sig) return;
     const prevState = sig.split('|')[0];
     sig = next;
@@ -63,6 +84,20 @@ export function createTicker(root, R) {
       setText(R['tk-count-lbl'], '');
       setText(R['tk-count'], '');
       paintFill(0);
+      return;
+    }
+
+    if (waiting) {
+      // Nothing is on air and nothing is announced: no countdown, no bar — what the set waits for.
+      root.dataset.state = 'waiting';
+      setText(R['tk-tag'], 'Standby');
+      setText(R['tk-label'], tv.label || 'Waiting for the next track');
+      setText(R['tk-to'], '');
+      setText(R['tk-why'], tv.why || '');
+      setText(R['tk-count-lbl'], '');
+      setText(R['tk-count'], '');
+      paintFill(0);
+      setText(R['tk-live'], `${tv.label || 'Waiting for the next track'}.${tv.why ? ` ${tv.why}` : ''}`);
       return;
     }
 
@@ -110,7 +145,7 @@ export function createTicker(root, R) {
 
   /** @param {number} t set time */
   function frame(t) {
-    if (!tv) return;
+    if (!tv || tv.state === 'waiting') return;
     if (tv.state === 'active') {
       const span = tv.tEnd - tv.tStart;
       paintFill(span > 0 ? (t - tv.tStart) / span : 1);

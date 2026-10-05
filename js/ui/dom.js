@@ -13,11 +13,17 @@ export function safeUrl(u) {
   if (typeof u !== 'string' || !u) return '';
   try {
     const parsed = new URL(u);
-    return parsed.protocol === 'https:' || parsed.protocol === 'blob:' ? parsed.href : '';
+    if (parsed.protocol === 'blob:') return parsed.href;
+    // https only, and never with credentials in front of the host (same rule as sources/util.js
+    // httpsUrl): "https://familiar-name@other.host/" reads like a link to the wrong place.
+    return parsed.protocol === 'https:' && parsed.hostname && !parsed.username && !parsed.password ? parsed.href : '';
   } catch {
     return '';
   }
 }
+
+/** True when `host` is `domain` itself or a subdomain of it — never a look-alike that merely ends with it. */
+const onDomain = (host, domain) => host === domain || host.endsWith(`.${domain}`);
 
 const lastText = new WeakMap();
 
@@ -103,9 +109,10 @@ export function linkLabel(url) {
   } catch {
     return 'Open track';
   }
-  if (host.endsWith('spotify.com')) return 'Open in Spotify';
-  if (host.endsWith('deezer.com') || host.endsWith('deezer.page.link')) return 'Open in Deezer';
-  if (host.endsWith('apple.com')) return 'Open in Apple Music';
+  // Only a link that really is on the service gets the service's name; anything else is just "a link".
+  if (onDomain(host, 'spotify.com')) return 'Open in Spotify';
+  if (onDomain(host, 'deezer.com') || onDomain(host, 'deezer.page.link')) return 'Open in Deezer';
+  if (onDomain(host, 'apple.com')) return 'Open in Apple Music';
   return 'Open track';
 }
 

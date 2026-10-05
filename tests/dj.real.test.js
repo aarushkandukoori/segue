@@ -7,6 +7,7 @@ import { createPlanner } from '../js/dj/planner.js';
 import { RECIPES } from '../js/dj/transitions.js';
 import { loadRealCrate, onsetEnvelope, onsetLag } from './helpers/dj-real.js';
 import { checkBusSessions, checkTransition, simulateSet } from './helpers/dj-synth.js';
+import { GROUPS, formatSurvey, loadCrate, surveyAll, tally } from './helpers/mix-eval.js';
 
 const crate = await loadRealCrate(48);
 const skip = crate ? false : 'no audio fixtures (node tests/tools/fetch-fixtures.mjs) or no analysis module';
@@ -75,4 +76,30 @@ test('real previews: a beat-matched blend puts real drum hits on real drum hits'
   // (the rest are pairs whose rhythms correlate best a 16th apart — swing, off-beat hats — not drift)
   assert.ok(median <= 0.01, `median onset offset ${median * 1000} ms`);
   assert.ok(within20 >= 0.75, `only ${Math.round(within20 * 100)}% of pairs within 20 ms`);
+});
+
+test('real previews, sets per genre crate: the blends the planner allows itself put the drums together (raw, ±0.55 beat)', { skip }, () => {
+  // The offline twin of tests/e2e/mix.e2e.mjs: every fixture, one crate per genre, sets planned the way
+  // the conductor plans them; each overlapping beat-matched blend is measured by cross-correlating the
+  // two tracks' attack envelopes over the overlap. No allowances: half a beat apart is a miss.
+  const all = loadCrate();
+  if (!all) return;
+  const by = surveyAll(all, { seeds: 3 });
+  console.log(formatSurvey(by).replace(/^/gm, '      '));
+  const group = (list) => {
+    const have = list.filter((g) => by[g]);
+    const blends = have.flatMap((g) => by[g].blends);
+    return { ...tally(blends), transitions: have.reduce((n, g) => n + by[g].transitions, 0), blendCount: have.reduce((n, g) => n + by[g].blendCount, 0) };
+  };
+  const steady = group(GROUPS.steady);
+  const sync = group(GROUPS.syncopated);
+  if (steady.n < 30 || sync.n < 20) return; // a tiny fixture set has nothing to say
+  // wanted: ≥ 92 % on dance / electro / pop, ≥ 85 % on hip-hop / latin / r&b (measured on the 357 fixtures
+  // this was written with: 98 % / 96 %; another day's charts are other songs, hence floors, not the figures)
+  assert.ok(steady.tight / steady.n >= 0.92, `dance + electro + pop: ${steady.tight} of ${steady.n} blends within 20 ms`);
+  assert.ok(sync.tight / sync.n >= 0.85, `hip-hop + latin + r&b: ${sync.tight} of ${sync.n} blends within 20 ms`);
+  // … and blending has not been gated away where it works (measured: 33 % of dance + electro transitions)
+  const dance = group(['dance', 'electro']);
+  assert.ok(dance.blendCount / dance.transitions >= 0.2, `dance + electro: ${dance.blendCount} blends in ${dance.transitions} transitions`);
+  assert.ok(sync.blendCount / sync.transitions >= 0.08, `syncopated crates still blend sometimes: ${sync.blendCount} in ${sync.transitions}`);
 });

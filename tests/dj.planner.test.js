@@ -376,8 +376,22 @@ test('type selection follows compatibility and vibe; previous type is not repeat
   for (const t of ['echoOut', 'reverbWash', 'cut', 'spinback', 'brake', 'riserDrop', 'loopRoll']) assert.ok(far[t] > 0, `${t} reachable when unsyncable`);
   // every type is reachable for a matchable pair, at both ends of the vibe range
   for (const h of [smooth, hot, mid]) for (const t of Object.keys(RECIPES)) if (h === mid) assert.ok(h[t] > 0, `${t} reachable`);
+  // "Smooth" (vibe 0): the percussive hand-overs are a rarity, not one transition in seven —
+  // on a pair that can be blended next to nothing, on one that cannot a few per cent …
+  const HARD = ['cut', 'spinback', 'brake', 'loopRoll', 'riserDrop'];
+  const sum = (h) => HARD.reduce((n, t) => n + (h[t] || 0), 0);
   const all = tally({ vibe: 0 }, 3000);
-  for (const t of Object.keys(RECIPES)) assert.ok(all[t] > 0, `${t} reachable even at vibe 0`);
+  assert.ok(sum(all) < 0.01 * 3000, `vibe 0, blendable pair: ${sum(all)} hard moves in 3000`);
+  for (const t of ['bassSwap', 'eqBlend', 'filterBlend', 'echoOut', 'reverbWash']) assert.ok(all[t] > 0, `${t} reachable at vibe 0`);
+  const farSmooth = tally({ vibe: 0, bpmB: 98 }, 3000);
+  assert.ok(sum(farSmooth) < 0.06 * 3000, `vibe 0, unmatchable pair: ${sum(farSmooth)} hard moves in 3000 (was about 18 %)`);
+  // … but never impossible: every one of them is still reachable (for some pairs nothing else can be built)
+  for (const t of HARD) assert.ok(farSmooth[t] > 0, `${t} reachable even at vibe 0`);
+  // by vibe 0.1 they are on their way back, and from 0.2 up the slider works as it always did
+  const farLow = tally({ vibe: 0.1, bpmB: 98 }, 3000);
+  const farClub = tally({ vibe: 0.2, bpmB: 98 }, 3000);
+  assert.ok(sum(farSmooth) < sum(farLow) && sum(farLow) < sum(farClub), `${sum(farSmooth)} < ${sum(farLow)} < ${sum(farClub)}`);
+  assert.ok(sum(farClub) > 0.2 * 3000, `vibe 0.2, unmatchable pair: ${sum(farClub)} hard moves in 3000`);
   // a matched pair that ends up a quarter tone apart (no key lock) is treated like a clash: shorter blends
   const detuned = tally({ bpmB: 124 * 2 ** (0.5 / 12) });
   const inTune = tally({ bpmB: 124 });

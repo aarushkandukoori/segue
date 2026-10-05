@@ -58,7 +58,29 @@
 
 .topbar .wordmark {
   flex: none;
-  min-height: 40px;
+  min-height: 44px;
+}
+
+/* The way out of a set ("Change playlist"): the wordmark behind a back chevron, never a smaller
+   target than a fingertip — on a narrow phone the wordmark's text goes and the mark alone would be
+   22 px wide. */
+.topbar .wordmark-back {
+  min-width: 44px;
+  gap: 6px;
+}
+
+.wordmark-back .ic-back {
+  width: 14px;
+  height: 18px;
+  margin: 0 -3px 0 -4px;
+  color: var(--ink-3);
+  transition: color 0.15s, transform 0.2s var(--ease);
+}
+
+.wordmark-back:hover .ic-back,
+.wordmark-back:focus-visible .ic-back {
+  color: var(--ink);
+  transform: translateX(-2px);
 }
 
 .pl {
@@ -334,6 +356,11 @@
   color: var(--ink-3);
 }
 
+/* loaded but not playing yet: "Cued · in 0:14" */
+.wave-tag.is-cued {
+  color: var(--ink-2);
+}
+
 .wave-tag-a {
   top: 8px;
 }
@@ -470,6 +497,24 @@
   white-space: nowrap;
 }
 
+/* A mid-solo trick ("Beat repeat") while the next transition is already announced: a pill in front of
+   the reason line for the second or two it lasts. Inline, so the line keeps its height when it comes
+   and goes. */
+.tk-trick {
+  margin-right: 8px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: #0b0a0c;
+  font: 700 10px/1 var(--f-body);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.tk-trick[hidden] {
+  display: none;
+}
+
 .tk-marks {
   grid-area: marks;
   display: flex;
@@ -529,8 +574,14 @@
   letter-spacing: -0.02em;
 }
 
-.ticker[data-state='idle'] .tk-count {
+/* idle: a track riding solo, nothing announced yet. waiting: the crate ran dry — no countdown either. */
+.ticker[data-state='idle'] .tk-count,
+.ticker[data-state='waiting'] .tk-count {
   display: none;
+}
+
+.ticker[data-state='waiting'] .tk-tag::before {
+  animation: led 1.4s ease-in-out infinite;
 }
 
 .tk-bar {
@@ -2105,12 +2156,18 @@
   flex: none;
 }
 
-.tp-mode legend {
+/* label above the options here; beside them on the compact layouts further down */
+.tp-mode-body {
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+}
+
+.tp-mode-lbl {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0;
-  margin-bottom: 7px;
+  white-space: nowrap;
 }
 
 .tp-mode-lock {
@@ -2186,6 +2243,52 @@
 .seg input:disabled:checked + span {
   background: var(--panel-2);
   color: var(--ink-2);
+}
+
+/* Locked (30-second previews). A disabled control swallows clicks, so they are let through to the
+   fieldset, which answers with the reason — the title tooltip alone never shows on a touch screen. */
+.tp-mode.is-locked {
+  cursor: help;
+}
+
+.tp-mode.is-locked .seg input {
+  pointer-events: none;
+}
+
+/* …and on the compact layouts (below) this chip replaces the locked control altogether: four dead,
+   unlabelled options become one labelled thing to tap. */
+.tp-mode-note {
+  position: relative;
+  display: none;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 12px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(244, 238, 227, 0.03);
+  color: var(--ink-2);
+  font: 600 12px/1 var(--f-body);
+  white-space: nowrap;
+  flex: none;
+}
+
+/* finger-sized target without making the row taller */
+.tp-mode-note::after {
+  content: '';
+  position: absolute;
+  inset: -5px -4px;
+}
+
+.tp-mode-note .ic {
+  width: 13px;
+  height: 13px;
+  color: var(--ink-3);
+}
+
+.tp-mode-note:hover {
+  border-color: var(--ink-3);
+  color: var(--ink);
 }
 
 .tp-vol {
@@ -2370,10 +2473,38 @@
 
   .tp-mode {
     grid-area: mode;
+    justify-self: end;
   }
 
-  .tp-mode legend {
+  /* locked: the chip says "30 s previews" and explains itself when tapped */
+  .tp-mode.is-locked {
     display: none;
+  }
+
+  .tp-mode-note {
+    display: inline-flex;
+    grid-area: mode;
+    justify-self: end;
+  }
+
+  /* live (own files): the label sits beside the options, and each option is a finger-sized target */
+  .tp-mode-body {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .seg label {
+    display: grid;
+  }
+
+  .seg span {
+    display: grid;
+    place-items: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding-top: 0;
+    padding-bottom: 0;
   }
 }
 
@@ -2795,13 +2926,23 @@
     letter-spacing: 0.1em;
   }
 
-  .tp-mode {
+  .tp-mode,
+  .tp-mode-note {
     margin-left: 6px;
   }
 
+  .seg {
+    padding: 1px;
+  }
+
   .seg span {
-    padding: 8px 7px;
+    padding: 0 7px;
     font-size: 10.5px;
+  }
+
+  /* beside the vibe slider there is no room for the label (the group is still named for assistive tech) */
+  .tp-mode-lbl {
+    display: none;
   }
 
   /* hardware volume buttons do this job on a phone */
@@ -2810,14 +2951,54 @@
   }
 }
 
-@media (max-width: 380px) {
-  /* the mark alone still reads as "home" */
+/* Phone held upright, playing the user's own files: the track-length control is live, so it gets a
+   full-width row of its own, label included. (With 30-second previews the chip sits beside the vibe
+   slider instead and this row does not exist. A short viewport — the browser's toolbars showing —
+   cannot spare the row: there the options stay beside the slider so the whole booth still fits.) */
+@media (max-width: 719px) and (min-height: 790px) {
+  .transport.is-mode-live {
+    grid-template-areas:
+      'main main crate'
+      'vibe vibe vibe'
+      'mode mode mode';
+  }
+
+  .transport.is-mode-live .tp-mode {
+    justify-self: stretch;
+    margin-left: 0;
+  }
+
+  .transport.is-mode-live .tp-mode-lbl {
+    display: flex;
+  }
+
+  .transport.is-mode-live .seg {
+    display: flex;
+    flex: 1 1 auto;
+  }
+
+  .transport.is-mode-live .seg label {
+    flex: 1 1 0;
+  }
+
+  .transport.is-mode-live .seg span {
+    font-size: 12px;
+  }
+}
+
+/* A phone's top bar cannot hold the back chevron, the wordmark's text AND a six-character set code:
+   the code is what Share and the address bar refer to, so it is shown whole and the text goes. The
+   chevron and the mark stay — still the way out of the set, still a 44 px target. */
+@media (max-width: 430px) {
   .topbar .wordmark-text {
     display: none;
   }
+}
+
+@media (max-width: 380px) {
 
   .seg span {
-    padding: 8px 5px;
+    padding: 0 5px;
     font-size: 10px;
   }
 
@@ -2978,8 +3159,14 @@
     padding: 0 16px 3px 14px;
   }
 
-  .tp-mode {
+  .tp-mode,
+  .tp-mode-note {
     margin-left: 0;
+  }
+
+  /* one row for everything: the options are a touch slimmer so the row stays as tall as its buttons */
+  .seg span {
+    min-height: 40px;
   }
 
   /* a bottom sheet would be 300 px tall here: the setlist is a side drawer again */

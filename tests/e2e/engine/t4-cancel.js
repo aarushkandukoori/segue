@@ -126,6 +126,27 @@ async function scenarios(check, tag, engineOpts, lat, ref) {
     check(name('cancel exactly on an event: that event is removed too'), e < 0.005, `|Δ| ${fmt(e, 5)}`);
   }
 
+  // --- …and so is an event a single sample frame behind the cut ---------------------------------
+  // (The fallback path cannot cancel closer than two frames behind its own hold point; see laneTruncate.)
+  {
+    const events = [ev('gain', 0, 0.8), ev('gain', 2 + 1 / 48000, 0.2)];
+    let model = null;
+    const { L } = await renderSet({
+      seconds: 3,
+      engineOpts,
+      build: (engine, ctx) => engine.addPlay(mkPlay(0, { events }), sineBuffer(ctx, 4, 1000, AMP)),
+      hooks: [
+        [2, (engine) => {
+          engine.cancelFrom(2);
+          model = engine.getPlay(0);
+        }],
+      ],
+    });
+    const e = Math.max(Math.abs(level(L, 2.1) - 0.8), Math.abs(level(L, 2.8) - 0.8));
+    const m = model ? evalParam(model.events, 'gain', 2.5, 1) : NaN;
+    check(name('cancel one sample frame before an event: that event does not survive either'), e < 0.005 && Math.abs(m - 0.8) < 1e-9, `|Δ| ${fmt(e, 5)}, model ${fmt(m, 3)}`);
+  }
+
   // --- setTarget in flight is frozen; exponential filter sweep is held on its curve ---------
   {
     const evT = [ev('gain', 0, 1), ev('gain', 1, 0, 'tgt', 1.0)];

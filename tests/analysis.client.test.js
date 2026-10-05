@@ -2,7 +2,7 @@
 // cache). The Worker + IndexedDB paths are covered in headless Chrome by tests/e2e/analysis.e2e.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createAnalyzer, prepareAudio } from '../js/analysis/client.js';
+import { createAnalyzer, isPrivateKey, prepareAudio } from '../js/analysis/client.js';
 import { analyzeTrack, ANALYSIS_VERSION, ANALYSIS_RATE } from '../js/analysis/analyze.js';
 import { resample } from '../js/analysis/dsp.js';
 import { drumLoop } from './helpers/analysis-synth.js';
@@ -93,4 +93,129 @@ test('createAnalyzer({workers: 0}) and odd buffers', async () => {
   const empty = await analyzer.analyze(fakeBuffer([new Float32Array(0)], 48000), { key: 'local:empty:0:0' });
   assertValidAnalysis(empty, 0, ANALYSIS_VERSION);
   analyzer.destroy();
+});
+
+// ── what is written to IndexedDB ───────────────────────────────────────────────────────────────
+// (the real thing is exercised in headless Chrome by tests/e2e/analysis.e2e.mjs; this stand-in records
+// every write, so the rule "a file name never reaches the disk" is checked on every `node --test` run)
+
+/** The few IndexedDB calls client.js makes, over a Map; requests settle on later microtasks. */
+function fakeIndexedDB(initial = {}) {
+  const data = new Map(Object.entries(initial));
+  const log = { puts: [], deletes: [], cleared: 0, opened: 0 };
+  const request = (compute) => {
+    const r = { result: undefined, onsuccess: null, onerror: null };
+    queueMicrotask(() => {
+      r.result = compute();
+      if (r.onsuccess) r.onsuccess();
+    });
+    return r;
+  };
+  const store = {
+    get: (k) => request(() => data.get(k)),
+    put: (v, k) => (log.puts.push(k), request(() => void data.set(k, v))),
+    delete: (k) => (log.deletes.push(k), request(() => void data.delete(k))),
+    clear: () => (log.cleared++, request(() => void data.clear())),
+    count: () => request(() => data.size),
+    openKeyCursor() {
+      const keys = [...data.keys()].sort();
+      let i = 0;
+      const r = { result: null, onsuccess: null };
+      const step = () =>
+        queueMicrotask(() => {
+          r.result = i < keys.length ? { key: keys[i], continue: () => (i++, step()) } : null;
+          if (r.onsuccess) r.onsuccess();
+        });
+      step();
+      return r;
+    },
+  };
+  const db = { objectStoreNames: { contains: () => true }, transaction: () => ({ objectStore: () => store }), close() {} };
+  return {
+    data,
+    log,
+    open() {
+      log.opened++;
+      const r = { result: db };
+      queueMicrotask(() => r.onsuccess && r.onsuccess());
+      return r;
+    },
+  };
+}
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+test('a local file is cached for the session only: its key (the file name) is never written, old ones are removed', async () => {
+  assert.equal(isPrivateKey('local:Rehearsal take 2.wav:1764044:1700000000000'), true);
+  for (const key of ['deezer:123', 'itunes:9', 'mix:deezer:1', 'not-local:1', '']) assert.equal(isPrivateKey(key), false, key);
+  const sr = 44100;
+  const loop = drumLoop({ bpm: 122, seconds: 8, sr });
+  const buffer = fakeBuffer([loop.samples], sr);
+  const prepared = await prepareAudio(buffer);
+  const stored = analyzeTrack(prepared.pcm, prepared.sampleRate, { peak: prepared.peak, duration: buffer.duration });
+  const v = `|v${ANALYSIS_VERSION}`;
+  // what an earlier build left in the browser: two file-name keys, one preview, one outdated record
+  const idb = fakeIndexedDB({
+    [`local:Old demo bounce.wav:1500000:1690000000000${v}`]: stored,
+    [`local:Voice note.m4a:900:1680000000000|v${ANALYSIS_VERSION - 1}`]: stored,
+    [`deezer:7${v}`]: stored,
+    [`deezer:8|v${ANALYSIS_VERSION - 1}`]: stored,
+  });
+  globalThis.indexedDB = idb;
+  try {
+    const analyzer = createAnalyzer({ workers: 0 });
+    const key = 'local:Rehearsal take 2 (rough).wav:1764044:1700000000000';
+    // a stale record under a file-name key is not served …
+    assert.equal(await analyzer.cached('local:Old demo bounce.wav:1500000:1690000000000'), null);
+    const a = await analyzer.analyze(buffer, { key });
+    assertValidAnalysis(a, 8, ANALYSIS_VERSION);
+    assert.equal(await analyzer.analyze(buffer, { key }), a, 'second call: memory hit');
+    assert.equal(await analyzer.cached(key), a);
+    assert.equal(analyzer.stats.cacheHits, 1);
+    await settle();
+    // … nothing was written for the file, and the database was opened anyway to clean up
+    assert.equal(idb.log.opened, 1);
+    assert.deepEqual(idb.log.puts, []);
+    assert.deepEqual([...idb.data.keys()], [`deezer:7${v}`], 'file-name records and outdated ones are gone, the preview stays');
+    assert.equal(idb.log.cleared, 0);
+    // previews are stored and read back as before
+    assert.equal(await analyzer.cached('deezer:7'), stored);
+    const b = await analyzer.analyze(buffer, { key: 'deezer:42', bpmHint: 122 });
+    await settle();
+    assert.deepEqual(idb.log.puts, [`deezer:42${v}`]);
+    assert.equal(idb.data.get(`deezer:42${v}`), b);
+    assert.equal(analyzer.stats.storage, 'indexeddb');
+    analyzer.destroy();
+    // a new session: the preview comes back from the store, the file does not
+    const next = createAnalyzer({ workers: 0 });
+    assert.equal(await next.cached('deezer:42'), b);
+    assert.equal(await next.cached(key), null);
+    next.destroy();
+  } finally {
+    delete globalThis.indexedDB;
+  }
+});
+
+test('the stored cache is bounded: opened with more than 2000 records it starts over', async () => {
+  const v = `|v${ANALYSIS_VERSION}`;
+  const fill = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`deezer:${i}${v}`, { filler: i }]));
+  try {
+    const under = fakeIndexedDB(fill(2000));
+    globalThis.indexedDB = under;
+    let analyzer = createAnalyzer({ workers: 0 });
+    await analyzer.cached('deezer:nothing');
+    await settle();
+    assert.equal(under.log.cleared, 0);
+    assert.equal(under.data.size, 2000);
+    analyzer.destroy();
+    const over = fakeIndexedDB(fill(2001));
+    globalThis.indexedDB = over;
+    analyzer = createAnalyzer({ workers: 0 });
+    await analyzer.cached('deezer:nothing');
+    await settle();
+    assert.equal(over.log.cleared, 1);
+    assert.equal(over.data.size, 0);
+    analyzer.destroy();
+  } finally {
+    delete globalThis.indexedDB;
+  }
 });

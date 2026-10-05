@@ -11,6 +11,7 @@
 //     &rec=1       recording indicator on
 //     &toasts=1    show one toast of each kind
 //     &empty=1     stage with nothing loaded yet
+//     &fail=1      every load fails the way js/main.js reports one (back to landing, then view.inputError)
 //
 // window.__segueDemo exposes { ready, view, calls, seek(t), step(dt), frameAt(t), state() } for e2e tests.
 
@@ -110,6 +111,7 @@ function makeCover(i) {
 // ── mock planner ───────────────────────────────────────────────────────────────────────────────
 const SOLO = 9.5; // seconds a track rides alone before the next transition
 const ANNOUNCE = 8; // seconds before tStart that the transition is shown as "upcoming"
+const CUE_AFTER = 0.6; // seconds after a blend ends that the next track is cued on the freed deck (as the real conductor does)
 const PRE = 5.5; // silent pre-roll in which the incoming deck's grid visibly converges
 const TYPES = ['bassSwap', 'echoOut', 'filterBlend', 'cut', 'eqBlend', 'brake'];
 const SYNCED = new Set(['bassSwap', 'filterBlend', 'eqBlend']);
@@ -254,7 +256,7 @@ function createMockSet(seed, tracks) {
     P.events = sortEvents(P.events.concat(aEv));
     plays.push({
       id: k, track: T, deck: k % 2, startAt: play.startAt, offset: play.offset, rate: play.rate,
-      events: sortEvents(bEv), endAt: null, soloFrom: tEnd, loadAt: tStart - ANNOUNCE,
+      events: sortEvents(bEv), endAt: null, soloFrom: tEnd, loadAt: P.soloFrom + CUE_AFTER,
     });
     trans.push({
       id: k, type, label, why, from: k - 1, to: k, tStart, tEnd, marks,
@@ -407,9 +409,19 @@ function go(screen) {
   view.setScreen(screen);
 }
 
+const FAIL_MESSAGE = 'Short spotify.link addresses cannot be read from a web page. Open it in your browser, then copy the full address that starts with open.spotify.com/playlist/.';
+
 let loadTimer = 0;
 function fakeLoad(what) {
   go('loading');
+  if (flag('fail')) {
+    // what js/main.js fail() does: goHome(), then report the failure where the user started the load
+    loadTimer = setTimeout(() => {
+      go('landing');
+      view.inputError(FAIL_MESSAGE);
+    }, 80);
+    return;
+  }
   const steps = [
     ['Reading the playlist', `Fetching ${what} from Spotify…`, null],
     ['Digging through the crate', 'Finding audio 3 / 14 — Dov Kessler · Night Bus to Peckham', 0.2],
@@ -515,7 +527,7 @@ function sync(t) {
 }
 
 // One FrameState object, mutated in place every frame — the same no-allocation discipline the real loop needs.
-const mkDeck = () => ({ pos: 0, rate: 1, bpmNow: 0, gain: 0, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, audible: 0 });
+const mkDeck = () => ({ pos: 0, rate: 1, bpmNow: 0, gain: 0, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, audible: 0, startsIn: 0 });
 const deckFrames = [mkDeck(), mkDeck()];
 const frameState = {
   t: 0, playing: true, elapsed: 0, decks: [null, null], crossfade: -1, beatPhase: 0,
@@ -545,15 +557,18 @@ function frameAt(t) {
     const df = deckFrames[d];
     const an = p.track.an;
     df.pos = positionAt(p, t);
+    // > 0 only while the deck is cued: the view parks its waveform and counts down ("Cued · in 0:07")
+    df.startsIn = t < p.startAt ? p.startAt - t : 0;
     df.rate = t < p.startAt ? p.rate[0].v : rateAt(p, p.endAt != null && t > p.endAt ? p.endAt : t);
     df.bpmNow = p.track.bpm * df.rate;
-    df.gain = evalParam(p.events, 'gain', t, 1);
+    const running = t >= p.startAt && (p.endAt == null || t < p.endAt);
+    // a deck that is not running has its fader down, whatever its automation will say later
+    df.gain = running ? evalParam(p.events, 'gain', t, 1) : 0;
     df.low = evalParam(p.events, 'low', t, 0);
     df.mid = evalParam(p.events, 'mid', t, 0);
     df.high = evalParam(p.events, 'high', t, 0);
     df.hpf = evalParam(p.events, 'hpf', t, 20);
     df.lpf = evalParam(p.events, 'lpf', t, 20000);
-    const running = t >= p.startAt && (p.endAt == null || t < p.endAt);
     const eq = 0.5 * dbToGain(df.low) + 0.3 * dbToGain(df.mid) + 0.2 * dbToGain(df.high);
     const filt = Math.max(0.25, 1 - Math.log(Math.max(df.hpf, 20) / 20) / 9) * Math.max(0.3, Math.log(Math.max(df.lpf, 40) / 20) / Math.log(1000));
     df.audible = running ? Math.min(1, df.gain * eq * filt) : 0;
@@ -661,5 +676,9 @@ window.__segueDemo = {
   seek,
   step,
   frameAt,
-  state: () => ({ ...state, cur, phase: lastSig, trans: set ? set.trans.map((x) => ({ type: x.type, tStart: x.tStart, tEnd: x.tEnd, announceAt: x.announceAt })) : [] }),
+  state: () => ({
+    ...state, cur, phase: lastSig,
+    trans: set ? set.trans.map((x) => ({ type: x.type, tStart: x.tStart, tEnd: x.tEnd, announceAt: x.announceAt })) : [],
+    plays: set ? set.plays.map((x) => ({ deck: x.deck, startAt: x.startAt, loadAt: x.loadAt, offset: x.offset })) : [],
+  }),
 };

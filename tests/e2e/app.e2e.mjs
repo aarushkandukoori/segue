@@ -1,8 +1,8 @@
 // The whole app, end to end, in headless Chrome against the REAL network:
 // index.html → view → main.js → conductor → sources / analysis / planner / engine.
 //
-//   node tests/e2e/app.e2e.mjs            everything (~3–4 min; four browsers run side by side)
-//   node tests/e2e/app.e2e.mjs demo local only these groups: demo spotify share local mobile
+//   node tests/e2e/app.e2e.mjs            everything (~3–4 min; the browsers run side by side)
+//   node tests/e2e/app.e2e.mjs demo local only these groups: demo spotify share local transport mobile
 //
 // Prints one line per check, saves screenshots of the real app to handoff/shots/app-*.png and exits
 // non-zero when a check fails. A check that fails because a third-party service was unreachable says so.
@@ -56,17 +56,39 @@ const state = (page) =>
   page.evaluate(() => {
     const g = window.__segue;
     const c = g.conductor;
+    const q = (sel) => document.querySelector(sel);
+    const text = (sel) => (q(sel) ? q(sel).textContent.trim() : '');
+    const fader = (i) => {
+      const fill = q(`[data-ref="mixer"] [data-ch="${i}"] .fader-fill`);
+      const m = fill ? /scaleY\(([\d.]+)\)/.exec(fill.style.transform) : null;
+      return m ? Number(m[1]) : -1;
+    };
+    // The cued deck, as the page has drawn it — read BEFORE snapshot(): that brings conductor.live up
+    // to date by itself, a frame ahead of the DOM (a deck just handed its next track would still show
+    // the old one's readouts).
+    const drawnAt = g.engine.now();
+    const drawn = c.live.decks.map((rec, i) => (rec && drawnAt < rec.play.startAt - 0.4 ? { fader: fader(i), text: text(`[data-ref="wt${i}"] [data-part="t"]`), startsIn: rec.play.startAt - drawnAt } : null));
     const s = c.snapshot();
     const d = c.debug();
     const lv = g.engine.levels();
-    const q = (sel) => document.querySelector(sel);
-    const text = (sel) => (q(sel) ? q(sel).textContent.trim() : '');
     const tally = {};
     for (const it of s.setlist) tally[it.state] = (tally[it.state] || 0) + 1;
+    // (engine.ctx creates the AudioContext on first access: only look once the engine has built its graph)
+    const built = !!d.engine && d.engine.nodes > 0;
     return {
       screen: q('#app').dataset.screen,
+      loaded: s.loaded,
       started: s.started,
       playing: s.playing,
+      paused: s.paused,
+      ctx: built ? g.engine.ctx.state : 'none',
+      media: navigator.mediaSession ? navigator.mediaSession.playbackState : '',
+      vibe: s.vibe,
+      // per deck: is a track cued there that has not started yet, and where its channel fader stands
+      cued: drawn.map((x) => (x ? x.fader : null)),
+      // …and what the tag in its waveform lane says (the countdown comes from DeckFrame.startsIn)
+      cuedTag: drawn.map((x) => (x ? { text: x.text, startsIn: x.startsIn } : null)),
+      buffersChecked: g.metrics.buffersChecked,
       now: g.engine.now(),
       rms: lv.rms,
       peak: lv.peak,
@@ -98,11 +120,16 @@ const state = (page) =>
         seed: text('[data-ref="seed"]'),
         rows: document.querySelectorAll('[data-ref="crate-list"] li').length,
         toasts: [...document.querySelectorAll('.toast p')].map((n) => n.textContent),
+        // a failed load is written under the control it was started from (view.inputError), not toasted
+        hint: text('[data-ref="hint"]'),
+        fieldInvalid: !!q('#segue-input') && q('#segue-input').getAttribute('aria-invalid') === 'true',
+        focusId: document.activeElement ? document.activeElement.id : '',
         playLabel: q('[data-ref="play"]').getAttribute('aria-label'),
         skipDisabled: q('[data-ref="skip"]').disabled,
         loading: text('[data-ref="ld-detail"]'),
         loadingTitle: text('[data-ref="ld-title"]'),
         recording: q('[data-ref="rec"]').getAttribute('aria-pressed') === 'true',
+        vibe: Number(q('[data-ref="vibe"]').value),
       },
       url: location.href,
       firstSoundMs: g.metrics.firstSoundMs,
@@ -204,10 +231,33 @@ async function groupDemo(srv) {
     check('2. the address bar is a share link to this set', new RegExp(`\\?p=deezer:chart:113&seed=${first.seed}`).test(first.url), first.url.replace(srv.url, ''));
     const ref = { url: first.url.replace(srv.url, ''), seed: first.seed, firstFour: null, gone: false };
     shareInfo(ref);
+    check('2. the share link names the vibe the set uses', /[?&]vibe=0\.5(&|$)/.test(first.url), first.url.replace(srv.url, ''));
 
-    const seen = { decks: new Set(), tickers: new Set(), states: new Set(), elapsed: new Set(), maxBuffers: 0, maxStrips: 0, playingRows: [], shotMix: false, shotSolo: false };
+    // 4a. Watch the Skip button against the conductor for the whole run: every stretch in which the
+    // button says something else than Skip would do (it opens and closes on the audio clock).
+    await page.evaluate(() => {
+      const c = window.__segue.conductor;
+      const btn = document.querySelector('[data-ref="skip"]');
+      const w = (window.__skipWatch = { flips: 0, lags: [], since: 0, was: c.canSkip() });
+      setInterval(() => {
+        const can = c.canSkip();
+        const now = performance.now();
+        if (can !== w.was) {
+          w.was = can;
+          w.flips++;
+        }
+        if (can === !btn.disabled) {
+          if (w.since) w.lags.push(now - w.since);
+          w.since = 0;
+        } else if (!w.since) w.since = now;
+      }, 4);
+    });
+
+    const seen = { decks: new Set(), tickers: new Set(), states: new Set(), elapsed: new Set(), maxBuffers: 0, maxStrips: 0, playingRows: [], shotMix: false, shotSolo: false, cuedFaders: [], cuedTags: [] };
     const run = await listen(page, 125000, async (s) => {
       if (!ref.firstFour && s.history.length >= 4) ref.firstFour = signature(s);
+      for (const f of s.cued) if (f !== null) seen.cuedFaders.push(f);
+      for (const c of s.cuedTag) if (c !== null) seen.cuedTags.push(c);
       for (const d of s.decks) if (d) seen.decks.add(d.title);
       seen.tickers.add(s.dom.ticker);
       if (s.transition) seen.states.add(s.transition.state);
@@ -237,6 +287,25 @@ async function groupDemo(srv) {
     check('2. ticker updates (next → mixing)', seen.states.has('upcoming') && seen.states.has('active') && seen.tickers.size >= 3, `${seen.tickers.size} different labels`);
     check('2. setlist updates', (end.setlist.played || 0) >= 2 && seen.playingRows.filter((n) => n === 1).length >= seen.playingRows.length * 0.95 && end.dom.rows === end.rows, `${end.setlist.played} played, ${end.rows} rows`);
     check('2. the clock runs', seen.elapsed.size >= 60, `${seen.elapsed.size} different readings`);
+    check('2. mixer: the channel fader of a deck that is only cued is down', seen.cuedFaders.length >= 20 && Math.max(...seen.cuedFaders) <= 0.02, `${seen.cuedFaders.length} samples of a cued deck, fader at most ${seen.cuedFaders.length ? Math.max(...seen.cuedFaders) : '?'}`);
+    {
+      // "Cued · in 0:14": the tag counts the cued deck down. The view's clock trails the engine's by the
+      // output latency, so a second and a half either way is agreement. A deck that has just been handed
+      // its track reads plain "Cued" until the next animation frame writes the countdown: allowed, as
+      // long as it stays the rare look it is. What a cued deck must never show is time left ("−0:29").
+      const read = seen.cuedTags.map((c) => ({ ...c, m: /^Cued · in (\d+):(\d\d)$/.exec(c.text) }));
+      const counted = read.filter((c) => c.m);
+      const off = counted.filter((c) => Math.abs(Number(c.m[1]) * 60 + Number(c.m[2]) - c.startsIn) > 1.6);
+      const wrong = read.filter((c) => !c.m && c.text !== 'Cued').map((c) => c.text);
+      check('2. waveforms: a cued deck is counted down in its lane ("Cued · in m:ss")', read.length >= 20 && counted.length >= read.length * 0.95 && wrong.length === 0 && off.length === 0, `${counted.length} of ${read.length} looks at a cued deck showed a countdown, ${off.length} disagreed with the plan${wrong.length ? `; a cued deck also read: ${[...new Set(wrong)].slice(0, 3).join(' | ')}` : ''}`);
+    }
+    const sw = await page.evaluate(() => {
+      const w = window.__skipWatch;
+      const lags = w.lags.slice().sort((a, b) => a - b);
+      return { flips: w.flips, n: lags.length, median: lags.length ? lags[lags.length >> 1] : 0, max: lags.length ? lags[lags.length - 1] : 0, slow: lags.filter((x) => x > 100).length };
+    });
+    // (one animation frame is the design; when the button only followed the conductor's 200 ms tick the median was 56 ms and the longest 180)
+    check('4. the Skip button follows what Skip would do, promptly', sw.flips >= 4 && sw.median <= 35 && sw.slow <= 1, `Skip opened / closed ${sw.flips} times; the button disagreed for ${sw.median.toFixed(0)} ms (median of ${sw.n} stretches, longest ${sw.max.toFixed(0)} ms)`);
     const failed = end.stats.failed;
     if (failed && networkTrouble(b)) note(`${failed} track(s) failed while ${networkTrouble(b)} network requests failed: not counted against the app`);
     check('2. no failed track', failed === 0 || networkTrouble(b) > 0, `${failed} failed${failed ? ` (${JSON.stringify(end.failures)})` : ''}`);
@@ -249,7 +318,8 @@ async function groupDemo(srv) {
     check('2. Share gives a link to this exact set', !!sh, sh ? `"${sh.dom.toasts.find((t) => t.includes(first.seed) || /Copy this link/.test(t)).slice(0, 70)}"` : '');
 
     // 4. skip
-    const ready = await until(page, (s) => s.canSkip && s.history.length >= 2 && s.history[s.history.length - 1].tStart > s.now + 6, 40000);
+    // (the button, not just the conductor: a click on a button that is still disabled goes nowhere)
+    const ready = await until(page, (s) => s.canSkip && !s.dom.skipDisabled && s.history.length >= 2 && s.history[s.history.length - 1].tStart > s.now + 6, 40000);
     if (check('4. Skip becomes available during a solo', !!ready)) {
       const planned = ready.history[ready.history.length - 1];
       await page.click('[data-ref="skip"]');
@@ -264,7 +334,7 @@ async function groupDemo(srv) {
 
     // 13. memory: more skips to get past 6 plays, then count what is retained
     for (let i = 0; i < 4; i++) {
-      const s = await until(page, (x) => x.canSkip, 30000);
+      const s = await until(page, (x) => x.canSkip && !x.dom.skipDisabled, 30000);
       if (!s) break;
       await page.click('[data-ref="skip"]');
       await sleep(4500);
@@ -280,6 +350,8 @@ async function groupDemo(srv) {
     await sleep(1200);
     const p2 = await state(page);
     check('7. pause freezes set time', !p2.playing && Math.abs(p2.now - p1.now) < 0.005 && p2.dom.playLabel === 'Play', `set time ${p1.now.toFixed(3)} → ${p2.now.toFixed(3)} over 1.2 s`);
+    // (the analyser still holds the last block it saw; the meter must not stay lit over a silent set)
+    check('7. paused: the output meter reads silence', p2.rms === 0 && p2.peak === 0, `level ${p2.rms}, peak ${p2.peak}`);
     await page.click('[data-ref="play"]');
     const p3 = await until(page, (s) => s.playing && s.now > p2.now + 0.4 && s.rms > 0.005, 5000);
     check('7. resume continues', !!p3, p3 ? `set time ${p3.now.toFixed(2)}` : '');
@@ -305,6 +377,14 @@ async function groupDemo(srv) {
       const opener = fresh.history[0].trackId !== before.history[0].trackId;
       check('5. New Set: different order and transitions', !sameOrder && fresh.history[0].type === 'fadeIn' && (opener || fresh.history[1].type !== before.history[1].type || fresh.history[1].trackId !== before.history[1].trackId), `base order changed: ${!sameOrder}; opener changed: ${opener}; first move ${before.history[1].label} → ${fresh.history[1].label}`);
     }
+    // 17. Back leaves the set, not the site; Forward leads to the set again
+    const cur = await state(page);
+    await page.evaluate(() => history.back());
+    const home = await until(page, (s) => s.screen === 'landing' && !s.loaded, 5000, 50);
+    check('17. Back from the stage returns to the start screen and stops the set', !!home && home.url === `${srv.url}/index.html`, home ? home.url.replace(srv.url, '') : `still on ${(await state(page)).screen}, ${await page.evaluate(() => location.href)}`);
+    await page.evaluate(() => history.forward());
+    const again = await until(page, (s) => s.screen === 'ready' && s.seed === cur.seed, 25000, 100);
+    check('17. Forward leads to the same set again ("Start the set")', !!again && again.url === cur.url && !again.started, again ? again.url.replace(srv.url, '') : (await state(page)).screen);
     check('demo group: no console errors at all', ownErrors(b).length === 0, ownErrors(b).slice(0, 3).join(' | '));
   } finally {
     shareInfo(null);
@@ -321,9 +401,23 @@ async function groupShare(srv) {
   const b = await open(srv, { width: 1280, height: 800, gesture: true });
   const { page } = b;
   try {
-    await page.goto(`${srv.url}${info.url}`, { waitUntil: 'load' });
+    // The recipient is a returning visitor who once left the Vibe slider at "wild" — and the link is
+    // an old-style one that does not name a vibe (= made at the default).
+    await page.evaluateOnNewDocument(() => {
+      try {
+        if (!sessionStorage.getItem('e2e-prefs')) {
+          sessionStorage.setItem('e2e-prefs', '1');
+          localStorage.setItem('segue:prefs', JSON.stringify({ volume: 0.9, vibe: 0.95, mode: 'medium' }));
+        }
+      } catch {
+        /* storage blocked: the check below says so */
+      }
+    });
+    await page.goto(`${srv.url}${info.url.replace(/&vibe=[^&]*/, '')}`, { waitUntil: 'load' });
     const ready = await until(page, (s) => s.screen === 'ready', 20000);
     check('6. share link opens on the "Start the set" screen', !!ready && ready.seed === info.seed && !ready.started, ready ? `set #${ready.seed}` : (await state(page)).screen);
+    const stored = () => page.evaluate(() => JSON.parse(localStorage.getItem('segue:prefs') || '{}').vibe);
+    check('6. the set uses the link’s vibe, not the one the visitor has stored', !!ready && ready.vibe === 0.5 && ready.dom.vibe === 0.5 && /[?&]vibe=0\.5(&|$)/.test(ready.url) && (await stored()) === 0.95, ready ? `set vibe ${ready.vibe}, slider ${ready.dom.vibe}, stored preference ${await stored()}, address bar ${ready.url.replace(srv.url, '')}` : '');
     await sleep(1500); // let it cue the opener while it waits for the tap
     await shot(page, 'app-ready-1280x800.png');
     const cued = await state(page);
@@ -340,6 +434,13 @@ async function groupShare(srv) {
       const c = signature(mine);
       check('6. same p + seed reproduces the first 4 tracks and transition types', JSON.stringify(a) === JSON.stringify(c), `${c.map((x) => x.split(' ').slice(1).join(' ')).join(' → ')}${JSON.stringify(a) === JSON.stringify(c) ? '' : `  vs  ${a.join(' → ')}`}`);
     }
+    // a volume change saves the preferences: the link's vibe must not ride along into them
+    await page.$eval('[data-ref="volume"]', (el) => {
+      el.value = '0.8';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('segue:prefs') || '{}'));
+    check('6. the visitor’s own stored vibe survives the visit', kept.vibe === 0.95 && kept.volume === 0.8, JSON.stringify(kept));
     check('share group: no console errors', ownErrors(b).length === 0, ownErrors(b).slice(0, 3).join(' | '));
   } finally {
     await b.close();
@@ -358,8 +459,11 @@ async function groupSpotify(srv) {
     // 10. bad input first (cheap, and proves the way back to landing)
     const bad = async (label, text, expect) => {
       await typeAndGo(page, text);
-      const s = await until(page, (x) => x.screen === 'landing' && x.dom.toasts.some((t) => expect.test(t)), 30000, 150);
-      check(`10. bad input (${label}) → friendly error, back on landing`, !!s, s ? `"${s.dom.toasts.find((t) => expect.test(t)).slice(0, 90)}"` : `toasts: ${JSON.stringify((await state(page)).dom.toasts)}`);
+      const s = await until(page, (x) => x.screen === 'landing' && expect.test(x.dom.hint), 30000, 150);
+      const now = s || (await state(page));
+      check(`10. bad input (${label}) → friendly error, back on landing`, !!s, s ? `"${s.dom.hint.slice(0, 90)}"` : `hint: ${JSON.stringify(now.dom.hint)}, toasts: ${JSON.stringify(now.dom.toasts)}`);
+      // …said where it can be acted on: under the link field, which is marked, focused, and not also toasted
+      check(`10. bad input (${label}): the error stays under the link field, the field is marked and has the focus`, !!s && s.dom.fieldInvalid && s.dom.focusId === 'segue-input' && !s.dom.toasts.some((t) => expect.test(t)), s ? JSON.stringify({ invalid: s.dom.fieldInvalid, focus: s.dom.focusId, toasts: s.dom.toasts.length }) : '');
       if (s && !bad.shot) {
         bad.shot = true;
         await shot(page, 'app-landing-error-1280x800.png');
@@ -379,9 +483,9 @@ async function groupSpotify(srv) {
     // 3. a real Spotify playlist
     const t0 = Date.now();
     await typeAndGo(page, SPOTIFY_URL);
-    const first = await until(page, (s) => (s.started && s.rms > 0.01) || (s.screen === 'landing' && s.dom.toasts.length > 0 && Date.now() - t0 > 1500), 60000, 60);
+    const first = await until(page, (s) => (s.started && s.rms > 0.01) || (s.screen === 'landing' && (s.dom.hint || s.dom.toasts.length > 0) && Date.now() - t0 > 1500), 60000, 60);
     if (!first || !first.started) {
-      const why = first ? first.dom.toasts.join(' | ') : 'timeout';
+      const why = first ? [first.dom.hint, ...first.dom.toasts].filter(Boolean).join(' | ') : 'timeout';
       check('3. Spotify playlist loads and plays', false, /reach Spotify|offline/i.test(why) ? `NETWORK: the Spotify relays did not answer (${why})` : why);
     } else {
       check('3. Spotify playlist loads and plays', true, `time to first sound ${Date.now() - t0} ms; ${first.stats.total} tracks from ${first.source}`);
@@ -466,19 +570,25 @@ function synthWav(bpm, seconds, note) {
   return buf;
 }
 
-async function groupLocal(srv) {
+const WAV_SPECS = [
+  ['Test Pilots - Kick One Twenty.wav', 120, 55],
+  ['Test Pilots - Kick One Twenty Four.wav', 124, 61.7],
+  ['Signal Check - Click One Twenty Six.wav', 126, 65.4],
+  ['Signal Check - Click One Twenty Eight.wav', 128, 73.4],
+];
+/** Write the synthetic tracks (each `seconds` long) into a fresh temp dir: {dir, paths}. */
+function makeWavs(seconds) {
   const dir = mkdtempSync(join(tmpdir(), 'segue-wav-'));
-  const specs = [
-    ['Test Pilots - Kick One Twenty.wav', 120, 55],
-    ['Test Pilots - Kick One Twenty Four.wav', 124, 61.7],
-    ['Signal Check - Click One Twenty Six.wav', 126, 65.4],
-    ['Signal Check - Click One Twenty Eight.wav', 128, 73.4],
-  ];
-  const paths = specs.map(([name, bpm, note]) => {
+  const paths = WAV_SPECS.map(([name, bpm, note]) => {
     const p = join(dir, name);
-    writeFileSync(p, synthWav(bpm, 40, note));
+    writeFileSync(p, synthWav(bpm, seconds, note));
     return p;
   });
+  return { dir, paths };
+}
+
+async function groupLocal(srv) {
+  const { dir, paths } = makeWavs(40);
   const b = await open(srv, { width: 1280, height: 800 });
   const { page } = b;
   try {
@@ -521,6 +631,212 @@ async function groupLocal(srv) {
     await b.close();
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// ── group: transport truth, history, re-planning (14–19) — local files, real autoplay policy ───
+
+/**
+ * Runs inside the page (evaluateOnNewDocument), with no user activation and no devtools call: waits for
+ * the app, puts three synthetic WAVs into the real file input, fires `change` and logs the app's state
+ * four times a second into window.__noGesture.
+ */
+function noGestureFiles() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const wav = (bpm) => {
+    const sr = 11025;
+    const n = sr * 24;
+    const bytes = new Uint8Array(44 + n * 2);
+    const v = new DataView(bytes.buffer);
+    const tag = (o, t) => {
+      for (let i = 0; i < t.length; i++) bytes[o + i] = t.charCodeAt(i);
+    };
+    tag(0, 'RIFF');
+    v.setUint32(4, 36 + n * 2, true);
+    tag(8, 'WAVEfmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true);
+    v.setUint32(28, sr * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    tag(36, 'data');
+    v.setUint32(40, n * 2, true);
+    const beat = Math.round((60 / bpm) * sr);
+    for (let i = 0; i < n; i++) {
+      const k = i % beat;
+      const kick = Math.exp(-k / (0.05 * sr)) * Math.sin((2 * Math.PI * 60 * k) / sr);
+      v.setInt16(44 + i * 2, Math.round(20000 * kick + 2500 * Math.sin((2 * Math.PI * 220 * i) / sr)), true);
+    }
+    return bytes;
+  };
+  (async () => {
+    const out = (window.__noGesture = { done: false, log: [] });
+    while (!window.__segue || !document.getElementById('segue-files')) await sleep(50);
+    await sleep(300);
+    const input = document.getElementById('segue-files');
+    const dt = new DataTransfer();
+    [['Quiet Room - First Light.wav', 120], ['Quiet Room - Second Light.wav', 124], ['Quiet Room - Third Light.wav', 126]].forEach(([name, bpm]) => dt.items.add(new File([wav(bpm)], name, { type: 'audio/wav' })));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    // look four times a second until the set has been "started" for three seconds (at most 40 s)
+    let after = 0;
+    for (let i = 0; i < 160 && after < 12; i++) {
+      await sleep(250);
+      const g = window.__segue;
+      const s = g.conductor.snapshot();
+      const d = g.engine.debug();
+      if (s.started) after++;
+      out.log.push({ screen: document.getElementById('app').dataset.screen, started: s.started, playing: s.playing, ctx: d && d.nodes > 0 ? g.engine.ctx.state : 'none', now: g.engine.now(), label: document.querySelector('[data-ref="play"]').getAttribute('aria-label') });
+    }
+    out.done = true;
+    console.log('[e2e] no-gesture run done'); // the test waits for this line: it must not look into the page before
+  })();
+}
+
+async function groupTransport(srv) {
+  const short = makeWavs(40);
+  const long = makeWavs(100);
+  const downloads = mkdtempSync(join(tmpdir(), 'segue-dl-'));
+  const [a, b] = await Promise.all([open(srv, { width: 1280, height: 800, gesture: true }), open(srv, { width: 1280, height: 800, gesture: true })]);
+  try {
+    await Promise.all([transportA(srv, a, short.paths, downloads), transportB(srv, b, long.paths)]);
+  } finally {
+    await a.close();
+    await b.close();
+    for (const d of [short.dir, long.dir, downloads]) rmSync(d, { recursive: true, force: true });
+  }
+}
+
+/** A page nobody has touched: files arrive without a user gesture; then interruptions, Pause + Rec, New Set that cannot start, Back. */
+async function transportA(srv, b, paths, downloads) {
+  const { page } = b;
+  const cdp = await page.createCDPSession();
+  await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads }).catch(() => {});
+  // 14. No gesture (what Safari makes of its file picker, and every browser of a drop): the context
+  // cannot run. Puppeteer's evaluate() counts as a user gesture, so the page does this part alone:
+  // it hands itself three files through the real input and writes down what it sees.
+  await page.evaluateOnNewDocument(noGestureFiles);
+  await page.goto(`${srv.url}/index.html`, { waitUntil: 'load' });
+  for (let i = 0; i < 500 && !b.logs.some((l) => l.text === '[e2e] no-gesture run done'); i++) await sleep(100); // hands off until the page-side script is through
+  const rep = await page.evaluate(() => window.__noGesture || null);
+  const seenAt = (rep && rep.log) || [];
+  const cued = seenAt[seenAt.length - 1] || {};
+  const lied = seenAt.filter((x) => x.playing && x.ctx !== 'running');
+  if (!check('14. files without a user gesture: the set is cued behind "Start the set", never shown as playing', !!rep && rep.done && cued.started && cued.screen === 'ready' && !cued.playing && cued.ctx === 'suspended' && cued.now <= 0.01 && lied.length === 0, `${seenAt.length} looks; last: screen ${cued.screen}, started ${cued.started}, playing ${cued.playing}, context ${cued.ctx}, set time ${cued.now}; ${lied.length} looks claimed to play on a context that was not running`)) return;
+  const h0 = await page.evaluate(() => history.length) - 1; // (the set already has its entry)
+  await page.click('[data-ref="rd-start"]');
+  const first = await until(page, (s) => s.screen === 'stage' && s.playing && s.ctx === 'running' && s.rms > 0.01, 8000, 40);
+  check('14. one tap starts it, from the beginning', !!first && first.now < 3 && first.dom.playLabel === 'Pause' && first.media === 'playing', first ? `sound at set time ${first.now.toFixed(2)} s` : JSON.stringify(await state(page)).slice(0, 200));
+
+  // 15. The browser stops the audio by itself (a call, another app's audio; iOS calls it "interrupted").
+  await until(page, (s) => s.now > 3 && s.history.length >= 2, 20000);
+  await page.evaluate(() => window.__segue.engine.ctx.suspend());
+  const cut = await until(page, (s) => !s.playing && s.dom.playLabel === 'Play' && s.media === 'paused', 3000, 40);
+  check('15. audio stopped by the browser: the transport says paused', !!cut, cut ? `context ${cut.ctx}, button "${cut.dom.playLabel}", media session ${cut.media}` : JSON.stringify((({ playing, ctx, media, dom }) => ({ playing, ctx, media, label: dom.playLabel }))(await state(page))));
+  await sleep(600);
+  const plansBefore = (await state(page)).history.length;
+  await page.click('[data-ref="play"]');
+  const back = await until(page, (s) => s.playing && s.ctx === 'running' && s.dom.playLabel === 'Pause' && s.rms > 0.005, 4000, 40);
+  await sleep(1500);
+  const on = await state(page);
+  check('15. one tap on Play brings it back — as playing', !!back && on.playing && !on.paused && on.dom.playLabel === 'Pause' && on.media === 'playing' && on.now > back.now + 1, `playing ${on.playing}, button "${on.dom.playLabel}", set time ${back ? back.now.toFixed(2) : '?'} → ${on.now.toFixed(2)}`);
+  // an interruption that ends by itself needs no tap at all
+  await page.evaluate(() => window.__segue.engine.ctx.suspend());
+  await until(page, (s) => !s.playing, 3000, 40);
+  await page.evaluate(() => window.__segue.engine.ctx.resume());
+  const self = await until(page, (s) => s.playing && s.dom.playLabel === 'Pause', 3000, 40);
+  check('15. audio that comes back by itself is playing again without a tap', !!self);
+
+  // 16. Pause, then Rec: arming a recording must not start the sound behind a Play button.
+  await page.click('[data-ref="play"]');
+  const held = await until(page, (s) => !s.playing && s.ctx !== 'running', 3000, 40);
+  await sleep(300);
+  const q1 = await state(page);
+  await page.click('[data-ref="rec"]');
+  await sleep(1500);
+  const q2 = await state(page);
+  check('16. Pause, then Rec: still paused, nothing audible, clock frozen', !!held && !q2.playing && q2.ctx !== 'running' && Math.abs(q2.now - q1.now) < 0.005 && q2.dom.playLabel === 'Play' && q2.dom.recording, `context ${q2.ctx}, set time ${q1.now.toFixed(3)} → ${q2.now.toFixed(3)}, button "${q2.dom.playLabel}", recording armed: ${q2.dom.recording}`);
+  await page.click('[data-ref="play"]');
+  const resumed = await until(page, (s) => s.playing && s.rms > 0.005 && s.now > q2.now + 0.5, 5000, 40);
+  await sleep(1200);
+  await page.click('[data-ref="rec"]');
+  const saved = await until(page, (s) => !!s.lastRecording, 6000);
+  check('16. Play resumes; the armed recording has the music from there on', !!resumed && !!saved && saved.lastRecording.size > 2000, saved ? `${saved.lastRecording.size} bytes` : 'no recording');
+  const later = await until(page, (s) => s.history.length > plansBefore || s.now > 60, 60000, 500);
+  check('15. the set keeps planning after the interruptions', !!later && later.history.length > plansBefore && later.playing, later ? `${later.history.length} plays planned at ${later.now.toFixed(0)} s` : '');
+
+  // 18. New Set that cannot start (here: the engine never answers): the loading screen says what it waits for.
+  await page.evaluate(() => {
+    const e = window.__segue.engine;
+    e.__start = e.start;
+    e.start = () => new Promise(() => {});
+  });
+  await page.click('[data-ref="newset"]');
+  const waiting = await until(page, (s) => s.screen === 'loading', 4000, 50);
+  check('18. a New Set that does not start within a moment shows the loading screen, not a silent stage', !!waiting && !waiting.started && waiting.dom.loadingTitle.length > 0, waiting ? `"${waiting.dom.loadingTitle} — ${waiting.dom.loading}"` : `screen ${(await state(page)).screen}`);
+  await page.evaluate(() => {
+    const e = window.__segue.engine;
+    e.start = e.__start;
+  });
+
+  // 17. Cancel steps back onto the start screen's own history entry; a new set gets one again; Back returns.
+  await page.click('[data-ref="ld-cancel"]');
+  const home = await until(page, (s) => s.screen === 'landing' && !s.loaded, 4000, 50);
+  await sleep(300);
+  const h1 = await page.evaluate(() => ({ len: history.length, href: location.href, state: history.state }));
+  check('17. leaving a set from the page steps back to the start screen’s history entry', !!home && h1.len === h0 + 1 && h1.state === null && h1.href === `${srv.url}/index.html`, JSON.stringify({ ...h1, was: h0 }));
+  await (await page.$('#segue-files')).uploadFile(...paths);
+  const second = await until(page, (s) => s.screen === 'stage' && s.playing && s.rms > 0.01, 40000, 60);
+  const h2 = await page.evaluate(() => ({ len: history.length, state: history.state }));
+  check('17. a set started from the start screen has a history entry of its own', !!second && h2.len === h0 + 1 && !!h2.state && h2.state.segue === 'set', JSON.stringify(h2));
+  await page.evaluate(() => history.back());
+  const out = await until(page, (s) => s.screen === 'landing' && !s.loaded, 4000, 50);
+  await sleep(1200);
+  const quiet = await state(page);
+  check('17. Back from the stage returns to the start screen and stops the set', !!out && quiet.rms < 0.001 && quiet.url === `${srv.url}/index.html`, out ? `level ${quiet.rms.toFixed(4)}` : `screen ${quiet.screen}, ${quiet.url}`);
+  check('transport group (untouched page): no console errors', ownErrors(b).length === 0, ownErrors(b).slice(0, 3).join(' | '));
+}
+
+/** The picker opened by a real click; then Track length on full-length files. */
+async function transportB(srv, b, paths) {
+  const { page } = b;
+  await page.goto(`${srv.url}/index.html`, { waitUntil: 'load' });
+  await page.waitForSelector('label[for="segue-files"]', { timeout: 15000 });
+  const before = await state(page);
+  const [chooser] = await Promise.all([page.waitForFileChooser({ timeout: 8000 }), page.click('label[for="segue-files"]')]);
+  await sleep(250);
+  const open1 = await state(page);
+  check('14. the click that opens the file picker unlocks the audio (the context runs while the picker is open)', before.ctx === 'none' && open1.ctx === 'running', `context before the click: ${before.ctx}, with the picker open: ${open1.ctx}`);
+  const screens = new Set();
+  await chooser.accept(paths);
+  const first = await until(page, (s) => (screens.add(s.screen), s.started && s.playing && s.rms > 0.01), 40000, 40);
+  check('14. picked files start playing by themselves, straight onto the stage', !!first && first.screen === 'stage' && !screens.has('ready'), `screens seen: ${[...screens].join(' → ')}`);
+  if (!first) return;
+  // Full-length files are checked for NaN / Infinity samples in slices right after decoding, so the
+  // engine's own check does not land in one piece on the frame a track starts (every decode counts one).
+  check('14. decoded files are checked for bad samples before they reach the engine', first.buffersChecked >= 1 && first.buffersChecked >= first.buffers, `${first.buffersChecked} buffers checked after decoding, ${first.buffers} held`);
+
+  // 19. Track length reaches the transition that is already announced.
+  const planned = await until(page, (s) => s.history.length >= 2 && s.canSkip && !s.dom.skipDisabled, 20000, 100);
+  if (!check('19. full-length files: the way out of the first track is planned early', !!planned && planned.mode === 'medium' && planned.history[1].tStart > 52, planned ? `Medium: planned for ${planned.history[1].tStart.toFixed(1)} s` : '')) return;
+  const was = planned.history[1];
+  await page.click('input[name="segue-mode"][value="short"]').catch(() => page.evaluate(() => document.querySelector('input[name="segue-mode"][value="short"]').click()));
+  const moved = await until(page, (s) => s.mode === 'short' && s.history.length >= 2 && s.history[1].tStart !== was.tStart, 3000, 50);
+  const now1 = moved && moved.history[1];
+  check('19. choosing Short re-plans it at once: same next track, about 45 s in', !!moved && now1.trackId === was.trackId && now1.tStart < was.tStart - 12 && now1.tStart < 62 && now1.tStart > moved.now, moved ? `${was.label} at ${was.tStart.toFixed(1)} s → ${now1.label} at ${now1.tStart.toFixed(1)} s (set time ${moved.now.toFixed(1)} s)` : `still planned for ${was.tStart.toFixed(1)} s`);
+  if (!moved) return;
+  const heard = await listen(page, 4000);
+  check('19. the music does not notice the re-plan', heard.longestSilentMs <= 500 && heard.medianRms > 0.02, `longest quiet stretch ${heard.longestSilentMs} ms, median level ${heard.medianRms.toFixed(3)}`);
+  // and Skip still works on the re-made plan
+  const can = await until(page, (s) => s.canSkip && !s.dom.skipDisabled, 10000, 50);
+  if (can) {
+    await page.click('[data-ref="skip"]');
+    const q = await until(page, (s) => s.history[1].tStart < can.now + 3.2 && s.history[1].tStart !== now1.tStart, 3000, 50);
+    const after = await listen(page, 5000);
+    check('19. Skip after a re-plan: quick transition, sound throughout', !!q && q.history[1].trackId === was.trackId && after.longestSilentMs <= 700 && after.medianRms > 0.02, q ? `${q.history[1].label}, longest quiet stretch ${after.longestSilentMs} ms` : 'no new plan');
+  } else check('19. Skip after a re-plan: quick transition, sound throughout', false, 'Skip never became available');
+  check('transport group (picker): no console errors', ownErrors(b).length === 0, ownErrors(b).slice(0, 3).join(' | '));
 }
 
 // ── group: phone (11) ──────────────────────────────────────────────────────────────────────────
@@ -578,7 +894,8 @@ if (wants('demo')) jobs.push(guard('demo', groupDemo));
 else shareInfo(null);
 if (wants('share') && wants('demo')) jobs.push(guard('share', groupShare));
 if (wants('spotify')) jobs.push(guard('spotify', groupSpotify));
-if (wants('local')) jobs.push(guard('local', groupLocal));
+// (the two groups that play local files run one after the other: fewer browsers at once, same total time)
+jobs.push((wants('local') ? guard('local', groupLocal) : Promise.resolve()).then(() => (wants('transport') ? guard('transport', groupTransport) : undefined)));
 if (wants('mobile')) jobs.push(guard('mobile', groupMobile));
 await Promise.all(jobs);
 await srv.close();

@@ -207,6 +207,15 @@ test('errors: not found / private, empty, unreachable — all friendly SourceErr
   });
   await assert.rejects(down.loadPlaylist('4'), (e) => coded('unreachable')(e) && /Couldn't reach Deezer/.test(e.message));
 
+  // The browser's JSONP transport fails with its own terse SourceError: the user still gets told what to do.
+  const jsonpDown = createDeezer({
+    transport: async () => {
+      throw new SourceError('unreachable', 'Could not reach Deezer.');
+    },
+    limiter: instant(),
+  });
+  await assert.rejects(jsonpDown.loadPlaylist('4'), (e) => coded('unreachable')(e) && /check your connection and try again/.test(e.message));
+
   const weird = client([[/^\/playlist\//, () => ({ error: { type: 'Exception', message: 'boom', code: 700 } })]]);
   await assert.rejects(weird.dz.loadPlaylist('5'), coded('unreachable'));
   const notJson = createDeezer({ transport: async () => 'nonsense', limiter: instant() });

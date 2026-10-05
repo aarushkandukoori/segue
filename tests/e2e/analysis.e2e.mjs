@@ -198,6 +198,106 @@ try {
   });
   check('cache survives a page reload', afterReload.stored && JSON.stringify(afterReload.stored) === JSON.stringify(a) && afterReload.other === null);
 
+  // ---- 4b. what must NOT be kept: the user's own files -----------------------------------------------
+  // A local file's cache key carries its file name. Earlier builds wrote those keys to IndexedDB, where
+  // they outlived the session and the page. (Names below are invented.)
+  const localKey = 'local:Rehearsal take 2 (rough).wav:1764044:1700000000000';
+  const legacyKey = 'local:Old demo bounce.wav:1500000:1690000000000';
+  const privacy = await page.evaluate(
+    async (url, key, legacy) => {
+      const h = window.harness;
+      const idb = (mode, fn) =>
+        new Promise((resolve, reject) => {
+          const open = indexedDB.open('segue-analysis', 1);
+          open.onupgradeneeded = () => open.result.createObjectStore('analysis');
+          open.onerror = () => reject(open.error);
+          open.onsuccess = () => {
+            const tx = open.result.transaction('analysis', mode);
+            const out = fn(tx.objectStore('analysis'));
+            tx.oncomplete = () => {
+              open.result.close();
+              resolve(out.result);
+            };
+            tx.onerror = () => reject(tx.error);
+          };
+        });
+      const keys = () => idb('readonly', (store) => store.getAllKeys());
+      const suffix = `|v${h.ANALYSIS_VERSION}`;
+      const buffer = await h.decode(url);
+      // what an earlier build left behind: a current-version record under a file-name key
+      const an0 = h.createAnalyzer();
+      const valid = await an0.analyze(buffer, { key: 'e2e:track' });
+      an0.destroy();
+      await idb('readwrite', (store) => store.put(valid, legacy + suffix));
+      const seeded = (await keys()).includes(legacy + suffix);
+
+      const an = h.createAnalyzer();
+      const legacyRead = await an.cached(legacy);
+      const first = await an.analyze(buffer, { key });
+      const again = await an.analyze(buffer, { key });
+      const viaCached = await an.cached(key);
+      const stats = an.stats;
+      // (only local keys were asked for: the housekeeping must not wait for a preview to come along)
+      let after = await keys();
+      for (let i = 0; i < 40 && after.some((k) => String(k).startsWith('local:')); i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        after = await keys();
+      }
+      await new Promise((r) => setTimeout(r, 150)); // anything that was going to be written has been by now
+      after = await keys();
+      an.destroy();
+      // a new analyzer (new session): nothing about the file comes back
+      const fresh = h.createAnalyzer();
+      const freshRead = await fresh.cached(key);
+      const previewStill = !!(await fresh.cached('e2e:track'));
+      fresh.destroy();
+      return { seeded, legacyRead, memoryHit: again === first && viaCached === first, stats, localKeys: after.filter((k) => String(k).startsWith('local:')), all: after.length, freshRead, previewStill };
+    },
+    audioUrl,
+    localKey,
+    legacyKey,
+  );
+  check('a local file is analysed and cached for the session (memory)', privacy.memoryHit && privacy.stats.cacheHits === 1 && privacy.stats.worker === 1, JSON.stringify(privacy.stats));
+  check('… but its key (the file name) is never written to IndexedDB', privacy.localKeys.length === 0 && privacy.all > 0, `${privacy.all} records, ${privacy.localKeys.length} of them local`);
+  check('file-name records left by an earlier build are deleted, and not read back', privacy.seeded && privacy.legacyRead === null && privacy.localKeys.length === 0);
+  check('a new session knows nothing about the file; previews are still cached', privacy.freshRead === null && privacy.previewStill);
+
+  await open();
+  const bounded = await page.evaluate(async (limit) => {
+    const h = window.harness;
+    const idb = (mode, fn) =>
+      new Promise((resolve, reject) => {
+        const open = indexedDB.open('segue-analysis', 1);
+        open.onerror = () => reject(open.error);
+        open.onsuccess = () => {
+          const tx = open.result.transaction('analysis', mode);
+          const out = fn(tx.objectStore('analysis'));
+          tx.oncomplete = () => {
+            open.result.close();
+            resolve(out && out.result);
+          };
+          tx.onerror = () => reject(tx.error);
+        };
+      });
+    const suffix = `|v${h.ANALYSIS_VERSION}`;
+    const before = await idb('readonly', (store) => store.count());
+    // under the limit nothing of the current version is touched …
+    const an1 = h.createAnalyzer();
+    const kept = !!(await an1.cached('e2e:track'));
+    an1.destroy();
+    // … a store that has outgrown it starts over
+    await idb('readwrite', (store) => {
+      for (let i = 0; i <= limit; i++) store.put({ filler: i }, `e2e:filler:${i}${suffix}`);
+    });
+    const full = await idb('readonly', (store) => store.count());
+    const an2 = h.createAnalyzer();
+    const gone = await an2.cached('e2e:track');
+    an2.destroy();
+    const after = await idb('readonly', (store) => store.count());
+    return { before, kept, full, gone, after };
+  }, 2000);
+  check('the store is bounded: found with more than 2000 records it starts over', bounded.kept && bounded.before > 0 && bounded.full > 2000 && bounded.gone === null && bounded.after === 0, JSON.stringify(bounded));
+
   // ---- 5. fallbacks ---------------------------------------------------------------------------------
   const fallback = await page.evaluate(async (url) => {
     const h = window.harness;
