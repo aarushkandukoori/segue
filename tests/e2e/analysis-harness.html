@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Segue · analysis harness</title>
+  </head>
+  <body>
+    <p>Analysis e2e harness — driven by tests/e2e/analysis.e2e.mjs.</p>
+    <script type="module">
+      import { createAnalyzer, prepareAudio } from '../../js/analysis/client.js';
+      import { analyzeTrack, ANALYSIS_VERSION, ANALYSIS_RATE } from '../../js/analysis/analyze.js';
+      import { drumLoop } from '../helpers/analysis-synth.js';
+
+      /** Typed arrays → plain arrays so results survive page.evaluate's JSON serialisation. */
+      const plain = (a) =>
+        a && {
+          ...a,
+          wave: { cols: a.wave.cols, perSec: a.wave.perSec, low: Array.from(a.wave.low), mid: Array.from(a.wave.mid), high: Array.from(a.wave.high) },
+          __types: { low: a.wave.low.constructor.name, mid: a.wave.mid.constructor.name, high: a.wave.high.constructor.name, beats: Array.isArray(a.beats) },
+        };
+
+      let ctx = null;
+      const buffers = new Map();
+
+      window.harness = {
+        ANALYSIS_VERSION,
+        ANALYSIS_RATE,
+        createAnalyzer,
+        prepareAudio,
+        analyzeTrack,
+        plain,
+        analyzers: {},
+
+        /** Fetch + decodeAudioData exactly like the app will (shared AudioContext at the device rate). */
+        async decode(url) {
+          if (buffers.has(url)) return buffers.get(url);
+          ctx = ctx || new AudioContext();
+          const bytes = await (await fetch(url)).arrayBuffer();
+          const buffer = await ctx.decodeAudioData(bytes);
+          buffers.set(url, buffer);
+          return buffer;
+        },
+
+        /** A long synthetic stereo track built in-page (no download). */
+        synthBuffer(seconds, bpm, sampleRate = 48000) {
+          const loop = drumLoop({ bpm, seconds, sr: sampleRate, tonal: false });
+          const buffer = new AudioBuffer({ length: loop.samples.length, sampleRate, numberOfChannels: 2 });
+          buffer.copyToChannel(loop.samples, 0);
+          buffer.copyToChannel(loop.samples, 1);
+          return buffer;
+        },
+
+        info(buffer) {
+          return { sampleRate: buffer.sampleRate, channels: buffer.numberOfChannels, duration: buffer.duration, length: buffer.length };
+        },
+      };
+      window.harnessReady = true;
+    </script>
+  </body>
+</html>

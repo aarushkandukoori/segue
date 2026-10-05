@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Segue engine harness</title>
+    <link rel="icon" href="data:," />
+    <style>
+      body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #111; color: #ddd; padding: 16px; }
+      .ok { color: #7c7; } .bad { color: #f66; } h3 { margin: 14px 0 4px; }
+    </style>
+  </head>
+  <body>
+    <!-- Driven by tests/e2e/engine.e2e.mjs in headless Chrome. Open it in a browser (npm run serve, then
+         /tests/e2e/engine-harness.html?run) to run the same groups by hand and read the report here. -->
+    <div id="out">engine harness: window.engineTests.run(group)</div>
+    <script type="module" src="./engine/run.js"></script>
+  </body>
+</html>

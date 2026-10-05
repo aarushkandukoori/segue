@@ -1,0 +1,7 @@
+node_modules/
+tests/fixtures/
+handoff/
+.DS_Store
+*.wav
+*.log
+.claude/

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- The app's own policy (index.html) plus a nonce for this page's inline module, so the e2e proves
+         that JSONP to api.deezer.com and every fetch the sources make are allowed in production. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' https://api.deezer.com 'nonce-sourcesharness'; connect-src https:; img-src 'self' https: data: blob:; media-src https: blob: data:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:"
+    />
+    <title>Segue · sources harness</title>
+  </head>
+  <body>
+    <p>Sources e2e harness — driven by tests/e2e/sources.e2e.mjs (real network, real JSONP).</p>
+    <script type="module" nonce="sourcesharness">
+      import * as index from '../../js/sources/index.js';
+      import * as spotify from '../../js/sources/spotify.js';
+      import * as deezer from '../../js/sources/deezer.js';
+      import * as itunes from '../../js/sources/itunes.js';
+      import * as resolver from '../../js/sources/resolver.js';
+      import * as jsonp from '../../js/sources/jsonp.js';
+      import * as match from '../../js/sources/match.js';
+      import * as local from '../../js/sources/local.js';
+
+      const errInfo = (e) => ({ name: e && e.name, code: e && e.code, message: e && e.message, detail: e && e.detail, final: e && e.final });
+
+      /** Run fn, return {ok, value | error, ms}. Results must survive JSON serialisation. */
+      async function timed(fn) {
+        const t0 = performance.now();
+        try {
+          const value = await fn();
+          return { ok: true, value, ms: Math.round(performance.now() - t0) };
+        } catch (e) {
+          return { ok: false, error: errInfo(e), ms: Math.round(performance.now() - t0) };
+        }
+      }
+
+      /** Contract check of a Playlist; returns a list of problems (empty = fine). */
+      function checkPlaylist(p, { source, trackId }) {
+        const bad = [];
+        const https = (u) => typeof u === 'string' && u.startsWith('https://');
+        if (!p || typeof p !== 'object') return ['not an object'];
+        if (p.source !== source) bad.push(`source ${p.source}`);
+        if (typeof p.id !== 'string' || !p.id.startsWith(source + ':')) bad.push(`id ${p.id}`);
+        if (typeof p.title !== 'string' || !p.title) bad.push('no title');
+        if (p.link !== undefined && !https(p.link)) bad.push(`link ${p.link}`);
+        if (p.artwork !== undefined && !https(p.artwork)) bad.push(`artwork ${p.artwork}`);
+        if (!Array.isArray(p.tracks) || !p.tracks.length) return [...bad, 'no tracks'];
+        if (p.total !== undefined && !(Number.isInteger(p.total) && p.total > p.tracks.length)) bad.push(`total ${p.total}`);
+        const ids = new Set();
+        for (const t of p.tracks) {
+          if (typeof t.id !== 'string' || !trackId.test(t.id)) bad.push(`track id ${t.id}`);
+          if (ids.has(t.id)) bad.push(`duplicate ${t.id}`);
+          ids.add(t.id);
+          if (typeof t.title !== 'string' || !t.title.trim()) bad.push(`track ${t.id} has no title`);
+          if (typeof t.artist !== 'string') bad.push(`track ${t.id} artist`);
+          if (t.title !== t.title.trim() || /\s{2,}| /.test(t.title + t.artist)) bad.push(`track ${t.id} odd whitespace`);
+          if (t.durationMs !== undefined && !(t.durationMs > 1000)) bad.push(`track ${t.id} duration ${t.durationMs}`);
+          if (t.link !== undefined && !https(t.link)) bad.push(`track ${t.id} link`);
+          if (t.artwork !== undefined && !https(t.artwork)) bad.push(`track ${t.id} artwork`);
+          if (t.preview !== undefined && !(https(t.preview.url) && (t.preview.provider === 'deezer' || t.preview.provider === 'itunes') && t.preview.id)) bad.push(`track ${t.id} preview`);
+          if (bad.length > 12) break;
+        }
+        // Spotify audio must never come through, under any key.
+        const json = JSON.stringify(p);
+        if (/audioPreview|p\.scdn\.co|mp3-preview|accessToken/i.test(json)) bad.push('Spotify audio / token leaked into the playlist');
+        return bad;
+      }
+
+      let audioCtx = null;
+      /** decodeAudioData the way the app will. */
+      async function decode(bytes) {
+        audioCtx = audioCtx || new AudioContext();
+        const buf = await audioCtx.decodeAudioData(bytes.slice(0));
+        let peak = 0;
+        const ch = buf.getChannelData(0);
+        for (let i = 0; i < ch.length; i += 97) peak = Math.max(peak, Math.abs(ch[i]));
+        return { duration: buf.duration, sampleRate: buf.sampleRate, channels: buf.numberOfChannels, peak };
+      }
+
+      /** A one-second 440 Hz mono WAV, built in-page (stands in for a user's local file). */
+      function wavFile(name) {
+        const sr = 22050;
+        const n = sr;
+        const bytes = new DataView(new ArrayBuffer(44 + n * 2));
+        const put = (o, s) => [...s].forEach((c, i) => bytes.setUint8(o + i, c.charCodeAt(0)));
+        put(0, 'RIFF');
+        bytes.setUint32(4, 36 + n * 2, true);
+        put(8, 'WAVEfmt ');
+        bytes.setUint32(16, 16, true);
+        bytes.setUint16(20, 1, true);
+        bytes.setUint16(22, 1, true);
+        bytes.setUint32(24, sr, true);
+        bytes.setUint32(28, sr * 2, true);
+        bytes.setUint16(32, 2, true);
+        bytes.setUint16(34, 16, true);
+        put(36, 'data');
+        bytes.setUint32(40, n * 2, true);
+        for (let i = 0; i < n; i++) bytes.setInt16(44 + i * 2, Math.round(12000 * Math.sin((2 * Math.PI * 440 * i) / sr)), true);
+        return new File([bytes.buffer], name, { type: 'audio/wav', lastModified: 1700000000000 });
+      }
+
+      const leftovers = () => ({
+        globals: jsonp.jsonpGlobals(window),
+        scripts: [...document.querySelectorAll('script')].filter((s) => /deezer/i.test(s.src)).length,
+        scriptTags: document.querySelectorAll('script').length,
+      });
+
+      window.H = { index, spotify, deezer, itunes, resolver, jsonp, match, local, timed, checkPlaylist, decode, wavFile, leftovers, errInfo, shared: resolver.createResolver() };
+      window.harnessReady = true;
+    </script>
+  </body>
+</html>

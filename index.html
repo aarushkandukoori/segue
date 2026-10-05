@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://api.deezer.com; connect-src https:; img-src 'self' https: data: blob:; media-src https: blob: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; worker-src 'self' blob:">
+    <title>Segue — your playlist, DJ’d live</title>
+    <meta name="description" content="Paste a Spotify playlist link and Segue mixes it live in your browser: beat-matched blends, bass swaps, filter sweeps and drops. Never the same set twice.">
+    <meta name="theme-color" content="#09090b">
+    <meta name="color-scheme" content="dark">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+
+    <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png">
+    <link rel="manifest" href="./assets/manifest.webmanifest">
+
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Segue">
+    <meta property="og:title" content="Segue — your playlist, DJ’d live">
+    <meta property="og:description" content="Paste a playlist, get a live, beat-matched DJ set in your browser. Never the same set twice.">
+    <meta property="og:url" content="https://aarushkandukoori.github.io/segue/">
+    <meta property="og:image" content="https://aarushkandukoori.github.io/segue/assets/og.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="Segue: two stacked DJ waveforms, one warm and one cool, locked on a shared beat grid.">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Segue — your playlist, DJ’d live">
+    <meta name="twitter:description" content="Paste a playlist, get a live, beat-matched DJ set in your browser. Never the same set twice.">
+    <meta name="twitter:image" content="https://aarushkandukoori.github.io/segue/assets/og.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anybody:wdth,wght@50..150,100..900&family=Instrument+Sans:wght@400..700&family=Martian+Mono:wdth,wght@75..112.5,100..800&display=swap">
+    <link rel="stylesheet" href="./css/style.css">
+    <link rel="stylesheet" href="./css/stage.css">
+  </head>
+  <body>
+    <!-- The view (js/ui/view.js) replaces the contents of #app. What is here is the first paint and the
+         no-JavaScript fallback, styled to match the landing screen so nothing jumps when the app boots. -->
+    <div id="app" class="segue">
+      <main class="screen landing is-first">
+        <header class="l-top">
+          <span class="wordmark">
+            <svg class="mark" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true" focusable="false"><path d="M14.6 3.1a13 13 0 0 0 0 25.8z" fill="#ff7a3c"/><path d="M17.4 3.1a13 13 0 0 1 0 25.8z" fill="#3fd2ff"/><circle cx="16" cy="16" r="4.4" fill="#09090b"/></svg>
+            <span class="wordmark-text">Segue</span>
+          </span>
+          <p class="l-top-note">No sign-up. Runs in your browser.</p>
+        </header>
+        <section class="l-hero">
+          <h1 class="l-title"><span class="l-title-1">Your playlist,</span> <span class="l-title-2">DJ’d live.</span></h1>
+          <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue beat-matches, blends and drops every track — a different mix each time you press play.</p>
+          <noscript><p class="l-sub">Segue mixes audio in your browser, so it needs JavaScript turned on.</p></noscript>
+        </section>
+        <footer class="l-foot">
+          <p>Segue mixes 30-second previews (from Deezer / Apple). Local files play full length. Not affiliated with Spotify.</p>
+        </footer>
+      </main>
+    </div>
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
