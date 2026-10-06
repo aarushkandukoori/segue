@@ -4,12 +4,19 @@
 //
 // Every control keeps the last value it painted (quantized), so a frame in which nothing moved costs a
 // few comparisons and zero style writes.
+//
+// Full songs play in YouTube's player, whose audio never reaches the page: a deck whose DeckFrame says
+// `eqActive: false` shows its EQ / filter knobs at rest and inactive (with the reason), and in video mode
+// the master meter, which could only hear the Web Audio side, is switched off rather than faked.
+// Faders and the crossfader still follow `gain` — the player's volume is the one control there is.
 
 import { clamp, clamp01 } from './dom.js';
 
 const ARC_PER_DEG = (2 * Math.PI * 21) / 360; // k-val circle: r=21 in a 48-unit viewBox
 const LOG_1000 = Math.log(1000);
 const KILL_DB = -24;
+const EQ_WHY = 'EQ works on previews — YouTube audio can’t be processed';
+const METER_WHY = 'The master meter can’t hear YouTube’s player';
 const METER_STEPS = 24;
 const VU_STEPS = 20;
 
@@ -51,8 +58,14 @@ export function createMixer(root) {
       qVu: -1,
       vuLvl: 0,
       on: null,
+      eqOff: false,
+      knobs: /** @type {HTMLElement[]} */ (Array.from(ch.querySelectorAll('.knobs'))),
     };
   });
+  const master = root.querySelector('.master');
+  const note = root.querySelector('.mx-note');
+  let video = false;
+  let noteShown = false;
   const xfSlot = root.querySelector('.xf-slot');
   const xfCap = root.querySelector('.xf-cap');
   const meterLit = root.querySelector('.meter-lit');
@@ -117,16 +130,26 @@ export function createMixer(root) {
         c.on = on;
         c.el.classList.toggle('is-off', !on);
       }
-      const low = d ? d.low : 0;
-      const mid = d ? d.mid : 0;
-      const high = d ? d.high : 0;
+      const eqOff = !!d && d.eqActive === false;
+      if (eqOff !== c.eqOff) {
+        c.eqOff = eqOff;
+        c.el.classList.toggle('is-eq-off', eqOff);
+        for (const k of c.knobs) {
+          if (eqOff) k.title = EQ_WHY;
+          else k.removeAttribute('title');
+        }
+      }
+      // an inactive EQ rests at 12 o'clock: whatever the numbers say, nothing is being cut
+      const low = d && !eqOff ? d.low : 0;
+      const mid = d && !eqOff ? d.mid : 0;
+      const high = d && !eqOff ? d.high : 0;
       turn(c.low, eqAngle(low));
       turn(c.mid, eqAngle(mid));
       turn(c.high, eqAngle(high));
       flag(c.low, low <= KILL_DB ? 'kill' : '');
       flag(c.mid, mid <= KILL_DB ? 'kill' : '');
       flag(c.high, high <= KILL_DB ? 'kill' : '');
-      const fv = d ? filterValue(d.hpf, d.lpf) : 0;
+      const fv = d && !eqOff ? filterValue(d.hpf, d.lpf) : 0;
       turn(c.filter, fv * 135);
       // the filter knob names what it is doing: high-pass to the right, low-pass to the left
       if (fv > 0.02) flag(c.filter, 'hpf', 'Hi-pass');
@@ -151,13 +174,21 @@ export function createMixer(root) {
       }
     }
 
+    const showNote = channels[0].eqOff || channels[1].eqOff;
+    if (showNote !== noteShown) {
+      noteShown = showNote;
+      note.hidden = !showNote;
+      root.classList.toggle('has-note', showNote);
+    }
+
     const xf = Math.round(clamp(f.crossfade, -1, 1) * 100);
     if (xf !== qXf) {
       qXf = xf;
       xfCap.style.transform = `translate3d(${(((xf + 100) / 200) * xfTravel).toFixed(1)}px,0,0)`;
     }
 
-    const lv = f.levels;
+    // video mode: the meter is off (it would only hear the Web Audio side, never the player)
+    const lv = video ? null : f.levels;
     const rms = lv ? meterScale(lv.rms) : 0;
     const peak = lv ? meterScale(lv.peak) : 0;
     rmsLvl = rms > rmsLvl ? rms : Math.max(rms, rmsLvl - dt * 1.6);
@@ -179,5 +210,17 @@ export function createMixer(root) {
     }
   }
 
-  return { frame, destroy: () => ro.disconnect() };
+  /** @param {boolean} on video mode: master meter off */
+  function setVideo(on) {
+    if (on === video) return;
+    video = !!on;
+    root.classList.toggle('is-deaf', video);
+    if (video) {
+      master.title = METER_WHY;
+      // drop to silence at once instead of letting the bar fall through the next frames
+      rmsLvl = peakLvl = peakHold = 0;
+    } else master.removeAttribute('title');
+  }
+
+  return { frame, setVideo, destroy: () => ro.disconnect() };
 }

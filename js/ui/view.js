@@ -4,8 +4,13 @@
 //   const view = createView(document.getElementById('app'), handlers);
 //   view.setScreen('landing'); … view.frame(frameState) on every animation frame while on stage.
 //
-// Contract: see SPEC.md §4 "ui". Per-frame work is kept allocation-free and writes to the DOM only when
-// a displayed value changes (each sub-module quantizes and remembers what it last painted).
+// Contract: see SPEC.md §4 "ui" and §6.5 (video mode). Per-frame work is kept allocation-free and writes
+// to the DOM only when a displayed value changes (each sub-module quantizes and remembers what it last
+// painted).
+//
+// Two stage modes: 'waves' (30-second previews and local files through Web Audio: scrolling waveforms in
+// the hero) and 'video' (full songs in YouTube's embedded player: the hero shows two player slots, see
+// vstage.js). Switching modes is CSS only — the slots are created once and never moved.
 
 import { TEMPLATE } from './template.js';
 import { clamp01, collectRefs, el, fmtTime, isTypingTarget, setImage, setLink, setText } from './dom.js';
@@ -16,13 +21,24 @@ import { createMixer } from './mixer.js';
 import { createTicker } from './ticker.js';
 import { createSetlist } from './setlist.js';
 import { createAttract } from './landing.js';
+import { createVStage } from './vstage.js';
 
 const SCREENS = ['landing', 'loading', 'ready', 'stage'];
 const SOURCE_NAMES = { spotify: 'Spotify', deezer: 'Deezer', text: 'Track list', local: 'Your files' };
 const MODES = ['preview', 'short', 'medium', 'full'];
 const AUDIO_EXT = /\.(mp3|m4a|m4b|mp4|aac|wav|wave|flac|ogg|oga|opus|aif|aiff|caf|webm|weba|wma)$/i;
 const DRAWER_QUERY = '(max-width: 1179px)';
-const MODE_LOCKED_WHY = 'Previews are 30 seconds — add your own files to unlock longer plays';
+/** Video mode on a short phone (and a phone on its side): the page scrolls, and the setlist is page
+ * content under the booth instead of a drawer that would only get the sliver below the players. */
+const SCROLL_QUERY = '(max-width: 599px) and (max-height: 730px), (max-width: 1023px) and (max-height: 520px)';
+/** Track-length microcopy: how long each song plays, and where the sound comes from. */
+const MODE_LENGTH = { preview: '30-second clips', short: 'About 45 s of each song', medium: 'About 90 s of each song', full: 'Each song to its outro' };
+const MODE_FROM_STREAM = { preview: '30-second clips, beat-matched', short: 'full songs from YouTube', medium: 'full songs from YouTube', full: 'full songs from YouTube' };
+const MODE_FROM_FILES = { short: 'your own files, full length', medium: 'your own files, full length', full: 'your own files, full length' };
+const PREVIEW_OFF_WHY = 'Previews are for streaming playlists — your own files always play full length';
+/** The first song's ad in one short line (the video stage on a short phone; the ticker has the long one). */
+const START_AD = 'Muted ad before the first song. The set starts when it ends.';
+const REC_OFF_WHY = 'Recording isn’t available for this set';
 
 /**
  * @typedef {Object} ViewHandlers
@@ -34,7 +50,10 @@ const MODE_LOCKED_WHY = 'Previews are 30 seconds — add your own files to unloc
  * @property {() => void} [onSkip]
  * @property {() => void} [onNewSet]
  * @property {(v: number) => void} [onVibe]
- * @property {(m: string) => void} [onMode]
+ * @property {(m: string) => void} [onMode]  the Track length control: the visitor's choice (kept as their default)
+ * @property {() => void} [onPreviewOnce]  "Play previews instead" (the first song stuck behind its ad):
+ *   this set only goes on as previews; the stored track length is not touched. Without it the view
+ *   falls back to onMode('preview').
  * @property {(v: number) => void} [onVolume]
  * @property {() => void} [onRecordToggle]
  * @property {() => void} [onShare]
@@ -69,6 +88,10 @@ export function createView(root, handlers) {
   const ticker = createTicker(R.ticker, R);
   const setlist = createSetlist(R['crate-list'], { count: R['crate-count'], empty: R['crate-empty'] });
   const attract = createAttract(R.attract, R['attract-lock'], backdrop);
+  const vstage = createVStage(R.vstage);
+  /** @type {'waves'|'video'} */
+  let stageMode = 'waves';
+  root.dataset.stage = stageMode;
   const waveTagBox = [R.wt0, R.wt1];
   const waveTags = [R.wt0.querySelector('[data-part="t"]'), R.wt1.querySelector('[data-part="t"]')];
   /** @type {[any, any]} */
@@ -338,6 +361,9 @@ export function createView(root, handlers) {
     const count = Math.max(0, o.count | 0);
     const tracks = `${count} track${count === 1 ? '' : 's'}`;
     const source = SOURCE_NAMES[o.source] || '';
+    // your own files play full length through Web Audio: no 30-second previews, no YouTube
+    playlistLocal = o.source === 'local';
+    paintModes();
     setText(R['pl-title'], title);
     setLink(R['pl-title'], o.link, true);
     setText(R['pl-meta'], source ? `${tracks} · ${source}` : tracks);
@@ -364,6 +390,7 @@ export function createView(root, handlers) {
     deckViews[i] = d || null;
     deckUi[i].set(deckViews[i]);
     waves.setDeck(i, deckViews[i]);
+    vstage.set(i, deckViews[i]);
     qRemain[i] = -2;
     setText(waveTags[i], deckViews[i] ? 'Cued' : 'Empty');
     waveTagBox[i].classList.toggle('is-empty', !deckViews[i]);
@@ -396,7 +423,24 @@ export function createView(root, handlers) {
     transition = tv || null;
     ticker.set(transition);
     syncTransitionSides();
+    paintStart();
     soloCheck = 0;
+  }
+
+  /**
+   * The first song waiting for its ad (TransitionView 'starting'). Where the page scrolls (short phone,
+   * phone on its side) the ticker that explains it is below the fold, so the video stage carries a short
+   * version of it and the way out (the CSS shows .vs-start only on that layout). The ticker's live region
+   * still reads the whole reason out; the short line carries it as a tooltip.
+   */
+  function paintStart() {
+    const starting = !!transition && transition.state === 'starting';
+    R['vs-start'].hidden = !starting;
+    R.vstage.classList.toggle('is-starting', starting);
+    if (!starting) return;
+    const why = typeof transition.why === 'string' ? transition.why : '';
+    setText(R['vs-start-why'], /\bads?\b/i.test(why) ? START_AD : why || 'Starting the set…');
+    R['vs-start-why'].title = why;
   }
 
   /**
@@ -407,25 +451,73 @@ export function createView(root, handlers) {
     setlist.set(items, info);
   }
 
-  // Setlist drawer (docked column on wide screens, drawer / bottom sheet below that).
+  // Setlist drawer (docked column on wide screens, drawer / bottom sheet below that). Video mode on a
+  // short phone or a phone on its side (SCROLL_QUERY): the page scrolls and the setlist is page content
+  // under the booth; "Setlist" opens it as a sheet BELOW the two players (placeSheet) — scrolling down to
+  // it would take both players, and the transport, off the screen.
   const drawerMq = window.matchMedia(DRAWER_QUERY);
+  const scrollMq = window.matchMedia(SCROLL_QUERY);
+  const inlineCrate = () => stageMode === 'video' && scrollMq.matches;
   let crateOpen = false;
   function setCrate(open, moveFocus = true) {
-    const drawer = drawerMq.matches;
+    const inline = inlineCrate();
+    const drawer = drawerMq.matches && !inline;
     const was = crateOpen;
-    crateOpen = !!open && drawer;
+    crateOpen = !!open && (drawer || inline);
     const closed = drawer && !crateOpen;
+    const sheet = inline && crateOpen;
     R.crate.classList.toggle('is-open', crateOpen);
+    R.crate.classList.toggle('is-sheet', sheet);
     R.crate.toggleAttribute('inert', closed);
     if (closed) R.crate.setAttribute('aria-hidden', 'true');
     else R.crate.removeAttribute('aria-hidden');
-    R.scrim.hidden = !crateOpen;
+    // the sheet starts below the players and leaves them uncovered and in use: no scrim
+    R.scrim.hidden = !crateOpen || sheet;
     R['crate-toggle'].setAttribute('aria-expanded', String(crateOpen));
+    if (sheet && !was) {
+      placeSheet(true);
+      setlist.reveal();
+    }
     if (!moveFocus || was === crateOpen) return;
     if (crateOpen) R['crate-close'].focus({ preventScroll: true });
     else R['crate-toggle'].focus({ preventScroll: true });
   }
+
+  /**
+   * The setlist sheet where the page scrolls. Two screens of ≥ 200 px leave a phone no room for a list
+   * beside or under them, so: scroll the page just far enough that the screens sit at the top of the
+   * window (never further), and lay the sheet over everything below their bottom edge, down to the
+   * window's bottom. It is placed in page coordinates (absolute, CSS), so no later scroll — the user's —
+   * can bring a player under it: the players only ever move away from it, upwards.
+   * @param {boolean} scroll bring the screens to the top first (false: only re-measure, e.g. on resize)
+   */
+  function placeSheet(scroll) {
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (const s of R.vstage.querySelectorAll('.vscreen')) {
+      const r = s.getBoundingClientRect();
+      if (!(r.height > 0)) continue;
+      if (r.top < top) top = r.top;
+      if (r.bottom > bottom) bottom = r.bottom;
+    }
+    if (!(bottom > top)) return;
+    if (scroll) {
+      const y0 = window.scrollY;
+      window.scrollTo(0, Math.max(0, Math.floor(top + y0) - 6));
+      bottom -= window.scrollY - y0;
+    }
+    const cb = R.crate.offsetParent || document.body;
+    const cbTop = cb.getBoundingClientRect().top + cb.clientTop;
+    const sheetTop = Math.ceil(bottom) + 4; // viewport coordinates, a few px clear of the rings
+    R.crate.style.setProperty('--sheet-top', `${sheetTop - cbTop}px`);
+    R.crate.style.setProperty('--sheet-h', `${Math.max(160, Math.floor(window.innerHeight - sheetTop))}px`);
+  }
+  const onResize = () => {
+    if (crateOpen && inlineCrate()) placeSheet(false);
+  };
+  window.addEventListener('resize', onResize);
   drawerMq.addEventListener('change', () => setCrate(false, false));
+  scrollMq.addEventListener('change', () => setCrate(false, false));
   R['crate-toggle'].addEventListener('click', () => setCrate(!crateOpen));
   R['crate-close'].addEventListener('click', () => setCrate(false));
   R.scrim.addEventListener('click', () => setCrate(false));
@@ -442,11 +534,30 @@ export function createView(root, handlers) {
   press(R.skip, () => call('onSkip'));
   press(R.newset, () => call('onNewSet'));
   press(R.share, () => call('onShare'));
-  press(R.rec, () => call('onRecordToggle'));
+  // Recording can be unavailable (full songs: YouTube's audio never reaches the page, so there is
+  // nothing to record). The button stays focusable and tappable — a tap says why, which a tooltip
+  // alone never does on a touch screen.
+  press(R.rec, () => {
+    if (tp.recordEnabled === false) toast(tp.recordWhy || REC_OFF_WHY, 'info');
+    else call('onRecordToggle');
+  });
+  // the way out of a first song stuck behind its ad (ticker state 'starting'), in the ticker and, where
+  // the ticker is below the fold, on the video stage
+  // — for this set only (onPreviewOnce), so one tap does not switch full songs off for every later visit
+  const previewOnce = () => {
+    if (handlers && typeof handlers.onPreviewOnce === 'function') call('onPreviewOnce');
+    else call('onMode', 'preview');
+  };
+  press(R['tk-act'], previewOnce);
+  press(R['vs-start-act'], previewOnce);
 
-  const tp = { playing: null, canSkip: null, recording: null, seed: null, vibe: NaN, mode: null, modeEnabled: null, volume: NaN };
+  const tp = {
+    playing: null, canSkip: null, recording: null, seed: null, vibe: NaN, mode: null, modeEnabled: true, volume: NaN,
+    /** @type {string[]|null} */ modes: null, recordEnabled: true, recordWhy: '',
+  };
   const modeInputs = /** @type {HTMLInputElement[]} */ (Array.from(R.mode.querySelectorAll('input')));
   const vibeWords = Array.from(root.querySelectorAll('.vibe-scale span'));
+  let playlistLocal = false;
   let vibeBusy = false;
   let volumeBusy = false;
   let lastVolume = 0.9;
@@ -463,6 +574,41 @@ export function createView(root, handlers) {
     R.volume.style.setProperty('--v', v.toFixed(3));
     R.mute.classList.toggle('is-muted', v <= 0.001);
     R.mute.setAttribute('aria-pressed', String(v <= 0.001));
+  }
+  function paintRec() {
+    const off = tp.recordEnabled === false;
+    const why = tp.recordWhy || REC_OFF_WHY;
+    R.rec.classList.toggle('is-disabled', off);
+    if (off) R.rec.setAttribute('aria-disabled', 'true');
+    else R.rec.removeAttribute('aria-disabled');
+    // the name stays put while recording (aria-pressed says that); unavailable, it carries the reason
+    R.rec.setAttribute('aria-label', off ? `Record — not available: ${why}` : 'Record this set');
+    R.rec.title = off ? why : tp.recording ? 'Stop recording and save the set' : 'Record this set';
+  }
+
+  /** Which track lengths this set offers: what setTransport said, else all four — minus Preview for your own files. */
+  const offered = () => tp.modes || (playlistLocal ? MODES.slice(1) : MODES);
+  /** Track length: every playlist can play full songs; only your own files have no 30-second previews. */
+  function paintModes() {
+    const avail = offered();
+    const on = tp.modeEnabled !== false;
+    const from = playlistLocal ? MODE_FROM_FILES : MODE_FROM_STREAM;
+    for (const input of modeInputs) {
+      const ok = avail.includes(input.value);
+      input.disabled = !on || !ok;
+      const label = /** @type {HTMLElement} */ (input.parentElement);
+      label.classList.toggle('is-unavailable', !ok);
+      label.title = ok ? `${MODE_LENGTH[input.value]} — ${from[input.value] || ''}` : input.value === 'preview' && playlistLocal ? PREVIEW_OFF_WHY : 'Not available for this set';
+    }
+    // The fieldset itself is never disabled: Gecko would swallow the taps that explain an unavailable option.
+    R.mode.classList.toggle('is-off', !on);
+    // lets the phone layout give the control a row of its own
+    R.transport.classList.toggle('is-mode-live', on);
+    paintModeHint();
+  }
+  function paintModeHint() {
+    const from = playlistLocal ? MODE_FROM_FILES : MODE_FROM_STREAM;
+    setText(R['mode-hint'], from[tp.mode] || '');
   }
   const holdWhile = (input, set) => {
     input.addEventListener('pointerdown', () => set(true));
@@ -495,20 +641,26 @@ export function createView(root, handlers) {
     const input = /** @type {HTMLInputElement} */ (e.target);
     if (!input || !input.checked || !MODES.includes(input.value)) return;
     tp.mode = input.value;
+    paintModeHint();
     call('onMode', input.value);
   });
-  // Locked (30-second previews): a tooltip is no explanation on a touch screen, so a tap on the locked
-  // control — or on the chip that stands in for it on compact layouts — says why. (The CSS lets taps
-  // fall through the disabled radios; a disabled control would swallow them.)
-  const explainMode = () => toast(MODE_LOCKED_WHY, 'info');
-  R.mode.addEventListener('click', () => {
-    if (tp.modeEnabled === false) explainMode();
+  // An option this set does not offer (Preview, for your own files) says why when it is tapped: a
+  // tooltip is no explanation on a touch screen. The CSS lets taps fall through disabled radios to
+  // their label — a disabled control would swallow them.
+  R.mode.addEventListener('click', (e) => {
+    const label = e.target instanceof Element ? e.target.closest('label') : null;
+    const input = label && label.querySelector('input');
+    if (!input || !input.disabled || tp.modeEnabled === false) return;
+    toast(input.value === 'preview' && playlistLocal ? PREVIEW_OFF_WHY : 'That track length isn’t available for this set', 'info');
   });
-  press(R['mode-note'], explainMode);
   paintVibe(0.5);
   paintVolume(0.9);
+  paintModes();
 
-  /** @param {{playing:boolean, canSkip:boolean, recording:boolean, seed:string, vibe:number, mode:string, modeEnabled:boolean, volume:number}} s */
+  /**
+   * @param {{playing?:boolean, canSkip?:boolean, recording?:boolean, seed?:string, vibe?:number, mode?:string,
+   *   modeEnabled?:boolean, modes?:string[], volume?:number, recordEnabled?:boolean, recordWhy?:string}} s
+   */
   function setTransport(s) {
     if (!s) return;
     // Every field is optional: only what is present (and changed) is repainted.
@@ -529,11 +681,18 @@ export function createView(root, handlers) {
       tp.recording = recording;
       R.rec.classList.toggle('is-on', recording);
       R.rec.setAttribute('aria-pressed', String(recording));
-      R.rec.title = recording ? 'Stop recording and save the set' : 'Record this set';
       root.classList.toggle('is-recording', recording);
       recStart = performance.now();
       qRec = -1;
       setText(R['rec-label'], recording ? '0:00' : 'Rec');
+      paintRec();
+    }
+    const recordEnabled = s.recordEnabled == null ? tp.recordEnabled : s.recordEnabled !== false;
+    const recordWhy = s.recordWhy == null ? tp.recordWhy : String(s.recordWhy);
+    if (recordEnabled !== tp.recordEnabled || recordWhy !== tp.recordWhy) {
+      tp.recordEnabled = recordEnabled;
+      tp.recordWhy = recordWhy;
+      paintRec();
     }
     const seed = s.seed == null ? tp.seed || '' : String(s.seed).replace(/^#/, '');
     if (seed !== tp.seed) {
@@ -555,20 +714,23 @@ export function createView(root, handlers) {
       R.volume.value = String(volume);
       paintVolume(volume);
     }
+    let modesChanged = false;
     if (s.mode != null && s.mode !== tp.mode) {
       tp.mode = s.mode;
       for (const input of modeInputs) input.checked = input.value === s.mode;
+      paintModeHint();
     }
-    const modeEnabled = s.modeEnabled == null ? !!tp.modeEnabled : !!s.modeEnabled;
-    if (modeEnabled !== tp.modeEnabled) {
+    if (s.modes !== undefined) {
+      const list = Array.isArray(s.modes) ? MODES.filter((m) => s.modes.includes(m)) : null;
+      if (String(list) !== String(tp.modes)) {
+        tp.modes = list;
+        modesChanged = true;
+      }
+    }
+    const modeEnabled = s.modeEnabled == null ? tp.modeEnabled : !!s.modeEnabled;
+    if (modeEnabled !== tp.modeEnabled || modesChanged) {
       tp.modeEnabled = modeEnabled;
-      R.mode.disabled = !modeEnabled;
-      R.mode.classList.toggle('is-locked', !modeEnabled);
-      R.mode.title = modeEnabled ? 'How long each track plays before the next blend' : MODE_LOCKED_WHY;
-      R['mode-note'].hidden = modeEnabled;
-      R['mode-note'].title = MODE_LOCKED_WHY;
-      // lets the phone layout give a live control a row of its own
-      R.transport.classList.toggle('is-mode-live', modeEnabled);
+      paintModes();
     }
   }
 
@@ -687,10 +849,16 @@ export function createView(root, handlers) {
     const d1 = f.decks[1] || null;
     const playing = !!f.playing;
     const beatPhase = playing && f.beatPhase >= 0 ? f.beatPhase : 1;
+    const video = stageMode === 'video';
 
-    waves.draw(d0, d1, beatPhase);
+    if (video) {
+      // the waveform hero is hidden: its canvas is not drawn, the slots' captions are
+      vstage.frame(0, d0);
+      vstage.frame(1, d1);
+    } else waves.draw(d0, d1, beatPhase);
     deckUi[0].frame(d0);
     deckUi[1].frame(d1);
+    // channel meters are read off the deck's own waveform — a YouTube deck has none, so they stay down
     mixer.frame(f, d0 ? waves.ampAt(0, d0.pos) : 0, d1 ? waves.ampAt(1, d1.pos) : 0, dt);
     ticker.frame(f.t);
     // "In phase for half a second" is measured on the set's clock: what the lamp says must not depend
@@ -698,14 +866,15 @@ export function createView(root, handlers) {
     let dtSet = f.t - lastT;
     lastT = f.t;
     if (!(dtSet > 0) || dtSet > 0.25) dtSet = dt;
-    paintLock(d0, d1, playing, dtSet);
+    // no beat grid exists for a full song: the lamp (hidden in video mode anyway) never claims a lock
+    paintLock(d0, d1, playing && !video, dtSet);
 
     const es = f.elapsed > 0 ? Math.floor(f.elapsed) : 0;
     if (es !== qElapsed) {
       qElapsed = es;
       setText(R.elapsed, fmtTime(es));
     }
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; !video && i < 2; i++) {
       const v = deckViews[i];
       const d = i === 0 ? d0 : d1;
       if (!v || !d) continue;
@@ -754,12 +923,73 @@ export function createView(root, handlers) {
     backdrop.draw(f.levels, beatPhase, d0 ? d0.audible : 0, d1 ? d1.audible : 0, 1);
   }
 
+  // ── stage mode: waveforms (previews, own files) or video (full songs in YouTube's player) ──────
+  /**
+   * Nothing may be drawn over a player (YouTube's terms), so in video mode everything that floats —
+   * toasts, the setlist drawer and its scrim — is kept below the video stage. Its bottom edge is
+   * measured here and handed to the CSS as --vs-bottom.
+   */
+  const topbar = /** @type {HTMLElement} */ (root.querySelector('.topbar'));
+  let vsBottom = -1;
+  function syncVsBottom() {
+    if (stageMode !== 'video') return;
+    // in document coordinates: where a short phone lets the page scroll, the stage only ever moves up
+    // from here, so a layer placed below this line can never reach the players
+    const b = Math.ceil(R.vstage.getBoundingClientRect().bottom + window.scrollY);
+    if (b === vsBottom) return;
+    vsBottom = b;
+    root.style.setProperty('--vs-bottom', `${b}px`);
+  }
+  const vsRo = new ResizeObserver(() => {
+    syncVsBottom();
+    // the stage changed size under an open setlist sheet (the first song's start line came or went): the
+    // screens moved, so the sheet follows their bottom edge before anything is painted
+    onResize();
+  });
+  vsRo.observe(R.vstage);
+  vsRo.observe(topbar);
+
+  /**
+   * 'waves': the hero shows the scrolling waveforms (Web Audio sets). 'video': it shows the two video
+   * slots instead (full songs). CSS only: the slots stay where they are, so a mounted player is never
+   * reloaded. Switch back to 'waves' only once the players are stopped — a hidden slot must not play.
+   * @param {'waves'|'video'} m
+   */
+  function setStageMode(m) {
+    const mode = m === 'video' ? 'video' : 'waves';
+    if (mode === stageMode) return;
+    stageMode = mode;
+    root.dataset.stage = mode;
+    mixer.setVideo(mode === 'video');
+    if (locked) {
+      locked = false;
+      lockFor = 0;
+      R.lock.classList.remove('is-on');
+    }
+    for (let i = 0; i < 2; i++) qRemain[i] = -2;
+    vsBottom = -1;
+    setCrate(false, false); // drawer or page content, depending on the mode
+    if (mode === 'video') syncVsBottom();
+    else waves.invalidate();
+  }
+
+  /**
+   * The element deck `deck`'s YouTube player lives in: created once, never moved or re-created by the
+   * view. Mount the player INSIDE it (the IFrame API replaces the element it is given with its iframe,
+   * so hand it a child, not the slot). The slot is ≥ 200×200 CSS px in video mode; its children are
+   * stretched to fill it.
+   * @param {0|1} deck
+   */
+  const videoSlot = (deck) => vstage.slot(deck === 1 ? 1 : 0);
+
   function destroy() {
     document.removeEventListener('keydown', onKey);
+    window.removeEventListener('resize', onResize);
     attract.stop();
     mixer.destroy();
     deckUi[0].destroy();
     deckUi[1].destroy();
+    vsRo.disconnect();
   }
 
   return {
@@ -774,8 +1004,10 @@ export function createView(root, handlers) {
     toast,
     inputError,
     frame,
+    setStageMode,
+    videoSlot,
     destroy,
-    /** @internal test hook: waveform tile-cache statistics */
-    _debug: () => ({ waves: waves._stats() }),
+    /** @internal test hook: waveform tile-cache statistics, the video stage */
+    _debug: () => ({ waves: waves._stats(), stage: stageMode, vstage: vstage._state() }),
   };
 }

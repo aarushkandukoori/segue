@@ -3,9 +3,9 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://api.deezer.com; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://api.deezer.com https://www.youtube.com; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-src https://www.youtube-nocookie.com https://www.youtube.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>Segue — your playlist, DJ’d live</title>
-    <meta name="description" content="Paste a Spotify playlist link and Segue mixes it live in your browser: beat-matched blends, bass swaps, filter sweeps and drops. Never the same set twice.">
+    <meta name="description" content="Paste a Spotify playlist link and Segue mixes it live in your browser: full songs through YouTube’s player, or 30-second previews with beat-matched blends, filter sweeps and drops. Never the same set twice.">
     <meta name="theme-color" content="#09090b">
     <meta name="color-scheme" content="dark">
     <meta name="referrer" content="strict-origin-when-cross-origin">
@@ -30,6 +30,7 @@
 
     <link rel="stylesheet" href="./css/style.css">
     <link rel="stylesheet" href="./css/stage.css">
+    <link rel="stylesheet" href="./css/video.css">
     <!-- Web fonts (Google Fonts) are optional. media="print" keeps this request from holding up the first
          paint or the app when the font host is slow or unreachable; js/ui/fonts.js switches the sheet on
          once it has loaded, and css/style.css names the system fonts used until (or instead of) that. -->
@@ -53,11 +54,11 @@
         </header>
         <section class="l-hero">
           <h1 class="l-title"><span class="l-title-1">Your playlist,</span> <span class="l-title-2">DJ’d live.</span></h1>
-          <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue mixes every track into the next: beat-matched blends where the tempos line up, echo-outs, cuts and drops where they don’t. A different mix each time you press play.</p>
+          <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue mixes every track into the next: full songs in YouTube’s player, or 30-second previews beat-matched with blends, echo-outs, cuts and drops. A different mix each time you press play.</p>
           <noscript><p class="l-sub">Segue mixes audio in your browser, so it needs JavaScript turned on.</p></noscript>
         </section>
         <footer class="l-foot">
-          <p>Segue mixes 30-second previews (from Deezer / Apple). Local files play full length. Not affiliated with Spotify.</p>
+          <p>Full songs play in YouTube’s embedded player, ads included. Preview mode mixes 30-second clips from Deezer / Apple, beat-matched. Your own files play full length. Not affiliated with Spotify, Deezer, Apple or YouTube.</p>
         </footer>
       </main>
     </div>

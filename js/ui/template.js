@@ -56,6 +56,20 @@ const fader = (name) => `
         <span class="ch-id">${name}</span>
       </div>`;
 
+// One video deck: a stable slot the integrator mounts a YouTube player in, and everything the deck has
+// to say (letter, status, title, progress) laid out AROUND that rectangle, never on top of it.
+const vdeck = (i, name) => `
+    <div class="vdeck vdeck-${name.toLowerCase()}" data-vdeck="${i}" data-deck="${i}" data-status="empty">
+      <div class="vscreen"><div class="vslot" data-ref="vslot${i}" data-letter="${name}"></div></div>
+      <div class="vbar" aria-hidden="true"><i class="vbar-fill"></i><i class="vbar-leave"></i></div>
+      <div class="vinfo">
+        <p class="vhead"><span class="deck-id">${name}</span><span class="vstatus" data-part="status">Empty</span></p>
+        <p class="vtitle" data-part="title">Waiting for a track</p>
+        <p class="vartist" data-part="artist"></p>
+        <p class="vtime" data-part="time"></p>
+      </div>
+    </div>`;
+
 const deck = (i, name) => `
     <section class="deck deck-${name.toLowerCase()} is-empty" data-ref="deck${i}" data-deck="${i}" aria-label="Deck ${name}">
       <div class="deck-body">
@@ -81,7 +95,7 @@ const deck = (i, name) => `
         </div>
         <h2 class="deck-title" data-part="title">Waiting for a track</h2>
         <p class="deck-artist" data-part="artist">The next one lands here</p>
-        <div class="deck-ov" aria-hidden="true"><canvas></canvas><i class="ov-played"></i><i class="ov-head"></i></div>
+        <div class="deck-ov" aria-hidden="true"><canvas></canvas><i class="ov-played"></i><i class="ov-leave"></i><i class="ov-head"></i></div>
         <div class="deck-stats">
           <div class="stat stat-bpm"><b class="num" data-part="bpm">–</b><span class="unit">BPM</span><span class="pitch" data-part="pitch"></span></div>
           <div class="stat stat-key"><span class="keyname" data-part="keyname"></span><b class="keychip" data-part="key">–</b></div>
@@ -106,7 +120,7 @@ export const TEMPLATE = `
 
   <section class="l-hero">
     <h1 class="l-title"><span class="l-title-1">Your playlist,</span> <span class="l-title-2">DJ’d live.</span></h1>
-    <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue mixes every track into the next: beat-matched blends where the tempos line up, echo-outs, cuts and drops where they don’t. A different mix each time you press play.</p>
+    <p class="l-sub"><span class="l-sub-tag">Never the same set twice.</span> Paste a link and Segue mixes every track into the next: full songs in YouTube’s player, or 30-second previews beat-matched with blends, echo-outs, cuts and drops. A different mix each time you press play.</p>
 
     <form class="l-form" data-ref="form" novalidate>
       <label class="sr-only" for="segue-input">Spotify playlist link</label>
@@ -136,7 +150,7 @@ export const TEMPLATE = `
       <input class="sr-only" id="segue-files" data-ref="file" type="file" multiple accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.aif,.aiff,.webm">
       <span class="l-card-ic">${ICONS.files}</span>
       <h2 class="l-card-title">Your own files</h2>
-      <p class="l-card-text">Full-length sets from your own files. Drop audio anywhere on this page — nothing is uploaded.</p>
+      <p class="l-card-text">Mix your own audio at full length. Drop files anywhere on this page — nothing is uploaded.</p>
       <label class="btn btn-ghost" for="segue-files">Choose audio files</label>
     </div>
 
@@ -161,7 +175,7 @@ export const TEMPLATE = `
   </section>
 
   <footer class="l-foot">
-    <p>Segue mixes 30-second previews (from Deezer / Apple). Local files play full length. Not affiliated with Spotify.</p>
+    <p>Full songs play in YouTube’s embedded player, ads included. Preview mode mixes 30-second clips from Deezer / Apple, beat-matched. Your own files play full length. Not affiliated with Spotify, Deezer, Apple or YouTube.</p>
   </footer>
 
   <div class="dropveil" data-ref="dropveil" hidden><div><span class="l-card-ic">${ICONS.files}</span><p>Drop to start a full-length set</p></div></div>
@@ -242,10 +256,10 @@ export const TEMPLATE = `
 
     <!-- The legend names the group for assistive tech; the label the eye sees is an ordinary element, so
          it can sit above the options (wide) or beside them (compact) without fighting <legend> layout. -->
-    <fieldset class="tp-mode" data-ref="mode">
+    <fieldset class="tp-mode" data-ref="mode" aria-describedby="segue-mode-hint">
       <legend class="sr-only">Track length</legend>
       <div class="tp-mode-body">
-        <span class="lbl tp-mode-lbl" aria-hidden="true">Track length<span class="tp-mode-lock" data-ref="mode-lock">${ICONS.lock}</span></span>
+        <span class="lbl tp-mode-lbl" aria-hidden="true">Track length<span class="tp-mode-hint" id="segue-mode-hint" data-ref="mode-hint"></span></span>
         <div class="seg">
           <label><input type="radio" name="segue-mode" value="preview"><span>Preview</span></label>
           <label><input type="radio" name="segue-mode" value="short"><span>Short</span></label>
@@ -254,8 +268,6 @@ export const TEMPLATE = `
         </div>
       </div>
     </fieldset>
-    <!-- Stands in for the locked control on compact layouts: one labelled thing to tap, which says why. -->
-    <button type="button" class="tp-mode-note" data-ref="mode-note" hidden>${ICONS.lock}<span>30 s previews</span></button>
 
     <div class="tp-vol">
       <button type="button" class="iconbtn" data-ref="mute" aria-label="Mute" aria-pressed="false">${ICONS.volume}</button>
@@ -264,6 +276,22 @@ export const TEMPLATE = `
 
     <button type="button" class="tp-crate" data-ref="crate-toggle" aria-expanded="false" aria-controls="segue-crate">${ICONS.list}<span>Setlist</span></button>
   </div>
+
+  <!-- Full songs: the two YouTube players. Outside the booth, so nothing in its scrolling area can slide
+       under them; only shown in video mode (CSS), never moved or re-created. On a short phone (and a
+       phone on its side) the whole page scrolls and they move up with it like any page content — the
+       app itself never scrolls them out of view (the setlist opens as a sheet below them there). -->
+  <section class="vstage" data-ref="vstage" aria-label="Video decks: deck A left, deck B right">
+${vdeck(0, 'A')}
+${vdeck(1, 'B')}
+    <!-- The first song waiting for its ad, on a short phone / a phone on its side, where the ticker that
+         explains it is below the fold: the same in one short line, with the way out, between (upright) or
+         under (on its side) the two screens — never on them. Shown by the CSS only there. -->
+    <div class="vs-start" data-ref="vs-start" hidden>
+      <p class="vs-start-why" data-ref="vs-start-why"></p>
+      <button type="button" class="vs-start-act" data-ref="vs-start-act">Play previews instead</button>
+    </div>
+  </section>
 
   <main class="booth" data-ref="booth">
 ${deck(0, 'A')}
@@ -285,6 +313,7 @@ ${deck(1, 'B')}
       </div>
       <ol class="tk-marks" data-ref="tk-marks" aria-hidden="true"></ol>
       <div class="tk-count"><span class="lbl" data-ref="tk-count-lbl"></span><b data-ref="tk-count"></b></div>
+      <button type="button" class="tk-act" data-ref="tk-act" hidden>Play previews instead</button>
       <div class="tk-bar" aria-hidden="true"><i class="tk-fill" data-ref="tk-fill"></i><div class="tk-notches" data-ref="tk-notches"></div></div>
       <p class="sr-only" aria-live="polite" data-ref="tk-live"></p>
       <p class="sr-only" aria-live="polite" data-ref="tk-trick-live"></p>
@@ -301,6 +330,7 @@ ${deck(1, 'B')}
         <div class="ch ch-b" data-ch="1">${knobs()}${fader('B')}
         </div>
       </div>
+      <p class="mx-note" data-ref="mx-note" title="EQ works on previews — YouTube audio can’t be processed" hidden>EQ &amp; filters work on previews only</p>
       <div class="xf" aria-hidden="true">
         <span class="xf-end xf-a">A</span>
         <div class="xf-slot" data-ref="xf"><i class="xf-cap" data-ref="xf-cap"></i></div>

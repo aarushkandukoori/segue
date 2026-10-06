@@ -24,10 +24,12 @@ it in your `handoff/<area>.md` so the integrator sees it.
   `cancelAndHoldAtTime` without a fallback (Firefox lacks it). No negative `playbackRate` (Chrome
   outputs silence).
 - The page runs under a Content-Security-Policy (`index.html`, same in `ui-demo.html`): scripts from
-  `'self'` and `https://api.deezer.com` (JSONP) only, no inline script or style (`style="…"` attributes
-  and `<style>` elements are refused; CSSOM writes are fine), `connect-src 'self' https:`, images
-  `'self'` / `https:` / `data:` / `blob:`, media `blob:` only, workers `'self'` only, fonts from Google Fonts,
-  `object-src` / `base-uri` / `form-action` `'none'`.
+  `'self'`, `https://api.deezer.com` (JSONP) and `https://www.youtube.com` (the IFrame Player API) only,
+  frames from `https://www.youtube-nocookie.com` / `https://www.youtube.com` only, no inline script or
+  style (`style="…"` attributes and `<style>` elements are refused; CSSOM writes are fine),
+  `connect-src 'self' https:`, images `'self'` / `https:` / `data:` / `blob:`, media `blob:` only, workers
+  `'self'` only, fonts from Google Fonts, `object-src` / `base-uri` / `form-action` `'none'`. Exactly:
+  `default-src 'self'; script-src 'self' https://api.deezer.com https://www.youtube.com; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-src https://www.youtube-nocookie.com https://www.youtube.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'`
 - Code style: small pure functions, JSDoc types on exports, no classes needed, no frameworks. Comments
   explain *why*, not what. `node --test` for pure logic; headless Chrome (puppeteer-core) for anything
   touching Web Audio / DOM / network-from-a-browser.
@@ -56,12 +58,16 @@ css/style.css (+ more)          [ui]
 ui-demo.html                    [ui]    mock-driven harness for the view (no audio)
 js/main.js                      [integrator]  bootstrap: view <-> conductor wiring, URL params, rAF loop
 js/util/rng.js                  [brain]
+js/util/{timers,timer-worker}.js   [integrator]  the full-song clock: timers on a dedicated worker (not throttled in a background tab), §6.4
 js/sources/{spotify,deezer,itunes,resolver,local,text,demo,index}.js   [sources]
 js/analysis/{dsp,tempo,grid,key,features,analyze,worker,client}.js      [analysis]  grid.js = beat grid vs. the audible attacks (Analysis.grid)
 js/dj/timeline.js               [foundation — DONE, do not change semantics]
 js/dj/{camelot,transitions,planner}.js   [brain]
 js/dj/{engine,fx,recorder}.js   [engine]
-js/dj/conductor.js              [integrator]
+js/dj/conductor.js              [integrator]  previews + local files (Web Audio)
+js/dj/fullset.js                [integrator]  full songs (YouTube decks), §6
+js/dj/{ytdeck,videomix}.js      [engine] / [brain]  §6
+js/sources/youtube.js           [sources]  §6
 js/ui/*.js                      [ui]    (fonts.js switches the deferred Google Fonts stylesheet on; no other module touches the network)
 tests/*.test.js                 node --test (each area prefixes its files: analysis.*.test.js, dj.*.test.js, sources.*.test.js)
 tests/helpers/*.js              synthetic analyses / audio, and the evaluations on real previews (need tests/fixtures; skip without)
@@ -444,7 +450,9 @@ small crates). Skip = `engine.cancelFrom(now)` + `planner.next(…, {earliest: n
 only when a single track is playing. Tracks that fail to resolve/decode are marked failed and skipped;
 network failures stay retryable once the crate has produced a track. URL:
 `?p=<playlist id>&seed=<seed>&vibe=<0..1>` reproduces a set (a link without `vibe` means 0.5; the
-recipient's own stored vibe is neither used nor overwritten).
+recipient's own stored vibe is neither used nor overwritten). Since §6 the URL also carries
+`&len=<preview|short|medium|full>`; a link without `len` was made before full songs existed and means
+`preview`.
 
 As built, beyond the paragraph above (`createConductor({engine, analyzer, resolver, decode})`):
 
@@ -473,3 +481,354 @@ pushes one entry, so Back returns to the start screen; seed / vibe changes and N
 - **P1** — skip, vibe control, share link with seed, local files (full-length), text paste, setlist with
   "open in Spotify" links, Media Session, record/download the set.
 - **P2** — nice-to-have polish.
+
+## 6. Full songs (YouTube) — added 2026-10-05
+
+Goal: Short / Medium / Full track lengths work for **every** playlist (Spotify, Deezer, pasted text), not
+only for local files, by playing full songs through YouTube's official embedded player. Preview mode
+(30-second clips through Web Audio, beat-matched) stays exactly as it is.
+
+### 6.1 Verified facts (headless Chrome, 2026-10-05; see `handoff/yt/` scratch)
+
+| Thing | Result |
+|---|---|
+| YouTube search page `https://www.youtube.com/results?search_query=<q>` via relay 2 (`r.jina.ai`, header `X-Return-Format: html`) | 200, CORS ok, ~1.3 MB HTML containing `var ytInitialData = {…};</script>`. Walk it for `videoRenderer` objects: `videoId`, `title.runs[].text`, `ownerText.runs[].text` (channel), `lengthText.simpleText` ("4:40"), `ownerBadges[].metadataBadgeRenderer.style` (`BADGE_STYLE_TYPE_VERIFIED_ARTIST` / `…_VERIFIED`). For "Calvin Harris Blessings KETTAMA remix" the first hit was the artist's own "(KETTAMA Remix - Official Audio)", verified artist, 4:40. |
+| Same URL via relay 1 (`web.scraper.workers.dev`, `selector=script`, `scrape=text`) | 200, CORS `*`, JSON `{result:{script:[…texts]}}`; one text holds `var ytInitialData = …`. |
+| Invidious / Piped public instances | all failing (401/403/526). Do not use. |
+| oEmbed `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=<id>&format=json` | CORS ok (reflects origin). 200 for embeddable public videos; 401/403/404 for private / removed / some non-embeddable. Not a full guarantee (label blocks show only at play time). |
+| IFrame Player API (`https://www.youtube.com/iframe_api`, `new YT.Player(el, {videoId, host, playerVars})`) | Works in Chrome with `host: 'https://www.youtube-nocookie.com'` (privacy-enhanced). Two players in one page can play at once. The nocookie host does **not** keep the visit cookie-free (next row). |
+| **Third-party cookies** (re-measured 2026-10-05: fresh Chrome profile, page served as the real site, share link, no tap; `Storage.getCookies` over CDP) | A plain home-page visit: **none**. The top page's own request for `www.youtube.com/iframe_api` answers with ~7 `Set-Cookie` on `.youtube.com` (`VISITOR_INFO1_LIVE`, `__Secure-YNID`, `VISITOR_PRIVACY_METADATA`, `__Secure-ROLLOUT_TOKEN` ≈ 6 months, `YSC` session) and no `Access-Control-Allow-Origin`, so `crossorigin="anonymous"` is not an option. The nocookie players' ad beacons (`www.youtube.com/pagead/adview`, `/pagead/interaction/`) carry those cookies; the ads set `.doubleclick.net` `IDE` (≈ 13 months), `APC`, `test_cookie` (depends on the ad). Deezer's JSONP script (`api.deezer.com`, every playlist but local files) sets `.deezer.com` `dzr_uniq_id` (≈ 6 months). Fetches (relays, oEmbed, iTunes) use `credentials: 'omit'` and set nothing. Loading the API only after the tap would break the muted pre-roll, so this is disclosed (README *Privacy*), not avoided. |
+| **Origin matters** | Label music (e.g. official Calvin Harris uploads) gives **error 150 on `http://127.0.0.1`** but plays on `https://aarushkandukoori.github.io`. Tests must serve the app under the real origin (request interception, see 6.6). |
+| **Pre-roll ads** | On the real origin every music video shows 1-2 pre-roll ads, 20-40 s in total (measured 20 s and 37 s). During an ad: `getPlayerState() === -1`, `getCurrentTime()` counts the AD's time, `getDuration()` already reports the song, `getVideoData().video_id` is the song, `seekTo` is ignored. The song has started when the state first becomes `1` (PLAYING). |
+| Muted pre-roll without any user gesture | Works: `mute(); playVideo()` on a fresh player plays the ads muted and then the song. After that, `pauseVideo(); seekTo(0, true)` holds it at the start; a later `unMute(); setVolume(100); playVideo()` plays with sound (no new ad, state 1 after ~0.3 s) — also with no gesture in that iframe, because the API's iframe carries `allow="autoplay"` and the top page has had a user tap. |
+| `loadVideoById` on a used player | Plays new ads for the new video. |
+| Background tab | A playing video keeps playing (time advanced 3.98 s in 4 s while another tab was in front). That run, like every e2e run by default, had hidden-tab throttling switched off: puppeteer itself passes `--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows` and `--disable-renderer-backgrounding`. With them removed (`launch({realBackground: true})`, 6.6) a hidden tab's 20 Hz `setInterval` runs once a second (measured 1.0/s against 19.8/s) — also while it plays Web Audio, because the harness's `--mute-audio` leaves Chrome nothing it hears; Chrome documents that it does not throttle a tab that is audibly playing. **Re-measured 2026-10-06** with `launch({realBackground: true})`: a player playing *unmuted at volume 0* runs its ads on in a hidden tab, cues there and starts new videos there; its `<video>` reads volume 0.00 throughout (sampled inside the player's frame at every media event). Chrome also lets such a pre-roll run before any gesture. A muted-only pre-roll in a hidden tab was held still in earlier probes and crawled at about half speed in these runs. Page timers of a hidden tab under `--mute-audio` fired **once a minute** after a few minutes (gaps of 60 s — Chrome's intensive throttling of a silent tab), so a conductor ticking on `setInterval` ran its hand-overs up to a minute late; timers in a dedicated Worker were not throttled (0 gaps in 300 s). |
+| `setPlaybackRate(1.05)` | Accepted (getPlaybackRate 1.05) but no beat grid exists for the full song, so it is not used. |
+| No audio access | The audio of a cross-origin iframe never enters our AudioContext: no EQ / filters / FX on it, no analysis of the full song, the master meter and the recorder do not hear it. Volume is the only control (0-100, linear). iOS ignores volume (mute/unmute only). |
+
+### 6.2 Policy constraints (YouTube API Services terms — design rules, not optional)
+
+- The player stays **visible, at least 200×200 CSS px, fully opaque**, never covered: no element may be
+  drawn over any part of the player rectangle (labels, progress, badges go *outside* it). Never
+  `display:none`, `visibility:hidden`, opacity < 1, off-screen, or clipped. Do not hide or skip ads; the
+  cued deck shows its ad (muted) in plain view.
+- Never move a player's iframe in the DOM after creation (that reloads it) — the view gives each deck
+  a stable slot element.
+- Use only the official IFrame API; no stream extraction, no audio capture.
+- README must say plainly that full songs come from YouTube's embedded player, ads included, and that
+  silent pre-loading of the next song (muted before the first tap, unmuted at volume 0 after it) is how
+  the mix avoids ad breaks (a grey area under YouTube's terms for anything commercial).
+- README *Privacy* must name every site that leaves cookies, in the same bullet as the word "cookie", and
+  say that a share link sets them before any tap. The players get only this page's origin and path, never
+  the playlist link or the set's seed, vibe or length: the deck builds its own iframe
+  (`youTubeEmbedUrl(host, location)`: `origin` + `widget_referrer` = origin + path, the iframe's
+  `referrerpolicy` strict-origin-when-cross-origin) instead of letting the IFrame API copy `location.href`
+  into it as `forigin`, and README says so. Its relay-hedge delays must match `HEDGE_MS` in
+  `js/sources/youtube.js` and `js/sources/spotify.js`. `tests/e2e/privacy.e2e.mjs` checks all of it
+  against a real run.
+
+### 6.3 Modes and engines
+
+| playlist source | mode `preview` | modes `short` / `medium` / `full` |
+|---|---|---|
+| spotify / deezer / text | existing `conductor.js` + Web Audio engine (unchanged) | **new `fullset.js`** with two YouTube decks |
+| local files | not offered | existing `conductor.js` (full-length local audio, unchanged) |
+
+Default mode = `prefs.mode` (default `'medium'`), so full songs are the default for every playlist.
+Leave points: short ≈ 45 s, medium ≈ 90 s (seeded ±, bar-snapped from the start when the BPM is known),
+full = the song's end minus a seeded outro guard (8-20 s) minus the transition. Changing mode between
+`preview` and a full-song mode mid-set hands over between the two conductors (main.js), without a gap
+when possible. Share links carry `&len=<mode>`.
+
+As built (main.js):
+
+- `prefs.mode` (`'preview' | 'short' | 'medium' | 'full'`, default `'medium'`) is the length every
+  playlist starts at; a share link's `len` is used for that set only (like its vibe). Local files never
+  play `preview` (the view greys it; `medium` is used).
+- Full songs skip the "Start the set" screen: the stage (video mode) shows at once, because the first
+  song's pre-roll ad must run in a visible player — and it needs no gesture (muted). A share link waits
+  for a tap on Play there; a pasted link / demo tap already was the gesture.
+- The two YouTube decks are created once (`createYouTubeDeck(view.videoSlot(i))`, which loads the IFrame
+  API) when a full-song set first needs them, and kept; leaving video mode (Preview, the start screen)
+  stops them first (`deck.stop()`: paused + muted), then `view.setStageMode('waves')`. The full-song set
+  has its own Web Audio engine (`videoEngine`: risers / impacts, preview fallback), so the two conductors
+  can overlap during a hand-over without sharing a clock.
+- Hand-over Preview ↔ full songs: the playing side keeps playing; the other side loads the same playlist
+  with the same seed and vibe (autostart) and starts silent; once its first track sounds, a 3-second
+  crossfade (Web Audio master volume vs. the decks' volume, ramped by main.js at 20 Hz), then the old side
+  is stopped. Into full songs that wait includes the first song's ad (the previews play on under the
+  video stage meanwhile); into previews it is the few seconds the preview conductor needs. With nothing
+  playing yet it is a plain swap. Flipping back while a hand-over is pending cancels it.
+- The hand-over does not restart the order, in either direction: main.js passes
+  `carry: {played, elapsed, at, live}` to the other side's `load` — `played` = the track ids played or on
+  air, oldest first; `elapsed` = the set's Elapsed; `at` = `performance.now()` of the switch; `live` = the
+  old side plays on (a hand-over, not a swap). `conductor.load` and `fullset.load` take the played ids
+  out of the first pass, list them as `'played'` setlist rows keyed `` `${trackId}|c${i}` ``, count them as
+  recent for the next pass, and continue Elapsed. With `live`, Elapsed keeps running through the wait
+  (the first song's ad / the first clip) and is fixed at the first sound. *New set* clears the carried
+  rows and Elapsed.
+- *Play previews instead* (the `starting` TransitionView action) calls `handlers.onPreviewOnce()`:
+  main.js hands this set over to previews without writing `prefs.mode`, so the next playlist plays the
+  stored length (6.5).
+- `fullset` emits `unavailable` when YouTube cannot work here at all (the IFrame API failed to load;
+  the first three lookups all failed on the network; three songs in a row whose every upload refused to
+  embed, before any cue succeeded — what label music does on `http://127.0.0.1`; three failed cues
+  before any success): main.js hands the set to Preview with a toast that says why.
+- REC is disabled in video mode (`recordEnabled: false`, `recordWhy`), Media Session follows the active
+  set, `window.__segue` exposes `conductor`, `fullset`, `engine`, `videoEngine`, `finder`, `active`,
+  `decks`, `handoff`, `workerClock` for the tests.
+
+### 6.4 Module APIs (new)
+
+```js
+// js/sources/youtube.js                                                          [sources]
+export function parseYouTubeSearch(text: string): YtCandidate[]      // pure; accepts the HTML page or the relay-1 JSON
+/** @typedef {{videoId:string, title:string, channel:string, durationS:number|null, verifiedArtist:boolean, verified:boolean, topic:boolean}} YtCandidate */
+export function scoreVideo(track: TrackMeta, c: YtCandidate): number  // pure, 0..1
+export function createYouTubeFinder(cfg?: {fetchText?, storage?}): {
+  find(track: TrackMeta, opts?: {signal}): Promise<{videoId, title, channel, durationS, score, alternates: string[] /*next best ids*/}>,  // throws ResolveError('no-match'|'network')
+  search(query: string, opts?: {signal}): Promise<YtCandidate[]>,
+}
+// js/dj/ytdeck.js                                                                [engine]
+export function loadYouTubeApi(opts?: {timeoutMs?}): Promise<any>      // injects https://www.youtube.com/iframe_api once
+export function youTubeEmbedUrl(host: string, loc: {origin, pathname}): string
+  // the deck's own embed URL: PLAYER_VARS (playsinline 1, controls 0, disablekb 1, rel 0, iv_load_policy 3,
+  // fs 0, cc_load_policy 0, enablejsapi 1, mute 1) + origin + widget_referrer = origin + path. Never the
+  // query or hash (the API itself would send location.href as forigin).
+export function createYouTubeDeck(slot: HTMLElement, opts?: {host?: string, onChange?: (deck) => void, apiTimeoutMs?: number,
+                                  timers?: {setTimeout, clearTimeout} /* what it polls its player on; main.js: js/util/timers.js */}): {
+  // builds its own <iframe> (src = youTubeEmbedUrl(host, location), referrerpolicy strict-origin-when-cross-origin,
+  // the API's allow list) in place of a placeholder in `slot`, then hands it to YT.Player; never moved or hidden
+  readonly state: 'empty'|'loading'|'ad'|'cued'|'playing'|'paused'|'ended'|'error',
+  readonly videoId: string|null, readonly duration: number, readonly error: number|null,
+  readonly adSeconds: number,      // pre-roll ad seconds of the current / last cue, counted only while the ad's own
+                                   // clock moves (not wall time: Chrome slows or holds a muted ad in a hidden tab)
+  readonly ready: boolean, readonly muted: boolean, readonly volume: number, readonly iframe: HTMLIFrameElement|null,
+  readonly unmutedHold: boolean,   // an unmuted pre-roll / cued song held at volume 0 until play()
+  readonly heldBack: number,       // starts the deck did not ask for, paused back (see below)
+  cue(videoId, opts?: {at?: number, timeoutMs?: number, unmuted?: boolean}): Promise<void>,
+      // pre-roll → 'cued' (song held at `at`); rejects DeckError {code}. Muted by default. unmuted: true runs the
+      // pre-roll unmuted at volume 0: setVolume(0), unMute(), setVolume(0), then loadVideoById (the last call undoes
+      // YouTube restoring volume 5 on unMute). The volume stays 0 until play(): setVolume() during the pre-roll is
+      // remembered, not sent; a player found unmuted above 0 is set back to 0 at most every 600 ms. Ignored on
+      // iOS / iPadOS (the volume is ignored there). If the browser refuses sound (onAutoplayBlocked, or a pre-roll
+      // that has not moved for 6 s with the page in front) the pre-roll goes on muted. A cue that fails 'blocked', or times out,
+      // is also cancelled with stopVideo().
+  unlock(): boolean,               // call inside the user's tap: a running muted pre-roll goes on unmuted at volume 0.
+                                   // true when the pre-roll is (now) unmuted at 0; false with no pre-roll, or on iOS / iPadOS
+  play(opts?: {volume?: number}): Promise<void>,   // unMute + the requested volume (100 if never set) + playVideo; resolves at PLAYING
+  pause(), resume(): Promise<boolean>, seek(s: number),
+  stop(),                          // pause + mute; a cue in progress is abandoned and cancelled with stopVideo() (→ 'empty');
+                                   // a deck in 'error' gets stopVideo() too, which clears YouTube's error screen (the deck
+                                   // stays 'error' with its code), and so does one whose play() was pending or timed out
+  setVolume(v: number),            // 0..1 → player 0-100, only sent when the rounded value changes
+  position(): number,              // song time, extrapolated between player reports
+  prime(): void,                   // call inside the Start tap (iOS media unlock); keeps an unmuted hold at volume 0
+  destroy(): void,
+  debug(): object,                 // adds silentHold, unmutedPreroll, fellBack ('refused'|'stalled'|'player'|''), heldBack, captionsOffFor …
+}
+// Pause-back: the deck is the only one that may start its player. A start nobody asked for — the play button
+// YouTube draws on a cued player, a stopped player that went on anyway, a player that plays while the deck is in
+// 'error' or 'empty' — is muted and paused back (a cued deck stays at its cue point); heldBack counts each one.
+// Captions: cc_load_policy 0, and YouTube's auto-generated captions are unloaded for each song once it plays
+// (and once more 1 s later): YouTube switches them on for these embeds and controls 0 leaves no way to turn them off.
+// During an ad they stay on (measured 2026-10-06 in the app: isSubtitlesOn() true and caption segments drawn in
+// 256 of 278 one-second samples of pre-roll ads on both decks); the module calls do nothing there.
+// js/dj/videomix.js  — pure, deterministic                                       [brain]
+export function planVideoTransition(input: {
+  seed, vibe, mode: 'short'|'medium'|'full', playIndex: number, prevType?: string, quick?: boolean,
+  reason?: 'skip'|'newset',                          // a quick plan's why ends in 'skipped' (default) or 'new set'; the plan is otherwise identical
+  earliest: number,                                  // set time; nothing may happen before it
+  out: {id, durationS, startedAt /*set time its position 0 was (or would have been) heard*/, bpm?, bpmConfidence?, energy?, provider: 'youtube'|'preview'},
+  inc: {id, durationS, bpm?, bpmConfidence?, energy?, provider: 'youtube'|'preview'},
+}): VideoTransition
+/** @typedef {{ type: 'longBlend'|'crossfade'|'fadeDrop'|'riserDrop'|'cut', label: string, why: string,
+ *   tStart: number, tEnd: number,          // set time
+ *   leaveAt: number,                       // outgoing song position at tStart
+ *   incAt: number,                         // incoming song position when it starts (usually 0)
+ *   incStart: number,                      // set time the incoming starts playing (≥ tStart - small lead)
+ *   outVol: {t:number, v:number}[], incVol: {t:number, v:number}[],   // linear 0..1 volume breakpoints, set time, linear interpolation between points
+ *   fx: Fx[],                              // only 'riser' / 'impact' (Web Audio, layered on top)
+ *   marks: {t:number, label:string}[] }} VideoTransition */
+export function leavePoint(input): number   // song position where a track in this mode is left (exported for the conductor's "upcoming" display)
+// js/dj/fullset.js — the full-song conductor                                     [integrator]
+// same public surface as conductor.js (on, load, begin, newSet, stop, skip, pause, resume, setVibe, setMode,
+// setVolume, audioState, canSkip, snapshot, history, debug, destroy) plus frame(t, out): fills a FrameState-like object.
+```
+
+As built:
+
+```js
+createFullSet({engine, finder, decks /* [deckA, deckB] or () => them */, resolver?, analyzer?, decode?, clock?, timers?, volumeWorks?, hidden?})
+load(playlist, {seed?, vibe?, mode?: 'short'|'medium'|'full', autostart?, carry?})  // autostart: a gesture happened, play as soon as cued; carry: 6.3
+begin()                 // the tap: the opener plays as soon as it is cued (now, if it is)
+newSet(seed?), stop(), skip(): boolean, pause(), resume(), setVibe(v), setMode(m), setVolume(v /*0..1*/)
+canSkip(), snapshot(), history(), debug(), frame(t, out), now() /*set time*/, tick(), poke(), destroy()
+on('start'|'change'|'status'|'skip'|'error'|'unavailable'|'notice', fn)    // notice: {message, kind} for a toast
+seed, started, paused, pausedByUser, vibe, mode, needsTap, onAir            // getters
+export FULL_MODES, LOOKAHEAD (3), TICK_MS (50), FX_LEAD (1.5), SWAP_AFTER_S (15), SILENT_WAIT_S (12), STALL_S (3)
+```
+
+The Preview conductor (`conductor.js`) gains the same carry: `load(pl, {…, carry: {played, elapsed, at?, live?}})`,
+`snapshot().elapsed` = set time + carried time, and `elapsedAt(t)` for the per-frame value (main.js `frame()` uses it).
+
+- **Order and preparation.** `planner.order(ids)` with the seed; passes as in conductor.js
+  (`nextCycleOrder`), every track once per pass, never the same song twice in a row. Videos are looked up
+  for the two plays in hand plus the next `LOOKAHEAD` tracks (two lookups at a time; the finder itself
+  searches one at a time). Previews (resolver → fetchAudio → decode → analyzer) one at a time for the
+  same window, fallbacks first. The next song is the first track of the order that has settled (waits for
+  it, so a seed gives the same songs), or — when the song on air is within 50 s of its way out — the first
+  one that is ready.
+- **Pre-roll.** Before the start deck A cues the opener and deck B the second song at once (both ads run
+  in parallel). After every hand-over the freed deck cues the next song immediately. Once the page has
+  had a gesture (and not on iOS) every cue is `{unmuted: true}` (volume 0), and the tap calls
+  `deck.unlock()` on pre-rolls still running muted (a share link before its tap). When to give up on a
+  pre-roll is decided by the conductor (`cueWatch`; the deck's own deadline is a 15-minute backstop), on
+  the time the page was **in front**: 180 s for the opener; for a next song the time the song on air still
+  runs + 15 s, within 120-300 s. A player that got nowhere by then → its next upload (a fresh ad); an ad
+  that is still moving (its `adSeconds` grew within the last 4 s) gets up to 240 s more, then the song's
+  preview. Ad pods of 120-250 s were measured.
+- **Opener swap** (`SWAP_AFTER_S` = 15): before the start, when the second song is cued and the opener is
+  still in its pre-roll 15 s later, the set opens with the second song and the opener's pre-roll goes on as
+  the next song. The seeded order changes only by swapping its first two songs.
+- **Silence.** Once the music has stopped (a song ended) and the incoming has been waited for
+  `SILENT_WAIT_S` (12 s of set time) still in its ad, its ready preview plays instead (the upload is not
+  refused or forgotten: the ad did nothing wrong).
+- **Buffering.** The song on air standing still for `STALL_S` (3 s) while its player says it plays is a
+  network stall: `snapshot().stalled = 'network'` and the ticker says so; YouTube picks the song up by
+  itself.
+- **Clock.** Set time = wall time since the opener's first sound minus pauses (YouTube plays in wall
+  time). Engine things are converted at the moment they are handed over (`engine.now() + (t − now())`)
+  and only `FX_LEAD` before they happen; nothing is re-planned or skipped once handed over (and not within
+  2 s of a transition's start). The ticker runs on `deps.timers` when it is an object
+  (`{setInterval, clearInterval}`): main.js passes `createTimers()` from `js/util/timers.js`, the timers of
+  a dedicated worker (`js/util/timer-worker.js`) that fire in the page as messages, and gives the same
+  timers to both decks (`createYouTubeDeck(slot, {timers})`, their polls) and to the hand-over ramp. A
+  hidden page's own timers fired once a minute (6.1); with the worker clock the hand-overs in a hidden tab
+  started 0.3 s after plan (full.e2e `background`, 2026-10-06). Without a Worker (or when it fails) the
+  page's timers are used. `window.__segue.workerClock` says which.
+- **Background tab.** A pre-roll whose ad clock grew within the last 20 s (`AD_HELD_MS`; `adSeconds`,
+  hidden or not — the gap between two ads of a pod, or the ad buffering, stops the clock for seconds;
+  the deck's `'loading'` while it holds the song at 0:00 right after the ad counts as moving) or that the
+  deck already reports `'cued'` is never stood in for: the song on air plays on, as in front.
+  Only a held play, or a pre-roll whose clock has stood still that long (Chrome holds a muted one still
+  in a hidden tab), gives way to its preview at the leave point (`STANDIN_LEAD_S`, after 15 s hidden).
+  Once the music has stopped, the silence rule names a moving ad `'slow'` (notice: the ad ran long) and
+  only a pre-roll that does not move in the hidden tab `'background'`; `history()` carries `previewWhy` and `heardAt` (set time the player reported PLAYING).
+  An incoming `play()` is given up `START_GRACE_S` after `max(tEnd, when it was issued)`, and a deferred
+  `play()` is never sent to a play given up in the meantime. *New set* while the song on air has run out
+  and its incoming is cued waits for that move (`pendingNew`), then the new order takes over under it.
+- **Transitions.** Planned as soon as the incoming is cued (`planVideoTransition`, `earliest = now + 0.4`;
+  BPM / energy from the preview analysis when it is there). A 20 Hz ticker applies `volumeAt(lane, t) ×
+  volume` (capped at 1) to each YouTube deck, calls the incoming `play()` at `incStart`, finishes the
+  hand-over at `tEnd` (outgoing `stop()`). The song on air is re-anchored to its real position (a stall or a
+  mid-roll ad) until its plan is made. An incoming still in its ad at the leave point: the song on air plays
+  on, the ticker says "Next song after its ad" (state `waiting`), the plan is made the moment it is cued
+  (late path). A song that ends first: `waiting` until the incoming is cued, then a cut.
+- **Errors.** A refusal (100 / 101 / 150 / 2 / 5) or another fault of the video → `finder.forget(track,
+  id, code)` with the deck's code (the finder keeps the upload for a code that says nothing about it:
+  timeout, blocked, background — `NO_VERDICT`) and the next alternate upload → the track's preview as a
+  Web Audio play (`engine.addPlay` with `'gain'` events from the same lanes; provider `'preview'`, it is
+  left 1-2.5 s before its end) → the track is marked failed and the slot goes to the next track. An opener
+  that fails hands the start to the song cued on the other deck. Every deck given up for its preview is
+  stopped with `deck.stop()` (a stop during a cue, or of a deck in 'error', does `stopVideo()`, which clears
+  YouTube's "Video unavailable" screen and an abandoned paused ad back to the player's plain start screen;
+  measured 2026-10-06). A failure (not a refusal) within 4 s of the page being hidden is the background
+  tab's doing: the play is **held** (deck stopped, nothing refused, forgotten or counted) and the same
+  upload is cued again once the page is in front.
+- **Skip.** Next song cued: a quick plan (`quick: true`, `reason: 'skip'`) at once. Still in its ad:
+  queued ("Next song after its ad" notice) and done the moment it is cued. Not during a transition or
+  within 2 s of one.
+- **New set** with a song on air (no hand-over in motion): that song plays on, the new order's head
+  pre-rolls on the free deck and comes in with a quick move once cued (`reason: 'newset'`, so its why says
+  "new set"; no silence for its ad); history restarts with the bridging song. Pressed during a hand-over
+  in motion, it is applied once that hand-over is over. Otherwise (nothing playing yet) a full reset.
+- **iOS** (`volumeWorks: false`, main.js detects iOS / iPadOS): the player ignores volume, so a
+  YouTube → YouTube move is turned into a cut at its crossover (`why` says so) instead of two songs at full
+  level for the length of a blend.
+- **Pause / resume** pause both decks and the engine and freeze set time; resume calls `play()` on the
+  decks that were sounding. A click on the video itself (which pauses YouTube's player) pauses the set,
+  another click resumes it.
+- **snapshot()** = conductor.js's shape plus `stageMode: 'video'`, `recordEnabled: false`, `recordWhy`,
+  `leaveAt` (song position the song on air is left at), `needsTap`, `skipQueued`, `unavailable`, `tr`
+  ({type, tStart, tEnd} of the announced transition). DeckView: `provider` `'youtube'|'preview'`, `link` the
+  YouTube watch URL, `bpm` only when the preview's tempo is trusted (else NaN), `wave` null (a preview
+  play passes its waveform), `status` / `statusText` from the play's phase and the deck's state
+  (`ad` / `loading` / `cued` / `live` / `mixing` / `error`). A preview play that is live or mixing has no
+  `statusText`, so the view says "No video · its 30-s preview" / "Mixing · 30-s preview"; a cued preview
+  says "No video · its preview is cued". TransitionView `starting` before the first sound (why: finding /
+  ad / "press Play"), `upcoming` / `active` for a plan, `waiting` as above. `snapshot().elapsed` and
+  `frame().elapsed` include the time carried over from the other conductor (6.3).
+- **frame(t, out)**: DeckFrame `pos` from `deck.position()` (a preview: set time since it started),
+  `gain` = lane value (before the user's volume), `audible` = gain, `startsIn` (cued incoming), `duration`,
+  `leaveAt`, `eqActive` false for YouTube; `beatPhase` −1; `levels` from the full-song engine.
+
+Deviations from the builders' modules used as built: `ytdeck` playerVars add `mute: 1`; `youtube.js`
+adds `forget`, `stats`, `sharedYouTubeFinder` (main.js uses the shared finder); `videomix` adds `volumeAt`
+and `beats`; see the modules' headers.
+
+### 6.5 View additions                                                           [ui]
+
+```js
+view.setStageMode('waves' | 'video')        // 'video': the hero shows two video slots instead of the waveform lanes
+view.videoSlot(deck: 0|1): HTMLElement      // stable, created once; the integrator mounts a YouTube player inside. Never moved / re-created by the view.
+// DeckView gains: provider 'youtube'|'deezer'|'itunes'|'local'|'preview', wave may be null (video mode → progress bar instead of mini waveform),
+//                 status?: 'ad'|'loading'|'cued'|'live'|'mixing'|'error', statusText?: string
+// DeckFrame gains: duration?: number, leaveAt?: number (song position where it will be left), eqActive?: boolean (false in video mode → EQ/filter knobs shown inactive)
+// TransitionView gains state 'starting' (waiting for the first song's ad; label/why/ no countdown) with an action button "Play previews instead"
+//                 (ticker tk-act, and vs-start-act on the video stage) → handlers.onPreviewOnce(): this set goes on as previews, prefs.mode
+//                 is not written (the next playlist plays the stored length); the view falls back to onMode('preview') only when
+//                 onPreviewOnce is missing. ViewHandlers gains onPreviewOnce.
+// setTransport gains: recordEnabled?: boolean, recordWhy?: string   (video mode: REC disabled — YouTube audio cannot be recorded)
+```
+Track-length control: enabled for every playlist (preview / short / medium / full); for local files `preview`
+stays unavailable. The old "Previews are 30 seconds — add your own files" lock and its toast go away.
+
+### 6.6 Testing under the real origin
+
+`tests/e2e/origin.mjs` exports `serveAsOrigin(page, {origin = 'https://aarushkandukoori.github.io', base = '/segue/'})`:
+request interception that answers every request under `origin + base` from the repo on disk (same MIME
+map as serve.mjs) and lets everything else through to the network. Full-song e2e runs use it, with
+`launch({gesture: true})` so Chrome's real autoplay policy applies, and must tolerate real ads (measured
+12 s to 250 s per video in the e2e runs). Waits longer than puppeteer's 180 s protocol timeout must poll
+with short evaluations: one `page.waitForFunction` is a single CDP call and is cut at 180 s.
+
+Background tabs: by default `launch()` keeps a hidden tab running at full speed (see the 6.1 row).
+`launch({realBackground: true})` removes the three switches that do that, so a hidden tab is throttled the
+way a visitor's Chrome throttles a silent one; `sendToBackground(page)` (also in `browser.mjs`) puts
+another tab in front and returns a function that brings `page` back. Use both for anything about the
+visitor who switches tabs.
+
+- `tests/fullset.test.js` — the conductor with fake decks / finder / engine and a hand-cranked clock.
+- `tests/e2e/privacy.e2e.mjs` — README *Privacy* against reality, each in a fresh profile with no tap: a
+  plain visit (only the page and Google Fonts contacted, no cookies), a Preview share link (no YouTube
+  host contacted), a full-song share link (YouTube's cookies within 30 s); every cookie's site must be
+  named next to "cookie" in README *Privacy*; no request to a YouTube or Google host (players, ads,
+  statistics, API script) may carry the share link's query — a seed made at run time, the playlist, vibe,
+  length — in its URL or its Referer (every percent-encoding layer undone), the player loads' Referer is
+  the bare origin, and README says the players get only origin and path; the hedge delays there must
+  equal the code's. `SEGUE_SITE_ROOT=<dir>` serves another copy of the site (a control run with a leaking
+  copy fails the query check).
+- `tests/e2e/ytdeck.e2e.mjs` — one deck in `ytdeck-harness.html` under the real origin. Chrome runs with
+  `launch({gesture: true, realBackground: true})`; `YT_IDS` takes 4 video ids (the 4th is one never loaded
+  in the session, for a cue started in a hidden tab). Silence is checked inside each player's own frame:
+  every `<video>` moment that plays unmuted above volume 0 before `play()` is a failure.
+- `tests/e2e/full.e2e.mjs` — the real app under the real origin: a Spotify playlist in Short (time to
+  first sound, ≥ 2 transitions, deck swap, volume lanes sampled at 20 Hz, positions, ticker and setlist
+  states, players ≥ 200×200 and uncovered on a 10 px elementsFromPoint grid with every element made
+  hit-testable, REC off with its reason, Skip into a cued song, Preview and back to Medium without a gap
+  > 1 s; Short → Preview keeps the running order and Elapsed, and back to Medium Elapsed includes the ad
+  wait), share links with and without `len` (a real tap on Play), a phone pass with a forced error 150
+  → preview fallback (the fallback deck's label, and its player showing neither the error screen nor an
+  ad), a real background tab (`background`: the set started in front and hidden for 180 s, and a set
+  started in front whose first ad runs on hidden), New set during a move (`moves`), *Play previews
+  instead* for this set only (`prefs`), Home / *Play previews instead* within 1 s of a deck's
+  `loadVideoById` with no player time moving for 30 s while the stage is hidden (`stopload`); zero console
+  errors and CSP violations. Groups: `main share phone background moves prefs stopload`. Page state is
+  read through raw CDP with `userGesture: false` (puppeteer's evaluate would grant the page user
+  activation). Waits for something that can only come after an ad (`untilPastAds`) go on past their base
+  time only while a deck's ad clock is still moving (YouTube served 3-4 minute pods at night), and a
+  check that meets an ad longer than the song on air expects the documented 12 s silence rule, nothing
+  looser. The background group's silence watch samples on the app's worker clock (page timers fire once
+  a minute in a throttled tab) and times each hand-over while hidden against its plan (`heardAt` vs
+  `incStart`).

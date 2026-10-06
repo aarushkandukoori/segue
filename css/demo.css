@@ -1,0 +1,80 @@
+/* ui-demo.html only: the plain boxes that stand in for YouTube's players in the video-mode mock
+   (js/ui/demo-video.js). The real app mounts the IFrame player in the same slot instead. */
+
+.demo-yt {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto 1fr auto auto;
+  justify-items: center;
+  padding: 10px 12px;
+  overflow: hidden;
+  background:
+    linear-gradient(115deg, transparent 0 40%, rgba(255, 255, 255, 0.035) 50%, transparent 60% 100%) 0 0 / 300% 100%,
+    radial-gradient(80% 90% at 30% 20%, #26252b, #121115 70%);
+  color: #e9e6e0;
+  font-family: var(--f-body);
+  text-align: center;
+}
+
+.demo-yt[data-status='live'],
+.demo-yt[data-status='mixing'] {
+  animation: demo-yt-sheen 6s linear infinite;
+}
+
+.demo-yt-badge {
+  justify-self: start;
+  padding: 4px 7px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #cfcac2;
+  font: 600 10px/1 var(--f-mono);
+  letter-spacing: 0.02em;
+}
+
+.demo-yt-what {
+  align-self: end;
+  max-width: 100%;
+  overflow: hidden;
+  font: 600 clamp(15px, 2.1vw, 24px) / 1.2 var(--f-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.demo-yt-sub {
+  margin-top: 4px;
+  color: #a9a49b;
+  font-size: 12.5px;
+}
+
+/* what a YouTube pre-roll looks like from across the room: the yellow "Ad" marker */
+.demo-yt[data-status='ad'] .demo-yt-what {
+  padding: 3px 9px;
+  border-radius: 3px;
+  background: #ffcc00;
+  color: #111;
+  font-size: 14px;
+}
+
+.demo-yt-note {
+  align-self: end;
+  margin-top: 8px;
+  color: #6f6b65;
+  font: 500 9.5px/1 var(--f-mono);
+}
+
+@keyframes demo-yt-sheen {
+  to {
+    background-position: -300% 0, 0 0;
+  }
+}
+
+@media (max-width: 599px), (max-height: 520px) {
+  .demo-yt-sub {
+    font-size: 11px;
+  }
+
+  .demo-yt-note {
+    display: none;
+  }
+}

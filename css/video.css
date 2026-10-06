@@ -1,0 +1,1271 @@
+/* Segue — video mode: full songs in YouTube's embedded player, one player per deck.
+
+   YouTube's terms are design rules here, not suggestions: each player stays visible, at least 200×200
+   CSS px, fully opaque, never covered by anything (labels, progress, badges, toasts, drawers all sit
+   outside its rectangle), never hidden, moved or clipped. So:
+     · the video stage is its own row of the stage grid, outside the scrolling booth, and sits above every
+       floating layer (z-index 61; toasts are 60, the setlist drawer 40);
+     · the slot itself has no radius, no opacity, no filter, no transform; the deck's colour is a ring
+       AROUND it (.vscreen padding) — the cued deck is never dimmed, its ring and label say "cued";
+     · toasts, the setlist drawer and its scrim start below the stage's bottom edge (--vs-bottom, measured
+       by view.js) while video mode is on — except the setlist sheet where the page scrolls (short and
+       sideways phones), which starts below the screens' own bottom edge and sits above the stage.
+   Layouts:
+     ≥ 1180 wide           [A info | A screen][B screen | B info], 16:9, progress bars under the screens
+     600–1179, phone side   two screens side by side, captions underneath
+     < 600 (phone upright) two full-width screens stacked, one-line captions
+   Switching between 'waves' and 'video' is CSS only (data-stage on .segue): nothing is moved. */
+
+/* ── mode switch ──────────────────────────────────────────────────────────────────────────────── */
+
+.vstage {
+  display: none;
+}
+
+.segue[data-stage='video'] .stage {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  /* the stage's fade-in would take the players' ancestor below full opacity for a moment */
+  animation: none;
+}
+
+.segue[data-stage='video'] .vstage {
+  display: grid;
+  grid-row: 2;
+}
+
+.segue[data-stage='video'] .booth {
+  grid-row: 3;
+}
+
+.segue[data-stage='video'] .transport {
+  grid-row: 4;
+}
+
+.segue[data-stage='video'] .waves {
+  display: none;
+}
+
+/* ── the video stage ──────────────────────────────────────────────────────────────────────────── */
+
+.vstage {
+  --vs-gap: 16px;
+  --vs-ring: 3px; /* the coloured ring around each slot */
+  --vs-info: 210px; /* side caption column on wide screens */
+  /* the tallest a screen may get while the booth below keeps its ticker and a usable deck row */
+  --vs-hmax: clamp(200px, calc(100vh - 534px), 360px);
+  --vs-w: min(calc(var(--vs-hmax) * 16 / 9), calc((100vw - var(--gl) - var(--gr) - 2 * var(--vs-info) - 3 * var(--vs-gap) - 4 * var(--vs-ring)) / 2));
+  --vs-h: max(200px, calc(var(--vs-w) * 9 / 16));
+  position: relative;
+  z-index: 61;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: var(--vs-gap);
+  row-gap: 10px;
+  align-items: start;
+  /* spare height on a tall window goes to air around the screens, not to empty space in the decks */
+  padding: clamp(16px, calc((100vh - 760px) / 4), 40px) var(--gr) clamp(14px, calc((100vh - 760px) / 4), 38px) var(--gl);
+  background:
+    radial-gradient(50% 120% at 50% 0%, rgba(244, 238, 227, 0.035), transparent 70%),
+    linear-gradient(180deg, #060607, #09090b);
+  border-bottom: 1px solid var(--line-2);
+}
+
+@supports (height: 100dvh) {
+  .vstage {
+    --vs-hmax: clamp(200px, calc(100dvh - 534px), 360px);
+  }
+}
+
+.vdeck {
+  display: grid;
+  column-gap: var(--vs-gap);
+  row-gap: 9px;
+  min-width: 0;
+}
+
+/* deck A's caption on its left, deck B's on its right: the two screens meet in the middle */
+.vdeck-a {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'info screen'
+    '. bar';
+}
+
+.vdeck-b {
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    'screen info'
+    'bar .';
+}
+
+.vscreen {
+  --ring-c: var(--line);
+  grid-area: screen;
+  padding: var(--vs-ring);
+  border-radius: 12px;
+  background: var(--ring-c);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 22px 46px -26px #000;
+  transition: background-color 0.25s, box-shadow 0.25s;
+}
+
+/* The player's rectangle. Square corners and nothing on top: the integrator mounts the player inside
+   and it fills the slot exactly. */
+.vslot {
+  position: relative;
+  width: var(--vs-w);
+  height: var(--vs-h);
+  background: #000;
+}
+
+.vslot > * {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  margin: 0;
+  border: 0;
+}
+
+/* nothing mounted yet: an idle screen with the deck's letter (gone the moment a player is inside) */
+.vslot:empty::before {
+  content: attr(data-letter);
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #19181d;
+  font: 900 clamp(56px, calc(var(--vs-h) * 0.46), 150px) / 1 var(--f-display);
+  font-stretch: 140%;
+}
+
+/* a deck playing a 30-second preview through the mixer has no player in its slot: say so there */
+.vdeck:is([data-provider='preview'], [data-provider='deezer'], [data-provider='itunes']) .vslot:empty::before {
+  color: #222127;
+}
+
+.vdeck:is([data-provider='preview'], [data-provider='deezer'], [data-provider='itunes']) .vslot:empty::after {
+  content: '30-second preview · playing through the mixer';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12%;
+  color: var(--ink-3);
+  font: 500 11px/1.3 var(--f-mono);
+  text-align: center;
+}
+
+.vbar {
+  grid-area: bar;
+  position: relative;
+  height: 4px;
+  margin: 0 var(--vs-ring);
+  border-radius: 2px;
+  background: #1c1b20;
+}
+
+.vbar-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--acc-deep), var(--acc));
+  transform: scaleX(0);
+  transform-origin: 0 50%;
+}
+
+/* where the DJ leaves this song (short / medium / full) */
+.vbar-leave {
+  position: absolute;
+  top: -4px;
+  left: 0;
+  width: 2px;
+  height: 12px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--ink);
+  box-shadow: 0 0 0 2px #09090b;
+}
+
+.vinfo {
+  grid-area: info;
+  align-self: end;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-width: 340px;
+  padding-bottom: 4px;
+}
+
+.vdeck-a .vinfo {
+  justify-self: end;
+  justify-items: end;
+  text-align: right;
+}
+
+.vdeck-b .vinfo {
+  justify-self: start;
+  justify-items: start;
+}
+
+.vhead {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  max-width: 100%;
+  margin-bottom: 2px;
+}
+
+.vdeck-a .vhead {
+  flex-direction: row-reverse;
+}
+
+.vstatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font: 700 10px/1.2 var(--f-display);
+  font-stretch: 112%;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.15em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Beside the screens (wide layout) the caption column is narrow: a long status ("No video · its 30-s
+   preview · −0:27") wraps onto a second line instead of being cut mid-word. */
+@media (min-width: 1180px) {
+  .vstatus {
+    display: block;
+    white-space: normal;
+    line-height: 1.35;
+  }
+
+  .vstatus::before {
+    display: inline-block;
+    margin-right: 7px;
+    vertical-align: 1px;
+  }
+}
+
+.vstatus::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+
+.vtitle {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font: 600 20px/1.2 var(--f-body);
+  letter-spacing: -0.005em;
+  overflow-wrap: anywhere;
+}
+
+.vartist {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vartist:empty {
+  display: none;
+}
+
+.vtime {
+  margin-top: 4px;
+  color: var(--ink-3);
+  font: 400 11.5px/1 var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.vtime:empty {
+  display: none;
+}
+
+/* ── what each deck is doing: ring and label, never the picture itself ────────────────────────── */
+
+.vdeck[data-status='live'] .vscreen {
+  --ring-c: var(--acc);
+  box-shadow: 0 0 0 1px rgba(var(--acc-rgb), 0.3), 0 0 44px -10px rgba(var(--acc-rgb), 0.6), 0 22px 46px -26px #000;
+}
+
+.vdeck[data-status='live'] .vstatus {
+  color: var(--acc);
+}
+
+.vdeck[data-status='live'] .vstatus::before {
+  background: var(--acc);
+  box-shadow: 0 0 0 3px rgba(var(--acc-rgb), 0.2), 0 0 12px var(--acc);
+}
+
+.vdeck[data-status='mixing'] .vscreen {
+  --ring-c: var(--acc);
+  animation: vs-mixing 1.6s ease-in-out infinite;
+}
+
+.vdeck[data-status='mixing'] .vstatus {
+  color: var(--ink);
+}
+
+.vdeck[data-status='mixing'] .vstatus::before {
+  background: var(--acc);
+  animation: led 0.7s ease-in-out infinite;
+}
+
+/* preloading: the next song's pre-roll ad plays muted, in plain view */
+.vdeck[data-status='ad'] .vscreen {
+  --ring-c: #4a4232;
+}
+
+.vdeck[data-status='ad'] .vstatus {
+  color: var(--warn);
+}
+
+.vdeck[data-status='ad'] .vstatus::before {
+  background: var(--warn);
+  animation: led 1.4s ease-in-out infinite;
+}
+
+.vdeck[data-status='ad'] .vbar {
+  background: repeating-linear-gradient(-45deg, rgba(255, 194, 74, 0.32) 0 4px, #1c1b20 4px 8px);
+  background-size: 11.31px 11.31px;
+  animation: vs-ad 0.9s linear infinite;
+}
+
+.vdeck[data-status='cued'] .vscreen {
+  --ring-c: #3a3842;
+}
+
+.vdeck[data-status='cued'] .vstatus,
+.vdeck[data-status='loading'] .vstatus {
+  color: var(--ink-2);
+}
+
+.vdeck[data-status='cued'] .vstatus::before {
+  background: rgba(var(--acc-rgb), 0.55);
+}
+
+.vdeck[data-status='loading'] .vstatus::before {
+  animation: led 1s ease-in-out infinite;
+}
+
+.vdeck[data-status='error'] .vscreen {
+  --ring-c: rgba(255, 61, 74, 0.6);
+}
+
+.vdeck[data-status='error'] .vstatus {
+  color: var(--rec);
+}
+
+.vdeck[data-status='error'] .vstatus::before {
+  background: var(--rec);
+}
+
+.vdeck[data-status='empty'] .vscreen {
+  --ring-c: var(--line-2);
+}
+
+/* A deck playing a song's 30-second preview (its video would not play): the sound comes through the
+   mixer, not from this player — whatever the player still shows is not what is heard — so the screen is
+   not lit as the one on air. Its label (and the ticker, and the setlist) say that it is. */
+.vdeck:is([data-provider='preview'], [data-provider='deezer'], [data-provider='itunes']):is([data-status='live'], [data-status='mixing']) .vscreen {
+  --ring-c: #34323b;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 22px 46px -26px #000;
+  animation: none;
+}
+
+.vdeck[data-status='empty'] .vtitle {
+  color: var(--ink-3);
+}
+
+/* box-shadow only: the slot's own opacity never changes */
+@keyframes vs-mixing {
+  50% {
+    box-shadow: 0 0 0 1px rgba(var(--acc-rgb), 0.45), 0 0 56px -6px rgba(var(--acc-rgb), 0.75), 0 22px 46px -26px #000;
+  }
+}
+
+@keyframes vs-ad {
+  to {
+    background-position: 11.31px 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vdeck[data-status='mixing'] .vscreen,
+  .vdeck[data-status='ad'] .vbar {
+    animation: none;
+  }
+}
+
+/* ── medium widths: captions under the screens ────────────────────────────────────────────────── */
+
+@media (max-width: 1179px) {
+  .vstage {
+    --vs-hmax: clamp(200px, calc(100vh - 592px), 360px);
+    --vs-w: min(calc(var(--vs-hmax) * 16 / 9), calc((100vw - var(--gl) - var(--gr) - var(--vs-gap) - 4 * var(--vs-ring)) / 2));
+    padding-top: 14px;
+    padding-bottom: 12px;
+  }
+
+  @supports (height: 100dvh) {
+    .vstage {
+      --vs-hmax: clamp(200px, calc(100dvh - 592px), 360px);
+    }
+  }
+
+  .vdeck-a,
+  .vdeck-b {
+    grid-template-columns: auto;
+    grid-template-areas:
+      'screen'
+      'bar'
+      'info';
+    row-gap: 8px;
+  }
+
+  .vdeck-a {
+    justify-self: end;
+  }
+
+  .vdeck-b {
+    justify-self: start;
+  }
+
+  /* one row for the deck, what it is doing and the clock; the song (title · artist) underneath */
+  .vdeck .vinfo {
+    grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
+    grid-template-areas:
+      'head head time'
+      'title artist artist';
+    align-items: baseline;
+    justify-self: stretch;
+    justify-items: stretch;
+    gap: 3px 9px;
+    max-width: none;
+    padding: 2px var(--vs-ring) 0;
+    text-align: left;
+  }
+
+  .vdeck-a .vhead,
+  .vhead {
+    grid-area: head;
+    flex-direction: row;
+    margin: 0 0 2px;
+  }
+
+  .vhead .deck-id {
+    width: 20px;
+    height: 20px;
+    font-size: 11.5px;
+  }
+
+  .vtitle {
+    grid-area: title;
+    display: block;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .vartist {
+    grid-area: artist;
+    font-size: 13px;
+  }
+
+  .vtime {
+    grid-area: time;
+    align-self: center;
+    min-width: 0;
+    margin: 0 0 2px;
+    overflow: hidden;
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+  }
+
+  /* what the deck is doing is never the part that gets cut short */
+  .vhead {
+    min-width: max-content;
+  }
+
+  .vdeck .vinfo {
+    grid-template-columns: minmax(0, max-content) minmax(0, 1fr) minmax(0, auto);
+  }
+}
+
+/* ── phone held upright: two full-width screens, stacked ──────────────────────────────────────── */
+
+@media (max-width: 599px) {
+  .vstage {
+    --vs-gap: 10px;
+    --vs-ring: 2px;
+    --vs-w: calc(100vw - max(8px, env(safe-area-inset-left)) - max(8px, env(safe-area-inset-right)) - 2 * var(--vs-ring));
+    /* as tall as 16:9 allows, never under 200 px, and shorter when the phone browser's toolbars eat the height */
+    --vs-h: clamp(200px, calc((100vh - 360px) / 2), calc(var(--vs-w) * 9 / 16));
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--vs-gap);
+    padding: 8px max(8px, env(safe-area-inset-right)) 8px max(8px, env(safe-area-inset-left));
+  }
+
+  @supports (height: 100dvh) {
+    .vstage {
+      --vs-h: clamp(200px, calc((100dvh - 360px) / 2), calc(var(--vs-w) * 9 / 16));
+    }
+  }
+
+  .vdeck-a,
+  .vdeck-b {
+    justify-self: stretch;
+    row-gap: 6px;
+  }
+
+  .vscreen {
+    border-radius: 8px;
+  }
+
+  .vhead .deck-id {
+    width: 18px;
+    height: 18px;
+    font-size: 10.5px;
+    border-radius: 5px;
+  }
+
+  .vdeck .vinfo {
+    padding: 0 2px;
+  }
+
+  .vtitle {
+    font-size: 14px;
+  }
+
+  .vartist {
+    font-size: 12px;
+  }
+
+  .vtime {
+    display: none;
+  }
+}
+
+/* shorter upright phones: one line — [A] LIVE · −0:31  Title  Artist */
+@media (max-width: 599px) and (max-height: 800px) {
+  .vdeck .vinfo {
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+  }
+
+  .vhead {
+    flex: none;
+    align-self: center;
+    margin: 0;
+  }
+
+  .vstatus {
+    font-size: 9.5px;
+    letter-spacing: 0.12em;
+  }
+
+  .vtitle {
+    flex: 0 1 auto;
+    min-width: 0;
+    font-size: 13.5px;
+    line-height: 1.25;
+  }
+
+  .vartist {
+    flex: 0 1000 auto;
+    min-width: 0;
+  }
+
+  .vtime {
+    display: none;
+  }
+}
+
+/* ── phone on its side: side by side, as tall as the rules allow and no taller ───────────────── */
+
+@media (max-width: 1023px) and (max-height: 520px) {
+  .vstage {
+    --vs-gap: 12px;
+    --vs-ring: 2px;
+    --vs-w: min(calc(200px * 16 / 9), calc((100vw - var(--gl) - var(--gr) - var(--vs-gap) - 4 * var(--vs-ring)) / 2));
+    --vs-h: 200px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  .vdeck-a,
+  .vdeck-b {
+    row-gap: 5px;
+  }
+
+  .vscreen {
+    border-radius: 8px;
+  }
+
+  .vdeck .vinfo {
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+    padding: 0 2px;
+  }
+
+  .vhead {
+    flex: none;
+    align-self: center;
+    margin: 0;
+  }
+
+  .vhead .deck-id {
+    width: 18px;
+    height: 18px;
+    font-size: 10.5px;
+  }
+
+  .vstatus {
+    font-size: 9.5px;
+    letter-spacing: 0.12em;
+  }
+
+  .vtitle {
+    flex: 0 1 auto;
+    min-width: 0;
+    font-size: 13px;
+  }
+
+  .vartist,
+  .vtime {
+    display: none;
+  }
+}
+
+/* ── the booth under the video stage ──────────────────────────────────────────────────────────── */
+
+.segue[data-stage='video'] .booth {
+  grid-template-rows: auto minmax(236px, 1fr);
+  grid-template-areas:
+    'ticker ticker ticker ticker'
+    'deckA mixer deckB crate';
+}
+
+@media (max-width: 1179px) {
+  .segue[data-stage='video'] .booth {
+    grid-template-areas:
+      'ticker ticker ticker'
+      'deckA mixer deckB';
+  }
+}
+
+/* phones: the captions under the screens already carry each deck's song and state, so the deck
+   strips go; the ticker and the mixer remain */
+@media (max-width: 719px), (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'] .booth {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(min-content, 1fr);
+    grid-template-areas:
+      'ticker'
+      'mixer';
+    padding: 0 0 10px;
+  }
+
+  .segue[data-stage='video'] .deck {
+    display: none;
+  }
+
+  .segue[data-stage='video'] .mixer {
+    margin: 0 max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+  }
+
+  .segue[data-stage='video'] .ticker {
+    border-top: 0;
+  }
+}
+
+/* Tall upright phones: the screens, the ticker and the transport fit on one screen. The track-length
+   options go back beside the vibe slider (two transport rows, not three), and the mixer — whose EQ and
+   meter cannot hear YouTube anyway — gives way. */
+@media (max-width: 599px) and (min-height: 731px) {
+  .segue[data-stage='video'] .booth {
+    grid-template-rows: auto;
+    grid-template-areas: 'ticker';
+  }
+
+  .segue[data-stage='video'] .mixer {
+    display: none;
+  }
+}
+
+@media (max-width: 719px) and (min-height: 790px) {
+  .segue[data-stage='video'] .transport.is-mode-live {
+    grid-template-areas:
+      'main main crate'
+      'vibe mode mode';
+  }
+
+  .segue[data-stage='video'] .transport.is-mode-live .tp-mode {
+    justify-self: end;
+    margin-left: 6px;
+  }
+
+  .segue[data-stage='video'] .transport.is-mode-live .tp-mode-lbl {
+    display: none;
+  }
+
+  .segue[data-stage='video'] .transport.is-mode-live .seg {
+    display: inline-flex;
+  }
+
+  .segue[data-stage='video'] .transport.is-mode-live .seg label {
+    flex: none;
+  }
+
+  .segue[data-stage='video'] .transport.is-mode-live .seg span {
+    font-size: 10.5px;
+  }
+}
+
+/* Short upright phones (the browser's toolbars showing) and phones on their side: two screens of at
+   least 200 px, the transport and a ticker do not fit at once. The page scrolls instead — nothing is
+   pinned over the players, so they move up like any other page content — with the screens and the
+   transport first and the ticker and the mixer below them. */
+@media (max-width: 599px) and (max-height: 730px), (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'] .stage {
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .segue[data-stage='video'] .transport {
+    grid-row: 3;
+    border-bottom: 1px solid var(--line-2);
+  }
+
+  .segue[data-stage='video'] .booth {
+    grid-row: 4;
+    /* not a scroll container any more (the page scrolls); the ticker's end notch must not widen it */
+    overflow: hidden;
+    overflow: clip;
+    padding-top: 10px;
+  }
+
+  .segue[data-stage='video'] .ticker {
+    border-top: 1px solid var(--line-2);
+  }
+
+  /* the setlist is page content here: a drawer would only get the sliver of window under the players
+     ("Setlist" opens it as a sheet below them instead, .is-sheet below) */
+  .segue[data-stage='video'] .booth {
+    grid-template-rows: auto auto auto;
+    grid-template-areas:
+      'ticker'
+      'mixer'
+      'crate';
+  }
+
+  .segue[data-stage='video'] .crate {
+    position: static;
+    z-index: auto;
+    width: auto;
+    height: auto;
+    margin: 10px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+    padding: 0;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r);
+    background: linear-gradient(180deg, rgba(24, 23, 28, 0.94), rgba(14, 13, 16, 0.94));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    transform: none;
+    visibility: visible;
+    transition: none;
+  }
+
+  .segue[data-stage='video'] .crate::before,
+  .segue[data-stage='video'] .crate-close {
+    display: none;
+  }
+
+  .segue[data-stage='video'] .crate-list {
+    overflow: visible;
+  }
+
+  /* "Setlist" opens the list as a sheet BELOW the two players (view.js placeSheet scrolls the screens to
+     the top of the window and measures their bottom edge): placed in page coordinates down to the
+     window's bottom, so no scroll can bring a player under it. Above the video stage, whose last
+     caption it covers — the screens themselves end above its top edge. The players stay in use: no scrim. */
+  .segue[data-stage='video'] .crate.is-sheet {
+    position: absolute;
+    z-index: 62;
+    top: var(--sheet-top, 0px);
+    left: 0;
+    right: 0;
+    height: var(--sheet-h, 50vh);
+    margin: 0;
+    padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: #121115;
+    box-shadow: 0 -30px 80px -20px #000;
+  }
+
+  .segue[data-stage='video'] .crate.is-sheet .crate-close {
+    display: inline-grid;
+  }
+
+  .segue[data-stage='video'] .crate.is-sheet .crate-list {
+    overflow-y: auto;
+  }
+}
+
+/* ── ticker: the first song waiting for its ad ────────────────────────────────────────────────── */
+
+.ticker[data-state='starting'] .tk-count {
+  display: none;
+}
+
+.ticker[data-state='starting'] .tk-tag {
+  border-color: rgba(255, 194, 74, 0.55);
+  color: var(--ink);
+}
+
+.ticker[data-state='starting'] .tk-tag::before {
+  background: var(--warn);
+  animation: led 1.4s ease-in-out infinite;
+}
+
+/* no countdown (an ad's length is unknown), but visibly not stuck */
+.ticker[data-state='starting'] .tk-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 194, 74, 0.7), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: tk-sweep 1.8s var(--ease) infinite;
+}
+
+@keyframes tk-sweep {
+  from {
+    background-position: -60% 0;
+  }
+  to {
+    background-position: 160% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker[data-state='starting'] .tk-bar::after {
+    animation: none;
+    background-position: 50% 0;
+  }
+}
+
+.tk-act {
+  grid-area: count;
+  justify-self: end;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 15px;
+  border: 1px solid var(--ink-3);
+  border-radius: 10px;
+  background: rgba(244, 238, 227, 0.06);
+  color: var(--ink);
+  font: 600 13px/1 var(--f-body);
+  white-space: nowrap;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+.tk-act:hover {
+  border-color: var(--ink);
+  background: rgba(244, 238, 227, 0.12);
+}
+
+.tk-act[hidden] {
+  display: none;
+}
+
+@media (max-width: 719px), (max-width: 1023px) and (max-height: 520px) {
+  .ticker[data-state='starting'] .tk-tag {
+    display: none;
+  }
+
+  .ticker[data-state='starting'] {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'main count'
+      'marks count';
+  }
+
+  .tk-act {
+    min-height: 36px;
+    padding: 0 11px;
+    font-size: 12px;
+  }
+}
+
+/* ── the same, where the ticker is below the fold ─────────────────────────────────────────────────
+   Short upright phones and phones on their side (the page scrolls): one short line and the way out on
+   the video stage — a row of its own between the screens (upright) or under both (on its side), never
+   on a screen. Neither deck has played anything yet, so their progress bars give it their room (on its
+   side the captions too: that row is all a 375 px tall window can spare), and the transport's buttons
+   stay on screen. The ticker's own button would only repeat it. */
+.vs-start {
+  display: none;
+}
+
+@media (max-width: 599px) and (max-height: 730px), (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'] .vstage.is-starting {
+    row-gap: 6px;
+  }
+
+  .segue[data-stage='video'] .vs-start:not([hidden]) {
+    display: flex;
+    grid-column: 1 / -1;
+    justify-self: center;
+    align-items: center;
+    gap: 10px;
+    width: min(100%, calc(2 * var(--vs-w) + 4 * var(--vs-ring) + var(--vs-gap)));
+    min-width: 0;
+    padding: 0 2px;
+  }
+
+  .segue[data-stage='video'] .vstage.is-starting .vdeck {
+    grid-template-areas:
+      'screen'
+      'info';
+  }
+
+  .segue[data-stage='video'] .vstage.is-starting .vbar,
+  .segue[data-stage='video'] .tk-act {
+    display: none;
+  }
+
+  .vs-start-why {
+    display: -webkit-box;
+    flex: 1 1 auto;
+    min-width: 0;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    color: var(--ink-2);
+    font: 500 11.5px/1.25 var(--f-body);
+  }
+
+  .vs-start-why::before {
+    content: '';
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+    vertical-align: 1px;
+    animation: led 1.4s ease-in-out infinite;
+  }
+
+  .vs-start-act {
+    position: relative;
+    flex: none;
+    min-height: 30px;
+    padding: 0 11px;
+    border: 1px solid var(--ink-3);
+    border-radius: 9px;
+    background: rgba(244, 238, 227, 0.06);
+    color: var(--ink);
+    font: 600 12px/1 var(--f-body);
+    white-space: nowrap;
+  }
+
+  /* a finger-sized target without a taller row (it stays inside the gaps, off both screens) */
+  .vs-start-act::after {
+    content: '';
+    position: absolute;
+    inset: -4px -3px;
+  }
+}
+
+/* on its side: in place of the captions */
+@media (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'] .vstage.is-starting .vdeck {
+    grid-template-areas: 'screen';
+  }
+
+  .segue[data-stage='video'] .vstage.is-starting .vinfo {
+    display: none;
+  }
+}
+
+/* upright: between the two screens */
+@media (max-width: 599px) and (max-height: 730px) {
+  .segue[data-stage='video'] .vstage.is-starting .vs-start {
+    order: 1;
+  }
+
+  .segue[data-stage='video'] .vstage.is-starting .vdeck-b {
+    order: 2;
+  }
+}
+
+/* ── a deck card without a waveform: a progress bar with the leave point ──────────────────────── */
+
+.deck.is-progress .deck-ov {
+  max-height: 84px;
+  background: #08080a;
+}
+
+/* the part already heard, lit in the deck's colour, with the playhead at its edge */
+.deck.is-progress .ov-played {
+  background: linear-gradient(90deg, rgba(var(--acc-rgb), 0.1), rgba(var(--acc-rgb), 0.34));
+  box-shadow: inset 0 -2px 0 var(--acc);
+}
+
+.deck.is-progress .ov-head {
+  box-shadow: 0 0 6px rgba(244, 238, 227, 0.6);
+}
+
+/* the point where the DJ leaves the song */
+.ov-leave {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -1px;
+  width: 2px;
+  background: repeating-linear-gradient(180deg, var(--ink-2) 0 3px, transparent 3px 5px);
+}
+
+.ov-leave::after {
+  content: 'out';
+  position: absolute;
+  bottom: 4px;
+  left: 6px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: rgba(8, 8, 10, 0.85);
+  color: var(--ink-2);
+  font: 700 8px/1 var(--f-display);
+  font-stretch: 112%;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* in video mode the tempo is not touched, so there is no pitch to show */
+.segue[data-stage='video'] .pitch {
+  display: none;
+}
+
+/* short decks drop the waveform overview; the progress bar is worth keeping, slim */
+@container (max-height: 290px) {
+  .deck.is-progress .deck-ov {
+    display: block;
+    flex: 0 0 auto;
+    height: 20px;
+    min-height: 20px;
+    margin-top: 8px;
+  }
+}
+
+/* ── mixer: faders follow the players' volume; EQ and meter cannot hear them ─────────────────── */
+
+.ch.is-eq-off .knobs {
+  cursor: help;
+}
+
+.ch.is-eq-off .knob {
+  opacity: 0.34;
+}
+
+.ch.is-eq-off .k-val {
+  visibility: hidden;
+}
+
+.ch.is-eq-off .k-track {
+  stroke-dasharray: 2 4.4;
+}
+
+.mixer.has-note {
+  --k: 46px;
+}
+
+@container mixer (max-height: 380px) {
+  .mixer.has-note .knob-dial {
+    width: 38px;
+    height: 38px;
+  }
+}
+
+@container mixer (max-height: 340px) {
+  .mixer.has-note .knob-dial {
+    width: 31px;
+    height: 31px;
+  }
+}
+
+@container mixer (max-height: 300px) {
+  .mixer.has-note .knob-dial {
+    width: 28px;
+    height: 28px;
+  }
+
+  /* inactive anyway: the labels give their line to the note that says why */
+  .mixer.has-note .knob-lbl {
+    display: none;
+  }
+}
+
+.mx-note {
+  flex: none;
+  margin: -2px 0 0;
+  color: var(--ink-3);
+  font: 500 10px/1.4 var(--f-mono);
+  text-align: center;
+  text-wrap: balance;
+}
+
+.mixer.is-deaf .master {
+  cursor: help;
+}
+
+.mixer.is-deaf .master .lbl {
+  color: var(--ink-4);
+}
+
+.mixer.is-deaf .meter {
+  background: repeating-linear-gradient(-45deg, #040405 0 3px, #141317 3px 6px);
+}
+
+.mixer.is-deaf .meter-lit,
+.mixer.is-deaf .meter-peak,
+.mixer.is-deaf .meter::after {
+  visibility: hidden;
+}
+
+/* ── REC unavailable (YouTube's audio cannot be recorded): a tap says why ─────────────────────── */
+
+.rec.is-disabled {
+  border-style: dashed;
+  color: var(--ink-4);
+  cursor: help;
+}
+
+.rec.is-disabled .rec-dot {
+  border-color: var(--ink-4);
+}
+
+.rec.is-disabled:hover {
+  border-color: var(--ink-3);
+  color: var(--ink-3);
+}
+
+/* ── track length: open for every playlist ────────────────────────────────────────────────────── */
+
+.tp-mode-hint {
+  color: var(--ink-3);
+  font: 500 11px/1 var(--f-body);
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+@media (max-width: 719px), (max-width: 1023px) and (max-height: 520px) {
+  .tp-mode-hint {
+    display: none;
+  }
+}
+
+.tp-mode-hint:not(:empty)::before {
+  content: '·';
+  margin: 0 7px 0 1px;
+  color: var(--ink-4);
+}
+
+/* a disabled radio swallows taps: let them reach the label, which explains (see view.js) */
+.seg input:disabled {
+  pointer-events: none;
+}
+
+.seg label.is-unavailable {
+  cursor: help;
+}
+
+.seg label.is-unavailable span {
+  color: var(--ink-4);
+  text-decoration: line-through;
+  text-decoration-color: rgba(141, 136, 127, 0.5);
+}
+
+.tp-mode.is-off .seg {
+  opacity: 0.5;
+}
+
+/* ── floating layers stay below the video stage ───────────────────────────────────────────────── */
+
+.segue[data-stage='video'][data-screen='stage'] .toasts {
+  top: calc(var(--vs-bottom, 0px) + 10px);
+  max-height: calc(100vh - var(--vs-bottom, 0px) - 20px);
+  overflow: hidden;
+  align-content: start;
+}
+
+.segue[data-stage='video'] .scrim {
+  top: var(--vs-bottom, 0px);
+}
+
+@media (max-width: 1179px) {
+  .segue[data-stage='video'] .crate {
+    top: var(--vs-bottom, 0px);
+    border-radius: 18px 0 0 0;
+  }
+}
+
+@media (max-width: 719px), (max-width: 1023px) and (max-height: 520px) {
+  /* the bottom sheet / side drawer runs from under the screens to the bottom of the window */
+  .segue[data-stage='video'] .crate {
+    height: auto;
+  }
+
+  .segue[data-stage='video'][data-screen='stage'] .toasts {
+    top: calc(var(--vs-bottom, 0px) + 8px);
+    bottom: calc(142px + env(safe-area-inset-bottom));
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    max-height: none;
+  }
+
+  /* room for one message at a time between the screens and the transport */
+  .segue[data-stage='video'][data-screen='stage'] .toast:not(:last-child) {
+    display: none;
+  }
+}
+
+/* short phones and phones on their side: the message may sit over the transport instead */
+@media (max-width: 719px) and (max-height: 760px), (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'][data-screen='stage'] .toasts {
+    bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 1023px) and (max-height: 520px) {
+  .segue[data-stage='video'][data-screen='stage'] .toasts {
+    left: auto;
+    width: min(400px, calc(100vw - 24px));
+  }
+}

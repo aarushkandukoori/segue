@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- The production policy, character for character (ytdeck.e2e.mjs checks it). It allows no inline
+         script or style, so this page's only script is ytdeck.e2e.mjs in its browser role (it installs
+         window.ytHarness and sizes the slots through the CSSOM). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' https://api.deezer.com https://www.youtube.com; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-src https://www.youtube-nocookie.com https://www.youtube.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Segue · YouTube deck harness</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <!-- Driven by tests/e2e/ytdeck.e2e.mjs (headless Chrome under the real origin, see origin.mjs). By hand:
+         serve the repo, open this page and use window.ytHarness from the console; "Start" runs whatever
+         ytHarness.onStart holds inside a real click (the user gesture a deck's play() / prime() needs).
+         Each slot is one deck's player: visible, at least 200×200 CSS px, never covered (SPEC.md §6.2). -->
+    <p><button id="start" type="button">Start</button> <span id="status">loading…</span></p>
+    <div id="slots">
+      <div id="slotA" class="slot"></div>
+      <div id="slotB" class="slot"></div>
+      <div id="slotC" class="slot"></div>
+    </div>
+    <pre id="out"></pre>
+    <script type="module" src="./ytdeck.e2e.mjs"></script>
+  </body>
+</html>

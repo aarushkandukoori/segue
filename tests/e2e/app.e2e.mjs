@@ -45,6 +45,23 @@ async function open(srv, opts = {}) {
 }
 
 /**
+ * Full songs (YouTube) are the default track length for streaming playlists since 2026-10-05; they have
+ * their own suite (full.e2e.mjs, under the real origin). The groups here test the Web Audio side, so
+ * the visitor has picked Preview (stored once, like a returning visitor's own choice).
+ */
+const preferPreview = (b) =>
+  b.page.evaluateOnNewDocument(() => {
+    try {
+      if (!sessionStorage.getItem('e2e-prefs')) {
+        sessionStorage.setItem('e2e-prefs', '1');
+        localStorage.setItem('segue:prefs', JSON.stringify({ volume: 0.9, vibe: 0.5, mode: 'preview' }));
+      }
+    } catch {
+      /* storage blocked */
+    }
+  });
+
+/**
  * Console errors that are ours to answer for. Chrome itself logs an error line for every failed
  * third-party request (an image that 404s, Spotify answering a non-existent playlist without CORS
  * headers); the app handles those and they cannot be silenced from script.
@@ -197,6 +214,7 @@ async function groupDemo(srv) {
   const b = await open(srv, { width: 1440, height: 900 });
   const { page } = b;
   const downloads = mkdtempSync(join(tmpdir(), 'segue-dl-'));
+  await preferPreview(b);
   try {
     const cdp = await page.createCDPSession();
     await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads }).catch(() => {});
@@ -232,6 +250,7 @@ async function groupDemo(srv) {
     const ref = { url: first.url.replace(srv.url, ''), seed: first.seed, firstFour: null, gone: false };
     shareInfo(ref);
     check('2. the share link names the vibe the set uses', /[?&]vibe=0\.5(&|$)/.test(first.url), first.url.replace(srv.url, ''));
+    check('2. …and its track length (Preview)', /[?&]len=preview(&|$)/.test(first.url), first.url.replace(srv.url, ''));
 
     // 4a. Watch the Skip button against the conductor for the whole run: every stretch in which the
     // button says something else than Skip would do (it opens and closes on the audio clock).
@@ -401,8 +420,9 @@ async function groupShare(srv) {
   const b = await open(srv, { width: 1280, height: 800, gesture: true });
   const { page } = b;
   try {
-    // The recipient is a returning visitor who once left the Vibe slider at "wild" — and the link is
-    // an old-style one that does not name a vibe (= made at the default).
+    // The recipient is a returning visitor who once left the Vibe slider at "wild" and prefers full
+    // songs — and the link is an old-style one that names neither a vibe (= made at the default) nor a
+    // track length (= made before full songs existed: 30-second previews).
     await page.evaluateOnNewDocument(() => {
       try {
         if (!sessionStorage.getItem('e2e-prefs')) {
@@ -413,11 +433,12 @@ async function groupShare(srv) {
         /* storage blocked: the check below says so */
       }
     });
-    await page.goto(`${srv.url}${info.url.replace(/&vibe=[^&]*/, '')}`, { waitUntil: 'load' });
+    await page.goto(`${srv.url}${info.url.replace(/&vibe=[^&]*/, '').replace(/&len=[^&]*/, '')}`, { waitUntil: 'load' });
     const ready = await until(page, (s) => s.screen === 'ready', 20000);
     check('6. share link opens on the "Start the set" screen', !!ready && ready.seed === info.seed && !ready.started, ready ? `set #${ready.seed}` : (await state(page)).screen);
     const stored = () => page.evaluate(() => JSON.parse(localStorage.getItem('segue:prefs') || '{}').vibe);
     check('6. the set uses the link’s vibe, not the one the visitor has stored', !!ready && ready.vibe === 0.5 && ready.dom.vibe === 0.5 && /[?&]vibe=0\.5(&|$)/.test(ready.url) && (await stored()) === 0.95, ready ? `set vibe ${ready.vibe}, slider ${ready.dom.vibe}, stored preference ${await stored()}, address bar ${ready.url.replace(srv.url, '')}` : '');
+    check('6. a link without a track length plays 30-second previews (its old meaning), whatever the visitor prefers', !!ready && ready.mode === 'preview' && /[?&]len=preview(&|$)/.test(ready.url), ready ? `mode ${ready.mode}, ${ready.url.replace(srv.url, '')}` : '');
     await sleep(1500); // let it cue the opener while it waits for the tap
     await shot(page, 'app-ready-1280x800.png');
     const cued = await state(page);
@@ -452,6 +473,7 @@ async function groupShare(srv) {
 async function groupSpotify(srv) {
   const b = await open(srv, { width: 1280, height: 800 });
   const { page } = b;
+  await preferPreview(b);
   try {
     await page.goto(`${srv.url}/index.html`, { waitUntil: 'load' });
     await page.waitForSelector('#segue-input');
@@ -844,6 +866,7 @@ async function transportB(srv, b, paths) {
 async function groupMobile(srv) {
   const b = await open(srv, { width: 390, height: 844, mobile: true });
   const { page } = b;
+  await preferPreview(b);
   try {
     await page.goto(`${srv.url}/index.html`, { waitUntil: 'load' });
     await page.waitForSelector('button[data-demo]', { timeout: 15000 });

@@ -497,6 +497,16 @@
   white-space: nowrap;
 }
 
+/* 'starting' (the first song behind its ad) and 'waiting' (nothing can play yet): the reason is the only
+   explanation of a silence nobody can time, so it wraps (up to three lines, which every ticker height
+   below holds) instead of being cut short. Nothing else is shown in those states, so nothing jumps. */
+.ticker:is([data-state='starting'], [data-state='waiting']) .tk-why {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: normal;
+}
+
 /* A mid-solo trick ("Beat repeat") while the next transition is already announced: a pill in front of
    the reason line for the second or two it lasts. Inline, so the line keeps its height when it comes
    and goes. */
@@ -2170,21 +2180,6 @@
   white-space: nowrap;
 }
 
-.tp-mode-lock {
-  display: none;
-  color: var(--ink-3);
-}
-
-.tp-mode-lock .ic {
-  width: 11px;
-  height: 11px;
-  display: block;
-}
-
-.tp-mode.is-locked .tp-mode-lock {
-  display: inline-flex;
-}
-
 .seg {
   display: inline-flex;
   padding: 2px;
@@ -2243,52 +2238,6 @@
 .seg input:disabled:checked + span {
   background: var(--panel-2);
   color: var(--ink-2);
-}
-
-/* Locked (30-second previews). A disabled control swallows clicks, so they are let through to the
-   fieldset, which answers with the reason — the title tooltip alone never shows on a touch screen. */
-.tp-mode.is-locked {
-  cursor: help;
-}
-
-.tp-mode.is-locked .seg input {
-  pointer-events: none;
-}
-
-/* …and on the compact layouts (below) this chip replaces the locked control altogether: four dead,
-   unlabelled options become one labelled thing to tap. */
-.tp-mode-note {
-  position: relative;
-  display: none;
-  align-items: center;
-  gap: 7px;
-  min-height: 36px;
-  padding: 0 12px 0 10px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(244, 238, 227, 0.03);
-  color: var(--ink-2);
-  font: 600 12px/1 var(--f-body);
-  white-space: nowrap;
-  flex: none;
-}
-
-/* finger-sized target without making the row taller */
-.tp-mode-note::after {
-  content: '';
-  position: absolute;
-  inset: -5px -4px;
-}
-
-.tp-mode-note .ic {
-  width: 13px;
-  height: 13px;
-  color: var(--ink-3);
-}
-
-.tp-mode-note:hover {
-  border-color: var(--ink-3);
-  color: var(--ink);
 }
 
 .tp-vol {
@@ -2476,18 +2425,7 @@
     justify-self: end;
   }
 
-  /* locked: the chip says "30 s previews" and explains itself when tapped */
-  .tp-mode.is-locked {
-    display: none;
-  }
-
-  .tp-mode-note {
-    display: inline-flex;
-    grid-area: mode;
-    justify-self: end;
-  }
-
-  /* live (own files): the label sits beside the options, and each option is a finger-sized target */
+  /* the label sits beside the options, and each option is a finger-sized target */
   .tp-mode-body {
     display: flex;
     align-items: center;
@@ -2761,6 +2699,18 @@
     display: none;
   }
 
+  /* waiting (nothing on air, no countdown): its reason — up to three lines — gets the tag's room too */
+  .ticker[data-state='waiting'] .tk-tag {
+    display: none;
+  }
+
+  .ticker[data-state='waiting'] {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'main count'
+      'marks count';
+  }
+
   .tk-mark {
     padding: 4px 7px;
     font-size: 10px;
@@ -2926,8 +2876,7 @@
     letter-spacing: 0.1em;
   }
 
-  .tp-mode,
-  .tp-mode-note {
+  .tp-mode {
     margin-left: 6px;
   }
 
@@ -2951,10 +2900,9 @@
   }
 }
 
-/* Phone held upright, playing the user's own files: the track-length control is live, so it gets a
-   full-width row of its own, label included. (With 30-second previews the chip sits beside the vibe
-   slider instead and this row does not exist. A short viewport — the browser's toolbars showing —
-   cannot spare the row: there the options stay beside the slider so the whole booth still fits.) */
+/* Phone held upright: the track-length control (live for every playlist) gets a full-width row of its
+   own, label included. A short viewport — the browser's toolbars showing — cannot spare the row: there
+   the options stay beside the vibe slider so the whole booth still fits. */
 @media (max-width: 719px) and (min-height: 790px) {
   .transport.is-mode-live {
     grid-template-areas:
@@ -3159,8 +3107,7 @@
     padding: 0 16px 3px 14px;
   }
 
-  .tp-mode,
-  .tp-mode-note {
+  .tp-mode {
     margin-left: 0;
   }
 

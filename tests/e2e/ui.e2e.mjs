@@ -8,11 +8,24 @@
 // overflow, key elements present / visible / inside the viewport, a screenshot. Then: phone-browser
 // and phone-on-its-side viewports (the whole booth must fit), every handler from click / tap /
 // keyboard / file input / drop, keyboard shortcuts ignored while typing, failed loads reported at the
-// field they came from, the locked / live track-length control, a cued deck parked in its lane,
+// field they came from, the track-length control (open for every playlist, Preview unavailable for your
+// own files), a cued deck parked in its lane,
 // hostile / sparse / extreme data, view.frame() cost over 600 frames (mean + p95) incl. a 6-minute,
 // 36 000-column track, the Content-Security-Policy (as written and as the browser enforces it), the
 // page with the web-font host blocked or never answering, and the same screens again in Firefox when
 // it is installed (skipped otherwise).
+// Video mode (full songs in YouTube's embedded player, ui-demo.html?mode=video with placeholder boxes in
+// the slots): at ten viewports and four states (first song's ad, next song's muted ad, cued, mixing)
+// each slot is ≥ 200×200, inside the viewport, fully opaque with no filter on it or any ancestor, never
+// clipped, and NO other element is drawn over any part of it (a grid of document.elementsFromPoint
+// probes) — also with toasts showing and the setlist drawer open (on short / sideways phones: the
+// setlist sheet, which opens below the players and never scrolls them away, also while the page is
+// scrolled); the slot elements survive setDeck / setStageMode untouched; the first song's ad explained
+// whole and on screen without scrolling with 'Play previews instead' beside it (in the ticker, or on the
+// video stage where the ticker is below the fold), a 'waiting' reason never cut short, a deck playing a
+// preview not lit as the screen on air, REC unavailable with its reason, EQ / meter inactive, YouTube
+// deck cards, frame() cost. Screenshots: handoff/shots/video-*.png. And the setlist follows the row on
+// air, also after New Set keeps the song on air at the top of a fresh order.
 // Exit code 0 = pass.
 
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
@@ -26,7 +39,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const SHOTS = join(ROOT, 'handoff', 'shots');
 const MAKE_ASSETS = process.argv.includes('--assets');
 // --only=handlers,helpers runs just those sections while working on one of them (default: all of them)
-const SECTIONS = ['screens', 'sizes', 'handlers', 'cued', 'live', 'robust', 'helpers', 'cost', 'index', 'csp', 'fonts', 'firefox'];
+const SECTIONS = ['screens', 'sizes', 'handlers', 'cued', 'live', 'robust', 'setlist', 'helpers', 'cost', 'index', 'csp', 'fonts', 'video', 'firefox'];
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7).split(',').filter(Boolean);
 const unknownSections = ONLY.filter((s) => !SECTIONS.includes(s));
 if (unknownSections.length) {
@@ -61,10 +74,9 @@ const MUST_SEE = {
     ],
     wide: ['.crate .sl', '.deck-a .deck-link', '.deck-a .deck-provider', '#segue-volume', '.pl-title'],
     narrow: ['[data-ref="crate-toggle"]'],
-    // Track length is locked in the mock set (30-second previews): where the transport has room the
-    // four options are shown greyed under their label; on compact layouts a chip stands in for them.
+    // Track length is open for every playlist: the four options, under their label where there is room
     roomy: ['.tp-mode .seg', '.tp-mode-lbl'],
-    compact: ['[data-ref="mode-note"]'],
+    compact: ['.tp-mode .seg'],
   },
 };
 const COMPACT_MAX = 1023;
@@ -311,7 +323,7 @@ async function extraSizes(srv) {
         await settle(screen === 'landing' ? 700 : 300);
         const of = await overflow(page);
         const sels = screen === 'stage'
-          ? ['.waves canvas', '.deck-a .deck-title', '.deck-b [data-part="bpm"]', '.ch-a [data-knob="low"]', '.xf-cap', '[data-ref="play"]', '[data-ref="newset"]', '#segue-vibe', vp.width <= COMPACT_MAX ? '[data-ref="mode-note"]' : '.tp-mode .seg', '[data-ref="rec"]', '[data-ref="share"]']
+          ? ['.waves canvas', '.deck-a .deck-title', '.deck-b [data-part="bpm"]', '.ch-a [data-knob="low"]', '.xf-cap', '[data-ref="play"]', '[data-ref="newset"]', '#segue-vibe', '.tp-mode .seg', '[data-ref="rec"]', '[data-ref="share"]']
           : ['.l-title', '#segue-input', '[data-ref="submit"]'];
         const bad = (await inspect(page, sels, screen === 'stage' && vp.height >= 720)).filter((x) => x.problem);
         const real = errors.filter((e) => !ignorable(e));
@@ -630,64 +642,58 @@ async function handlerChecks(srv, vp, tmp) {
       check(names(got).join() === 'onPlayPause', 'stage: Space after clicking Share still means play/pause');
     }
 
-    // track length: locked for previews, live with local files
+    // track length: open for every playlist (Preview = 30-second clips, the others = full songs from
+    // YouTube); with your own files Preview is not offered, and a tap on it says why
     await fresh();
-    const locked = await page.evaluate(() => ({ disabled: document.querySelector('[data-ref="mode"]').disabled, checked: document.querySelector('.seg input:checked')?.value }));
-    check(locked.disabled && locked.checked === 'preview', 'stage: track-length control is disabled (showing "preview") unless modeEnabled');
-    // …and a locked control must say why when it is tapped: a title tooltip never shows on a touch screen
     const compact = vp.width <= COMPACT_MAX;
-    const lockedLook = await page.evaluate(() => {
-      const vis = (sel) => {
-        const el = document.querySelector(sel);
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
-      };
-      const note = document.querySelector('[data-ref="mode-note"]');
-      const r = note.getBoundingClientRect();
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      // the tappable area is the chip plus the margin its ::after adds around it
-      const hit = (x, y) => document.elementFromPoint(x, y) === note || note.contains(document.elementFromPoint(x, y));
-      let top = cy;
-      let bottom = cy;
-      while (top > 0 && hit(cx, top - 1)) top--;
-      while (bottom < innerHeight && hit(cx, bottom + 1)) bottom++;
-      return { seg: vis('.tp-mode .seg'), note: vis('[data-ref="mode-note"]'), text: note.textContent.trim(), isButton: note.tagName === 'BUTTON' && !note.disabled, target: Math.round(bottom - top + 1), width: Math.round(r.width), group: document.querySelector('[data-ref="mode"] legend').textContent.trim() };
-    });
-    if (compact) {
-      check(lockedLook.note && !lockedLook.seg && lockedLook.isButton && /30 s previews/.test(lockedLook.text) && lockedLook.target >= 44 && lockedLook.width >= 44, `stage: compact layout shows one labelled chip in place of the locked options ("${lockedLook.text}", tap target ${lockedLook.width}×${lockedLook.target}px)`);
-      await press(page, vp, '[data-ref="mode-note"]');
-    } else {
-      check(lockedLook.seg && !lockedLook.note && lockedLook.group === 'Track length', 'stage: roomy layout keeps the greyed options under their "Track length" label');
-      await press(page, vp, '.seg label:nth-child(4)');
-    }
-    await settle(60);
-    got = await calls(page);
-    const why = await page.evaluate(() => ({ toasts: [...document.querySelectorAll('.toast p')].map((n) => n.textContent), checked: document.querySelector('.seg input:checked')?.value }));
-    check(got.length === 0 && why.checked === 'preview' && why.toasts.some((t) => /30 seconds/.test(t) && /your own files/.test(t)), `stage: tapping the locked track-length control explains it and changes nothing ("${why.toasts[0] || ''}")`);
-
-    await fresh('&long=1');
-    const liveLook = await page.evaluate(() => {
+    const lengths = await page.evaluate(() => {
       const box = (sel) => document.querySelector(sel).getBoundingClientRect();
-      const lbl = box('.tp-mode-lbl');
+      const inputs = [...document.querySelectorAll('.seg input')];
       return {
-        options: [...document.querySelectorAll('.seg label')].map((l) => ({ w: Math.round(l.getBoundingClientRect().width), h: Math.round(l.getBoundingClientRect().height) })),
-        label: lbl.width > 0 && lbl.height > 0, noteHidden: box('[data-ref="mode-note"]').width === 0, enabled: !document.querySelector('[data-ref="mode"]').disabled,
+        fieldset: !document.querySelector('[data-ref="mode"]').disabled,
+        enabled: inputs.filter((i) => !i.disabled).map((i) => i.value),
+        checked: document.querySelector('.seg input:checked')?.value,
+        options: [...document.querySelectorAll('.seg label')].map((l) => ({ w: Math.round(l.getBoundingClientRect().width), h: Math.round(l.getBoundingClientRect().height), title: l.title })),
+        hint: document.querySelector('[data-ref="mode-hint"]').textContent,
+        label: box('.tp-mode-lbl').width > 0, group: document.querySelector('[data-ref="mode"] legend').textContent.trim(),
         ownRow: box('[data-ref="mode"]').top >= box('.vibe-ctl').bottom - 1, sw: document.documentElement.scrollWidth,
+        lockGone: !document.querySelector('[data-ref="mode-note"], [data-ref="mode-lock"]'),
       };
     });
-    const small = liveLook.options.filter((o) => o.w < 44 || o.h < 44);
+    const small = lengths.options.filter((o) => o.w < 44 || o.h < 44);
+    check(lengths.fieldset && lengths.enabled.join() === 'preview,short,medium,full' && lengths.checked === 'preview' && lengths.lockGone && lengths.group === 'Track length', `stage: track length is open for a streaming playlist — all four options live, no lock (${lengths.enabled.join(', ')})`);
+    check(/30-second clips, beat-matched/.test(lengths.options[0].title) && lengths.options.slice(1).every((o) => /full songs from YouTube/.test(o.title)) && lengths.hint === '30-second clips, beat-matched', `stage: track-length microcopy — Preview "${lengths.options[0].title}", Full "${lengths.options[3].title}", hint "${lengths.hint}"`);
     if (compact) {
-      check(liveLook.enabled && liveLook.noteHidden && small.length === 0 && liveLook.sw <= vp.width, `stage: with own files the options are live and finger-sized (${liveLook.options.map((o) => `${o.w}×${o.h}`).join(', ')})`);
-      if (vp.height >= 790 && vp.width < 720) check(liveLook.label && liveLook.ownRow, 'stage: on a phone the live control has a row of its own, with its "Track length" label');
+      check(small.length === 0 && lengths.sw <= vp.width, `stage: the options are finger-sized on a compact layout (${lengths.options.map((o) => `${o.w}×${o.h}`).join(', ')})`);
+      if (vp.height >= 790 && vp.width < 720) check(lengths.label && lengths.ownRow, 'stage: on a phone the control has a row of its own, with its "Track length" label');
     } else {
-      check(liveLook.enabled && liveLook.noteHidden && liveLook.label, 'stage: with own files the options are live, under their label');
+      check(lengths.label, 'stage: the options sit under their "Track length" label');
     }
     await press(page, vp, '.seg label:nth-child(4)');
+    await settle(60);
     got = await calls(page);
-    check(got.length === 1 && got[0][0] === 'onMode' && got[0][1] === 'full', `stage: track length (enabled) → onMode(${JSON.stringify(got[0] && got[0][1])})`);
-    const quiet = await page.evaluate(() => [...document.querySelectorAll('.toast p')].some((n) => /30 seconds/.test(n.textContent)));
-    check(!quiet, 'stage: a live control does not show the "locked" explanation');
+    const hintFull = await page.evaluate(() => document.querySelector('[data-ref="mode-hint"]').textContent);
+    check(got.length >= 1 && got[0][0] === 'onMode' && got[0][1] === 'full' && hintFull === 'full songs from YouTube', `stage: track length → onMode(${JSON.stringify(got[0] && got[0][1])}), hint now "${hintFull}"`);
+    const quiet = await page.evaluate(() => [...document.querySelectorAll('.toast p')].some((n) => /30 seconds|your own files/.test(n.textContent)));
+    check(!quiet, 'stage: no "locked" explanation for a streaming playlist');
+
+    await fresh('&long=1');
+    const local = await page.evaluate(() => ({
+      enabled: [...document.querySelectorAll('.seg input')].filter((i) => !i.disabled).map((i) => i.value),
+      previewOff: document.querySelector('.seg input[value="preview"]').disabled,
+      title: document.querySelector('.seg label:first-child').title,
+      checked: document.querySelector('.seg input:checked')?.value,
+      hint: document.querySelector('[data-ref="mode-hint"]').textContent,
+    }));
+    check(local.previewOff && local.enabled.join() === 'short,medium,full' && local.checked === 'medium' && /your own files always play full length/.test(local.title) && local.hint === 'your own files, full length', `stage: with your own files Preview is unavailable and says why ("${local.title}"), the rest stay live`);
+    await press(page, vp, '.seg label:nth-child(1)');
+    await settle(60);
+    got = await calls(page);
+    const whyLocal = await page.evaluate(() => ({ toasts: [...document.querySelectorAll('.toast p')].map((n) => n.textContent), checked: document.querySelector('.seg input:checked')?.value }));
+    check(got.length === 0 && whyLocal.checked === 'medium' && whyLocal.toasts.some((t) => /Previews are for streaming playlists/.test(t)), `stage: tapping the unavailable Preview explains it and changes nothing ("${whyLocal.toasts[0] || ''}")`);
+    await press(page, vp, '.seg label:nth-child(4)');
+    got = await calls(page);
+    check(got.length === 1 && got[0][0] === 'onMode' && got[0][1] === 'full', `stage: own files, Full → onMode(${JSON.stringify(got[0] && got[0][1])})`);
 
     if (wide || vp.width >= 1024) {
       await fresh();
@@ -1085,7 +1091,7 @@ async function robustChecks(srv) {
       const real = errors.filter((e) => !ignorable(e));
       check(r.threw.length === 0 && real.length === 0, `hard data @ ${vp.name}: no exceptions, no console errors${r.threw.length ? ` — ${r.threw.join(' | ')}` : ''}${real.length ? ` — ${real.join(' | ')}` : ''}`);
       check(r.sw <= vp.width && r.out.length === 0 && r.rec && r.share && r.elapsed && r.count, `hard data @ ${vp.name}: very long titles / seed / clock stay inside the window (Rec, Share, clock, countdown all visible)${r.out.length ? ` — sticking out: ${r.out.join(', ')}` : ''}`);
-      check(r.bpmB === '–' && r.rows === 400 && r.text && r.toastH < 140 && r.setlistMs < 250, `hard data @ ${vp.name}: NaN tempo shows a dash, 400-row setlist in ${r.setlistMs.toFixed(0)} ms, toasts capped at ${Math.round(r.toastH)} px`);
+      check(r.bpmB === '—' && r.rows === 400 && r.text && r.toastH < 140 && r.setlistMs < 250, `hard data @ ${vp.name}: NaN tempo shows a dash, 400-row setlist in ${r.setlistMs.toFixed(0)} ms, toasts capped at ${Math.round(r.toastH)} px`);
       await page.screenshot({ path: join(SHOTS, `stage-hard-data-${vp.name}.png`) });
     } finally {
       await close();
@@ -1153,11 +1159,14 @@ async function firefoxChecks(srv) {
           `firefox ${screen} @ ${vp.name}: no errors, no policy violations, no overflow, ${sels.length} key elements visible${screen === 'stage' ? `, waveform ${(info.painted * 100).toFixed(0)}% painted, beat lock lit, frame ≈ ${info.cost.toFixed(2)} ms (300-frame batch incl. mock)` : ''}${info.fonts ? '' : ' (web fonts not loaded)'}${bad.length ? ` — ${bad.map((b) => `${b.sel}: ${b.problem}`).join('; ')}` : ''}${real.length ? ` — ${real.join(' | ')}` : ''}${info.sw > vp.width ? ` — scrollWidth ${info.sw}` : ''}${info.csp.length ? ` — CSP: ${info.csp.join(' | ')}` : ''}`,
         );
         if (screen === 'stage') {
-          // Gecko swallows clicks on disabled controls: the locked track-length control must still answer
-          await page.click(vp.width <= COMPACT_MAX ? '[data-ref="mode-note"]' : '.seg label:nth-child(4)');
+          // Gecko swallows clicks on disabled controls: an unavailable track length (Preview, for your own
+          // files) must still answer
+          await page.evaluate(() => window.__segueDemo.view.setPlaylist({ title: 'Your files', count: 3, source: 'local' }));
+          await page.click('.seg label:nth-child(1)');
           await settle(80);
           const said = await page.evaluate(() => [...document.querySelectorAll('.toast p')].map((n) => n.textContent));
-          check(said.some((t) => /30 seconds/.test(t)), `firefox stage @ ${vp.name}: clicking the locked track-length control explains it${said.length ? '' : ' — no toast appeared'}`);
+          check(said.some((t) => /Previews are for streaming playlists/.test(t)), `firefox stage @ ${vp.name}: clicking the unavailable Preview option explains it${said.length ? '' : ' — no toast appeared'}`);
+          await page.evaluate(() => window.__segueDemo.view.setPlaylist({ title: 'Late Night Drive', count: 14, source: 'spotify' }));
           // a cued deck: parked waveform and countdown in Gecko too
           const cuedFx = await page.evaluate(() => {
             const d = window.__segueDemo;
@@ -1187,6 +1196,19 @@ async function firefoxChecks(srv) {
         }
         await page.screenshot({ path: join(SHOTS, `firefox-${screen}-${vp.name}.png`) });
       }
+      // video mode in Gecko: the slots' rules hold there too
+      errors.length = 0;
+      await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video&vstate=mix`);
+      await page.evaluate(() => {
+        for (let i = 0; i < 30; i++) window.__segueDemo.step(1 / 60);
+      });
+      await settle(300);
+      const fxSlots = await page.evaluate(slotProbe);
+      const fxSw = await page.evaluate(() => document.documentElement.scrollWidth);
+      const fxReal = errors.filter((e) => !ignorable(e));
+      check(fxSlots.every((x) => x.w >= 200 && x.h >= 200 && x.inView && !x.bad.length && !x.anc.length) && fxSw <= vp.width && fxReal.length === 0,
+        `firefox video stage @ ${vp.name}: both slots ${fxSlots.map((x) => `${Math.round(x.w)}×${Math.round(x.h)}`).join(' + ')}, on screen, nothing drawn over them, opaque, no overflow${fxSlots.flatMap((x) => [...x.bad.slice(0, 3), ...x.anc]).map((t) => ` — ${t}`).join('')}${fxReal.length ? ` — ${fxReal.join(' | ')}` : ''}`);
+      await page.screenshot({ path: join(SHOTS, `firefox-video-${vp.name}.png`) });
       await page.close();
     }
   } finally {
@@ -1217,6 +1239,7 @@ async function helperChecks(srv) {
         ],
         times: [dom.fmtTime(0), dom.fmtTime(59.9), dom.fmtTime(61), dom.fmtTime(3725), dom.fmtTime(-4), dom.fmtTime(NaN)],
         labels: [dom.linkLabel('https://open.spotify.com/track/x'), dom.linkLabel('https://www.deezer.com/track/1'), dom.linkLabel('https://music.apple.com/x'), dom.linkLabel('https://example.com'), dom.linkLabel(scriptUrl)],
+        youtube: ['https://www.youtube.com/watch?v=x', 'https://youtu.be/x', 'https://m.youtube.com/watch?v=x', 'https://notyoutube.com/x', 'https://youtube.com.example.net/x'].map(dom.linkLabel),
         // a service's name is only for links that are on that service: the bare domain or a subdomain of it
         own: ['https://spotify.com/x', 'https://deezer.com/x', 'https://deezer.page.link/x', 'https://apple.com/x', 'https://geo.music.apple.com/x'].map(dom.linkLabel),
         lookalikes: ['https://pineapple.com/x', 'https://notspotify.com/x', 'https://mydeezer.com/x', 'https://spotify.com.example.net/x', 'https://open.spotify.com.example.net/x'].map(dom.linkLabel),
@@ -1231,6 +1254,7 @@ async function helperChecks(srv) {
     check(r.labels.join('|') === 'Open in Spotify|Open in Deezer|Open in Apple Music|Open track|', `linkLabel (${r.labels.join(', ')})`);
     check(r.own.join('|') === 'Open in Spotify|Open in Deezer|Open in Deezer|Open in Apple Music|Open in Apple Music', `linkLabel names a service for its own domain and subdomains (${r.own.join(', ')})`);
     check(r.lookalikes.every((l) => l === 'Open track'), `linkLabel does not name a service for a look-alike host (${r.lookalikes.join(', ')})`);
+    check(r.youtube.join('|') === 'Open on YouTube|Open on YouTube|Open on YouTube|Open track|Open track', `linkLabel: YouTube links, not look-alikes (${r.youtube.join(', ')})`);
     check(r.userinfo.every((u) => u === ''), `safeUrl refuses https URLs that carry a user name or password (${JSON.stringify(r.userinfo)})`);
     check(r.filter[0] === 0 && r.filter[1] === 1 && r.filter[2] === -1 && r.filter[3] && r.filter[4], 'filterValue: 0 when open, +1 high-pass fully up, −1 low-pass fully closed, log-scaled in between');
     check(r.track.cols === 3000 && r.track.perSec === 100 && r.track.beats === 60 && r.track.same && r.track.grid && r.track.cue, 'mock.makeTrack: deterministic, 100 columns/s, regular beat grid');
@@ -1247,7 +1271,10 @@ async function indexChecks(srv) {
   const csp = parseCsp(cspOf(html));
   const same = (a, b) => Array.isArray(a) && a.length === b.length && b.every((x) => a.includes(x));
   check(cspOf(html).length > 0 && cspOf(html) === cspOf(demoHtml), 'index.html: Content-Security-Policy meta tag, and ui-demo.html runs under the very same policy');
-  check(same(csp['default-src'], ["'self'"]) && same(csp['script-src'], ["'self'", 'https://api.deezer.com']), `CSP: scripts only from the page itself and Deezer's JSONP endpoint (script-src ${(csp['script-src'] || []).join(' ')})`);
+  const POLICY = "default-src 'self'; script-src 'self' https://api.deezer.com https://www.youtube.com; connect-src 'self' https:; img-src 'self' https: data: blob:; media-src blob:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-src https://www.youtube-nocookie.com https://www.youtube.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'";
+  check(cspOf(html) === POLICY, `index.html: the Content-Security-Policy is exactly the production policy${cspOf(html) === POLICY ? '' : ` — got "${cspOf(html)}"`}`);
+  check(same(csp['default-src'], ["'self'"]) && same(csp['script-src'], ["'self'", 'https://api.deezer.com', 'https://www.youtube.com']), `CSP: scripts only from the page itself, Deezer's JSONP endpoint and YouTube's IFrame API (script-src ${(csp['script-src'] || []).join(' ')})`);
+  check(same(csp['frame-src'], ['https://www.youtube-nocookie.com', 'https://www.youtube.com']), `CSP: frames only from YouTube's two player hosts (frame-src ${(csp['frame-src'] || []).join(' ')})`);
   const loose = Object.entries(csp).filter(([, src]) => src.some((s) => /unsafe-inline|unsafe-eval|unsafe-hashes|^\*$|^https?:\/\/\*$/.test(s))).map(([name]) => name);
   check(loose.length === 0 && same(csp['style-src'], ["'self'", 'https://fonts.googleapis.com']) && same(csp['font-src'], ['https://fonts.gstatic.com']), `CSP: no inline script, inline style or eval anywhere${loose.length ? ` — loose: ${loose.join(', ')}` : ''}`);
   check(['object-src', 'base-uri', 'form-action'].every((d) => same(csp[d], ["'none'"])), "CSP: object-src, base-uri and form-action are 'none' (the last two do not fall back to default-src)");
@@ -1431,11 +1458,13 @@ async function policyChecks(srv) {
   try {
     await watchCsp(page);
     // every screen, a transition, toasts, the setlist, a failed load: the view itself must never trip the policy
-    for (const q of ['screen=landing&freeze=1', 'screen=loading&freeze=1', 'screen=ready&freeze=1', 'screen=stage&freeze=1&toasts=1&rec=1&long=1']) {
+    for (const q of ['screen=landing&freeze=1', 'screen=loading&freeze=1', 'screen=ready&freeze=1', 'screen=stage&freeze=1&toasts=1&rec=1&long=1', 'screen=stage&freeze=1&toasts=1&mode=video']) {
       await open(page, `${srv.url}/ui-demo.html?${q}`);
       const own = await page.evaluate(() => {
         const d = window.__segueDemo;
-        if (d.state().screen === 'stage') {
+        if (d.state().video) {
+          for (let i = 0; i < 900; i++) d.step(1 / 15);
+        } else if (d.state().screen === 'stage') {
           const tr = d.state().trans.find((x) => x.type === 'bassSwap' || x.type === 'eqBlend' || x.type === 'filterBlend');
           d.seek(tr.tStart - 6);
           for (let i = 0; i < 600; i++) d.step(1 / 30);
@@ -1590,6 +1619,508 @@ async function makeAssets(srv) {
   }
 }
 
+// ── video mode: full songs in YouTube's embedded player ───────────────────────────────────────
+//
+// YouTube's terms make these hard rules for the two player slots (SPEC §6.2): visible, ≥ 200×200 CSS px,
+// fully opaque, never covered by anything, never hidden, moved or clipped. ui-demo.html?mode=video mounts
+// a plain placeholder box in each slot where the app mounts the IFrame player.
+
+/**
+ * Runs in the page: for each slot, its box, whether it is on screen, every probe point (a 6 px grid over
+ * the whole slot, edges included) where the topmost element is NOT the slot or something inside it, and
+ * every reason an ancestor (or the slot itself) would make the player less than fully visible. While it
+ * probes, every element is made hit-testable (an adopted stylesheet — CSSOM, so the page's CSP allows
+ * it): a `pointer-events: none` overlay is invisible to elementsFromPoint, and still covers the player.
+ */
+function slotProbe() {
+  const view = window.__segueDemo.view;
+  const name = (el) => `${el.tagName.toLowerCase()}${el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : ''}`;
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync('*, *::before, *::after { pointer-events: auto !important; }');
+  const prev = document.adoptedStyleSheets;
+  document.adoptedStyleSheets = [...prev, sheet];
+  try {
+    return [0, 1].map((i) => {
+      const slot = view.videoSlot(i);
+      const r = slot.getBoundingClientRect();
+      const bad = [];
+      let probes = 0;
+      const STEP = 6;
+      const nx = Math.max(2, Math.ceil((r.width - 2) / STEP) + 1);
+      const ny = Math.max(2, Math.ceil((r.height - 2) / STEP) + 1);
+      for (let a = 0; a < nx; a++) {
+        for (let b = 0; b < ny; b++) {
+          const x = r.left + 1 + ((r.width - 2) * a) / (nx - 1);
+          const y = r.top + 1 + ((r.height - 2) * b) / (ny - 1);
+          if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+          probes++;
+          const top = document.elementsFromPoint(x, y)[0];
+          if (!top || !(top === slot || slot.contains(top))) bad.push(`slot ${i} covered at ${Math.round(x)},${Math.round(y)} by ${top ? name(top) : 'nothing'}`);
+        }
+      }
+      const anc = [];
+      for (let el = slot; el && el.nodeType === 1; el = el.parentElement) {
+        const cs = getComputedStyle(el);
+        const who = el === slot ? `slot ${i}` : name(el);
+        if (cs.opacity !== '1') anc.push(`${who}: opacity ${cs.opacity}`);
+        if (cs.filter !== 'none') anc.push(`${who}: filter ${cs.filter}`);
+        if (cs.visibility !== 'visible') anc.push(`${who}: visibility ${cs.visibility}`);
+        if (cs.display === 'none') anc.push(`${who}: display none`);
+        if (cs.mixBlendMode !== 'normal') anc.push(`${who}: blend ${cs.mixBlendMode}`);
+        if (el !== slot && (cs.overflowX !== 'visible' || cs.overflowY !== 'visible' || cs.clipPath !== 'none')) {
+          const ar = el.getBoundingClientRect();
+          if (r.left < ar.left - 0.5 || r.right > ar.right + 0.5 || r.top < ar.top - 0.5 || r.bottom > ar.bottom + 0.5) anc.push(`${who}: clips the slot`);
+        }
+      }
+      const own = getComputedStyle(slot);
+      if (own.borderRadius !== '0px') anc.push(`slot ${i}: rounded corners clip the player (${own.borderRadius})`);
+      if (own.transform !== 'none') anc.push(`slot ${i}: transformed`);
+      return {
+        w: r.width, h: r.height, top: r.top, bottom: r.bottom, probes,
+        inView: r.left >= -0.5 && r.top >= -0.5 && r.right <= innerWidth + 0.5 && r.bottom <= innerHeight + 0.5,
+        bad, anc,
+      };
+    });
+  } finally {
+    document.adoptedStyleSheets = prev;
+  }
+}
+
+const VIDEO_VIEWPORTS = [
+  ...VIEWPORTS,
+  { name: '1280x720', width: 1280, height: 720, mobile: false },
+  { name: '2560x1080', width: 2560, height: 1080, mobile: false },
+  { name: '768x1024', width: 768, height: 1024, mobile: true },
+  { name: '390x664', width: 390, height: 664, mobile: true },
+  { name: '360x640', width: 360, height: 640, mobile: true },
+  { name: '844x390', width: 844, height: 390, mobile: true },
+  { name: '667x375', width: 667, height: 375, mobile: true },
+];
+const VIDEO_STATES = ['starting', 'ad', 'ready', 'mix'];
+// where the video stage lets the page scroll (short upright phones, phones on their side) — as view.js
+const VIDEO_SCROLL_QUERY = '(max-width: 599px) and (max-height: 730px), (max-width: 1023px) and (max-height: 520px)';
+const VIDEO_SHOTS = new Set(['1440x900', '1024x768', '390x844']);
+
+async function videoChecks(srv) {
+  console.log('\n== video mode (full songs) ==');
+  for (const vp of VIDEO_VIEWPORTS) {
+    const { page, errors, close } = await launch(vp);
+    const base = `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video`;
+    try {
+      // waves mode first: the video stage takes no room and shows nothing
+      await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1`);
+      const waves = await page.evaluate(() => ({ stage: getComputedStyle(document.querySelector('.vstage')).display, canvas: document.querySelector('.waves canvas').getBoundingClientRect().height }));
+      check(waves.stage === 'none' && waves.canvas > 50, `video @ ${vp.name}: in waves mode the video stage is not shown and the waveforms are (${Math.round(waves.canvas)} px)`);
+
+      await open(page, base);
+      const firstSlots = await page.evaluateHandle(() => [window.__segueDemo.view.videoSlot(0), window.__segueDemo.view.videoSlot(1), window.__segueDemo.view.videoSlot(0).firstElementChild, window.__segueDemo.view.videoSlot(1).firstElementChild]);
+      for (const state of VIDEO_STATES) {
+        errors.length = 0;
+        await page.evaluate((st) => {
+          const d = window.__segueDemo;
+          d.seek(d.moment(st));
+          for (let i = 0; i < 30; i++) d.step(1 / 60);
+        }, state);
+        await settle(state === 'starting' ? 300 : 150);
+        const slots = await page.evaluate(slotProbe);
+        const of = await overflow(page);
+        const same = await page.evaluate((els) => els[0] === window.__segueDemo.view.videoSlot(0) && els[1] === window.__segueDemo.view.videoSlot(1) && els[2] === els[0].firstElementChild && els[3] === els[1].firstElementChild && els.every((e) => e.isConnected), firstSlots);
+        const real = errors.filter((e) => !ignorable(e));
+        const problems = slots.flatMap((x) => [...x.bad.slice(0, 4), ...x.anc]);
+        check(slots.every((x) => x.w >= 200 && x.h >= 200), `video ${state} @ ${vp.name}: both slots ≥ 200×200 (${slots.map((x) => `${Math.round(x.w)}×${Math.round(x.h)}`).join(', ')})`);
+        check(slots.every((x) => x.inView), `video ${state} @ ${vp.name}: both slots inside the viewport (${slots.map((x) => `${Math.round(x.top)}..${Math.round(x.bottom)}`).join(', ')} of ${vp.height})`);
+        check(problems.length === 0, `video ${state} @ ${vp.name}: nothing drawn over either slot (${slots.map((x) => x.probes).join(' + ')} probes, 6 px apart), opacity 1 and no filter on the slots and every ancestor, never clipped${problems.length ? ` — ${problems.join('; ')}` : ''}`);
+        check(of.scrollWidth <= vp.width && of.innerWidth === vp.width && same && real.length === 0, `video ${state} @ ${vp.name}: no horizontal overflow, the same two slot elements (and the players in them) as at the start, no console errors${of.wide.length ? ` — wide: ${of.wide.join(', ')}` : ''}${same ? '' : ' — SLOT REPLACED'}${real.length ? ` — ${real.join(' | ')}` : ''}`);
+        const words = await page.evaluate(() => ({
+          a: document.querySelector('[data-vdeck="0"] [data-part="status"]').textContent,
+          b: document.querySelector('[data-vdeck="1"] [data-part="status"]').textContent,
+          da: document.querySelector('[data-vdeck="0"]').dataset.status,
+          db: document.querySelector('[data-vdeck="1"]').dataset.status,
+          tk: document.querySelector('.ticker').dataset.state,
+          act: !document.querySelector('[data-ref="tk-act"]').hidden,
+          count: getComputedStyle(document.querySelector('.tk-count')).display,
+        }));
+        const expect = {
+          starting: words.da === 'ad' && /^Starting · ad playing$/.test(words.a) && words.db === 'empty' && words.tk === 'starting' && words.act && words.count === 'none',
+          ad: /^Live · −\d+:\d\d$/.test(words.a) && words.db === 'ad' && words.b === 'Cued · ad playing' && !words.act,
+          ready: /^Live · −\d+:\d\d$/.test(words.a) && words.db === 'cued' && /^Cued · (in \d+:\d\d|ready)$/.test(words.b),
+          mix: words.a === 'Mixing' && words.b === 'Mixing' && words.tk === 'active',
+        }[state];
+        check(expect, `video ${state} @ ${vp.name}: deck A "${words.a}", deck B "${words.b}", ticker ${words.tk}${words.act ? ' + "Play previews instead"' : ''}`);
+        if (state === 'starting') {
+          // Nothing is heard while the first song's ad runs: why, and the way out, must be whole and on
+          // screen without scrolling — the ticker's reason where the ticker is in view, else the short
+          // line on the video stage (short phones, phones on their side) — with Play still on screen.
+          const st = await page.evaluate((q) => {
+            const scroll = matchMedia(q).matches;
+            const shown = (el) => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+            const onScreen = (el) => {
+              const r = el.getBoundingClientRect();
+              return shown(el) && r.width > 0 && r.height > 0 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5 && r.left >= -0.5 && r.right <= innerWidth + 0.5;
+            };
+            const why = document.querySelector(scroll ? '.vs-start-why' : '.ticker .tk-why');
+            const act = document.querySelector(scroll ? '[data-ref="vs-start-act"]' : '[data-ref="tk-act"]');
+            const acts = [...document.querySelectorAll('button')].filter((b) => /Play previews instead/.test(b.textContent) && shown(b));
+            return {
+              scroll, text: why.textContent, whyOn: onScreen(why), whole: why.scrollHeight <= why.clientHeight + 1 && why.scrollWidth <= why.clientWidth + 1,
+              actOn: onScreen(act), acts: acts.length, play: onScreen(document.querySelector('[data-ref="play"]')), y: scrollY,
+            };
+          }, VIDEO_SCROLL_QUERY);
+          check(st.whyOn && st.whole && /\bad\b/.test(st.text) && st.actOn && st.acts === 1 && st.play && st.y === 0, `video starting @ ${vp.name}: the reason ("${st.text.slice(0, 40)}…", ${st.scroll ? 'on the video stage' : 'in the ticker'}) is whole and on screen without scrolling, with one "Play previews instead" and Play beside it${st.whole ? '' : ' — CUT SHORT'}${st.whyOn ? '' : ' — reason off screen'}${st.actOn ? '' : ' — button off screen'}${st.play ? '' : ' — Play off screen'}${st.acts === 1 ? '' : ` — ${st.acts} buttons shown`}`);
+        }
+        if (VIDEO_SHOTS.has(vp.name) || state === 'mix') await page.screenshot({ path: join(SHOTS, `video-${state}-${vp.name}.png`) });
+      }
+
+      // floating layers while video is on: three toasts, and the setlist drawer where it is a drawer
+      errors.length = 0;
+      await page.evaluate(() => {
+        const d = window.__segueDemo;
+        d.seek(d.moment('mix'));
+        for (let i = 0; i < 30; i++) d.step(1 / 60);
+        d.view.toast('Couldn’t find a video for “Unreleased Dubplate” — skipping it', 'error');
+        d.view.toast('Link to set #K3F9QZ copied', 'success');
+        d.view.toast('Full songs come from YouTube’s player, ads included — the next song’s ad plays muted while this one is on', 'info');
+      });
+      await settle(350);
+      let slots = await page.evaluate(slotProbe);
+      let problems = slots.flatMap((x) => [...x.bad.slice(0, 4), ...x.anc]);
+      const toastBox = await page.evaluate(() => [...document.querySelectorAll('.toast')].filter((t) => getComputedStyle(t).display !== 'none').map((t) => Math.round(t.getBoundingClientRect().top)));
+      check(problems.length === 0 && toastBox.length >= 1, `video @ ${vp.name}: with toasts showing (${toastBox.length} on screen, top at ${toastBox.join(', ')} px) nothing is drawn over the slots${problems.length ? ` — ${problems.join('; ')}` : ''}`);
+      const inline = await page.evaluate((q) => matchMedia(q).matches, VIDEO_SCROLL_QUERY);
+      if (inline) {
+        // short phones / phones on their side: the page scrolls and the setlist is page content under the
+        // booth. "Setlist" opens it as a sheet BELOW the two players — it must never scroll them away
+        await page.evaluate(() => {
+          window.scrollTo(0, 0);
+          // a click, not a tap: on these layouts the toasts above may sit over the transport
+          document.querySelector('[data-ref="crate-toggle"]').click();
+        });
+        await settle(400);
+        slots = await page.evaluate(slotProbe);
+        problems = slots.flatMap((x) => [...x.bad.slice(0, 4), ...x.anc]);
+        const sh = await page.evaluate(() => {
+          const c = document.querySelector('.crate');
+          const r = c.getBoundingClientRect();
+          const lr = c.querySelector('.crate-list').getBoundingClientRect();
+          const now = c.querySelector('.sl[aria-current="true"]');
+          const nr = now ? now.getBoundingClientRect() : null;
+          return {
+            sheet: c.classList.contains('is-sheet'), pos: getComputedStyle(c).position, top: Math.round(r.top), bottom: Math.round(r.bottom), h: Math.round(r.height),
+            below: [...document.querySelectorAll('.vscreen')].every((v) => v.getBoundingClientRect().bottom <= r.top + 0.5),
+            now: !!nr && nr.top >= lr.top - 1 && nr.bottom <= lr.bottom + 1, rows: c.querySelectorAll('.sl').length,
+            scrim: document.querySelector('[data-ref="scrim"]').hidden, close: document.querySelector('[data-ref="crate-close"]').getClientRects().length > 0,
+            expanded: document.querySelector('[data-ref="crate-toggle"]').getAttribute('aria-expanded'), y: Math.round(scrollY), sw: document.documentElement.scrollWidth,
+          };
+        });
+        check(sh.sheet && sh.pos === 'absolute' && slots.every((x) => x.inView) && problems.length === 0 && sh.below && sh.h >= 150 && sh.bottom <= vp.height + 1 && sh.rows > 5 && sh.now && sh.scrim && sh.close && sh.expanded === 'true' && sh.sw <= vp.width, `video @ ${vp.name}: "Setlist" opens a sheet below the players (page at ${sh.y} px, sheet ${sh.top}..${sh.bottom}, ${sh.h} px tall, row on air in view): both players stay whole on screen (${slots.map((x) => `${Math.round(x.top)}..${Math.round(x.bottom)}`).join(', ')}) and uncovered, no scrim${problems.length ? ` — ${problems.join('; ')}` : ''}${sh.below ? '' : ' — SHEET OVER A PLAYER'}`);
+        // the user scrolls the page with the sheet open: the players only ever move away from it
+        const apart = await page.evaluate(async () => {
+          const out = [];
+          for (const y of [0, 120, 99999]) {
+            window.scrollTo(0, y);
+            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+            const top = document.querySelector('.crate').getBoundingClientRect().top;
+            out.push([...document.querySelectorAll('.vscreen')].every((v) => v.getBoundingClientRect().bottom <= top + 0.5));
+          }
+          return out;
+        });
+        check(apart.every(Boolean), `video @ ${vp.name}: scrolling the page with the sheet open never brings a player under it (${apart.join(', ')})`);
+        // the stage changes under the open sheet (New Set → the first song's start line between the
+        // screens): the sheet follows the screens' new bottom edge
+        const moved = await page.evaluate(async (y) => {
+          window.scrollTo(0, y);
+          const v = window.__segueDemo.view;
+          const clear = () => {
+            const top = document.querySelector('.crate').getBoundingClientRect().top;
+            return [...document.querySelectorAll('.vscreen')].every((s) => s.getBoundingClientRect().bottom <= top + 0.5);
+          };
+          const out = [];
+          for (const tv of [{ type: 'start', label: 'Starting the set', why: 'YouTube plays an ad before the first song — muted here; the set starts when it ends.', state: 'starting', fromTitle: '', toTitle: 'First', tStart: 0, tEnd: 0, marks: [] }, null]) {
+            v.setTransition(tv);
+            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+            out.push(clear());
+          }
+          return out;
+        }, sh.y);
+        check(moved.every(Boolean), `video @ ${vp.name}: the start line coming and going under the open sheet never leaves a player under it (${moved.join(', ')})`);
+        await page.evaluate((y) => window.scrollTo(0, y), sh.y);
+        await settle(100);
+        if (VIDEO_SHOTS.has(vp.name) || vp.name === '390x664' || vp.name === '844x390') await page.screenshot({ path: join(SHOTS, `video-setlist-${vp.name}.png`) });
+        await page.keyboard.press('Escape');
+        await settle(200);
+        const shut = await page.evaluate(() => {
+          const c = document.querySelector('.crate');
+          return { sheet: c.classList.contains('is-sheet'), pos: getComputedStyle(c).position, inert: c.hasAttribute('inert'), hidden: c.getAttribute('aria-hidden'), focus: document.activeElement === document.querySelector('[data-ref="crate-toggle"]') };
+        });
+        check(!shut.sheet && shut.pos === 'static' && !shut.inert && shut.hidden === null && shut.focus, `video @ ${vp.name}: Escape closes the sheet — the setlist is page content again, focus back on "Setlist"`);
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await settle(200);
+      } else if (vp.width < 1180) {
+        await page.evaluate(() => document.querySelector('[data-ref="crate-toggle"]').click());
+        await settle(450);
+        slots = await page.evaluate(slotProbe);
+        problems = slots.flatMap((x) => [...x.bad.slice(0, 4), ...x.anc]);
+        const drawer = await page.evaluate(() => {
+          const c = document.querySelector('.crate');
+          const r = c.getBoundingClientRect();
+          return { open: c.classList.contains('is-open'), top: Math.round(r.top), h: Math.round(r.height), rows: c.querySelectorAll('.sl').length };
+        });
+        check(drawer.open && drawer.rows > 5 && drawer.h > 60 && problems.length === 0, `video @ ${vp.name}: the setlist drawer opens below the screens (top ${drawer.top} px, ${drawer.h} px tall) and covers neither slot${problems.length ? ` — ${problems.join('; ')}` : ''}`);
+        if (VIDEO_SHOTS.has(vp.name)) await page.screenshot({ path: join(SHOTS, `video-drawer-${vp.name}.png`) });
+        await page.keyboard.press('Escape');
+        await settle(350);
+      } else if (VIDEO_SHOTS.has(vp.name)) await page.screenshot({ path: join(SHOTS, `video-toasts-${vp.name}.png`) });
+
+      // the slots survive everything the integrator does around them
+      const kept = await page.evaluate(() => {
+        const v = window.__segueDemo.view;
+        const s0 = v.videoSlot(0);
+        const s1 = v.videoSlot(1);
+        const kid0 = s0.firstElementChild;
+        const parent0 = s0.parentElement;
+        const before = s0.getBoundingClientRect();
+        v.setStageMode('waves');
+        const hiddenInWaves = getComputedStyle(document.querySelector('.vstage')).display === 'none' && getComputedStyle(document.querySelector('.waves')).display !== 'none';
+        v.setStageMode('video');
+        v.setDeck(0, null);
+        v.setDeck(1, null);
+        v.setDeck(0, { playId: 7, title: 'Another Song', artist: 'Someone', duration: 200, provider: 'youtube', wave: null, status: 'cued' });
+        v.setStageMode('video');
+        v.setStageMode('waves');
+        v.setStageMode('video');
+        const after = s0.getBoundingClientRect();
+        return {
+          same: v.videoSlot(0) === s0 && v.videoSlot(1) === s1 && s0.parentElement === parent0 && s0.firstElementChild === kid0 && kid0.isConnected && s0.isConnected,
+          hiddenInWaves, moved: Math.abs(after.top - before.top) + Math.abs(after.left - before.left),
+        };
+      });
+      check(kept.same && kept.hiddenInWaves && kept.moved < 1, `video @ ${vp.name}: setDeck / setStageMode toggles leave both slot elements (and the player inside) where they are${kept.same ? '' : ' — REPLACED OR MOVED IN THE DOM'}${kept.moved >= 1 ? ` — box moved ${kept.moved.toFixed(1)} px` : ''}`);
+    } finally {
+      await close();
+    }
+  }
+
+  // the rest of video mode's contract, at a desktop and a phone size
+  for (const vp of [VIEWPORTS[0], VIEWPORTS[2]]) {
+    console.log(`\n== video mode controls @ ${vp.name} ==`);
+    const { page, errors, close } = await launch(vp);
+    const base = `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video`;
+    const wide = vp.width >= 720;
+    try {
+      await open(page, `${base}&vstate=starting`);
+      await page.evaluate(() => {
+        for (let i = 0; i < 10; i++) window.__segueDemo.step(1 / 60);
+      });
+      await clearCalls(page);
+      const starting = await page.evaluate(() => {
+        const b = document.querySelector('[data-ref="tk-act"]');
+        const r = b.getBoundingClientRect();
+        return { text: b.textContent.trim(), w: r.width, h: r.height, inView: r.top >= 0 && r.bottom <= innerHeight, label: document.querySelector('[data-ref="tk-label"]').textContent, why: document.querySelector('[data-ref="tk-why"]').textContent, count: document.querySelector('[data-ref="tk-count"]').textContent };
+      });
+      check(starting.text === 'Play previews instead' && starting.w > 60 && starting.h >= 36 && starting.inView && starting.count === '' && /ad/.test(starting.why), `video @ ${vp.name}: the first song's ad — "${starting.label}", why "${starting.why.slice(0, 50)}…", no countdown, a ${Math.round(starting.w)}×${Math.round(starting.h)} "Play previews instead" button`);
+      await press(page, vp, '[data-ref="tk-act"]');
+      let got = await calls(page);
+      check(got.length >= 1 && got[0][0] === 'onPreviewOnce' && !got.some((c) => c[0] === 'onMode'), `video @ ${vp.name}: "Play previews instead" → onPreviewOnce (this set only, no onMode): ${JSON.stringify(got.map((c) => c[0]))}`);
+
+      await open(page, `${base}&vstate=mix`);
+      await page.evaluate(() => {
+        for (let i = 0; i < 20; i++) window.__segueDemo.step(1 / 60);
+      });
+      await clearCalls(page);
+      const rec = await page.evaluate(() => {
+        const b = document.querySelector('[data-ref="rec"]');
+        return { aria: b.getAttribute('aria-disabled'), title: b.title, label: b.getAttribute('aria-label'), cls: b.classList.contains('is-disabled'), visible: b.getBoundingClientRect().width > 30 };
+      });
+      check(rec.aria === 'true' && rec.cls && rec.visible && /YouTube/.test(rec.title) && /not available/.test(rec.label), `video @ ${vp.name}: REC is disabled with its reason ("${rec.title}")`);
+      await press(page, vp, '[data-ref="rec"]');
+      await settle(60);
+      got = await calls(page);
+      const recToast = await page.evaluate(() => [...document.querySelectorAll('.toast p')].map((n) => n.textContent));
+      check(got.length === 0 && recToast.some((t) => /YouTube/.test(t) && /recorded/.test(t)), `video @ ${vp.name}: tapping REC explains it instead of recording ("${recToast[0] || ''}")`);
+
+      const mx = await page.evaluate(() => {
+        const vis = (el) => !!el && el.getBoundingClientRect().width > 0 && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden';
+        const knobs = document.querySelector('.ch-a .knobs');
+        return {
+          eqOff: document.querySelector('.ch-a').classList.contains('is-eq-off') && document.querySelector('.ch-b').classList.contains('is-eq-off'),
+          title: knobs.title, note: vis(document.querySelector('.mx-note')) ? document.querySelector('.mx-note').textContent : null,
+          deaf: document.querySelector('.mixer').classList.contains('is-deaf'), lit: getComputedStyle(document.querySelector('.meter-lit')).visibility,
+          meterTitle: document.querySelector('.master').title,
+          lamp: vis(document.querySelector('[data-ref="lock"]')),
+          faderA: document.querySelector('.ch-a .fader-fill').style.transform, faderB: document.querySelector('.ch-b .fader-fill').style.transform,
+          mixerShown: vis(document.querySelector('.mixer')),
+        };
+      });
+      check(mx.eqOff && mx.title === 'EQ works on previews — YouTube audio can’t be processed' && (!mx.mixerShown || /previews only/.test(mx.note || '')), `video @ ${vp.name}: EQ / filter knobs inactive, with the reason ("${mx.title}")${mx.mixerShown ? `, note "${mx.note}"` : ' (mixer not shown on this layout)'}`);
+      check(mx.deaf && mx.lit === 'hidden' && /can’t hear YouTube/.test(mx.meterTitle) && !mx.lamp, `video @ ${vp.name}: master meter off (it cannot hear YouTube), Beat-lock lamp hidden`);
+      if (mx.mixerShown) check(/scaleY\(0\.[1-9]/.test(mx.faderA) && /scaleY\(0\.[1-9]/.test(mx.faderB), `video @ ${vp.name}: the faders follow the players' volume mid-blend (A ${mx.faderA}, B ${mx.faderB})`);
+
+      if (wide) {
+        const card = await page.evaluate(() => ({
+          progress: document.querySelector('.deck-a').classList.contains('is-progress'),
+          provider: document.querySelector('.deck-a [data-part="provider"]').textContent,
+          bpm: document.querySelector('.deck-a [data-part="bpm"]').textContent,
+          key: document.querySelector('.deck-a [data-part="key"]').textContent,
+          leave: !document.querySelector('.deck-a .ov-leave').hidden,
+          played: document.querySelector('.deck-a .ov-played').style.transform,
+          link: document.querySelector('.deck-a [data-part="link-text"]').textContent,
+        }));
+        check(card.progress && card.provider === 'YouTube' && card.bpm === '—' && card.key === '—' && card.leave && /scaleX\(0\.[1-9]/.test(card.played) && card.link === 'Open on YouTube', `video @ ${vp.name}: deck cards show a progress bar with the leave point (played ${card.played}), "${card.provider}", BPM "${card.bpm}", key "${card.key}", "${card.link}"`);
+      }
+
+      const mode = await page.evaluate(() => ({
+        enabled: [...document.querySelectorAll('.seg input')].filter((i) => !i.disabled).map((i) => i.value),
+        checked: document.querySelector('.seg input:checked')?.value,
+        hint: document.querySelector('[data-ref="mode-hint"]').textContent,
+      }));
+      check(mode.enabled.join() === 'preview,short,medium,full' && mode.checked === 'medium' && mode.hint === 'full songs from YouTube', `video @ ${vp.name}: track length open (${mode.enabled.join(', ')}), "${mode.checked}" — "${mode.hint}"`);
+      await clearCalls(page);
+      await press(page, vp, '.seg label:nth-child(2)');
+      got = await calls(page);
+      check(got.length === 1 && got[0][0] === 'onMode' && got[0][1] === 'short', `video @ ${vp.name}: Short → onMode(${JSON.stringify(got[0] && got[0][1])})`);
+
+      // hostile strings in the video captions stay text
+      const safe = await page.evaluate(() => {
+        const v = window.__segueDemo.view;
+        const evil = ['<im', 'g src=x on', 'error="window.__vpwned=1">'].join('');
+        v.setDeck(1, { playId: 50, title: evil, artist: evil, duration: 200, provider: 'youtube', wave: null, status: 'live', statusText: evil });
+        v.frame(window.__segueDemo.frameAt(window.__segueDemo.state().t));
+        const box = document.querySelector('[data-vdeck="1"]');
+        return { kids: box.querySelectorAll('img').length, text: box.querySelector('[data-part="title"]').textContent === evil, status: box.querySelector('[data-part="status"]').textContent.startsWith(evil), pwned: !!window.__vpwned };
+      });
+      check(safe.kids === 0 && safe.text && safe.status && !safe.pwned, 'video: hostile titles / status text in the captions render as text');
+      const real = errors.filter((e) => !ignorable(e));
+      check(real.length === 0, `video controls @ ${vp.name}: no console errors${real.length ? ` — ${real.join(' | ')}` : ''}`);
+    } finally {
+      await close();
+    }
+  }
+
+  // where the ticker is below the fold, the short line on the video stage is the way out — and it works
+  for (const vp of VIDEO_VIEWPORTS.filter((v) => v.name === '360x640' || v.name === '844x390')) {
+    const { page, errors, close } = await launch(vp);
+    try {
+      await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video&vstate=starting`);
+      await page.evaluate(() => {
+        for (let i = 0; i < 10; i++) window.__segueDemo.step(1 / 60);
+      });
+      await clearCalls(page);
+      const tip = await page.evaluate(() => ({ text: document.querySelector('.vs-start-why').textContent, title: document.querySelector('.vs-start-why').title, tk: document.querySelector('[data-ref="tk-why"]').textContent }));
+      await press(page, vp, '[data-ref="vs-start-act"]');
+      const got = await calls(page);
+      check(got.length >= 1 && got[0][0] === 'onPreviewOnce' && !got.some((c) => c[0] === 'onMode') && tip.title === tip.tk, `video @ ${vp.name}: "${tip.text}" + "Play previews instead" on the video stage → onPreviewOnce (${JSON.stringify(got.map((c) => c[0]))}); the ticker's whole reason is its tooltip`);
+      const real = errors.filter((e) => !ignorable(e));
+      check(real.length === 0, `video start line @ ${vp.name}: no console errors${real.length ? ` — ${real.join(' | ')}` : ''}`);
+    } finally {
+      await close();
+    }
+  }
+
+  // the next song still in its ad (TransitionView 'waiting'): its reason wraps instead of being cut short
+  // (phones), and a deck playing a song's preview instead of its video is not lit as the screen on air
+  for (const vp of [VIEWPORTS[0], VIEWPORTS[2], VIDEO_VIEWPORTS.find((v) => v.name === '360x640')]) {
+    const { page, errors, close } = await launch(vp);
+    try {
+      await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video&vstate=ready`);
+      const w = await page.evaluate(() => {
+        const v = window.__segueDemo.view;
+        v.setTransition({ type: 'wait', label: 'Next song after its ad', why: 'YouTube is showing an ad before the next song (muted, on the other deck) — this one plays on until it ends.', state: 'waiting', fromTitle: '', toTitle: 'Next', tStart: 10, tEnd: 10, marks: [] });
+        const why = document.querySelector('.ticker .tk-why');
+        return { whole: why.scrollHeight <= why.clientHeight + 1 && why.scrollWidth <= why.clientWidth + 1, h: Math.round(why.getBoundingClientRect().height), tip: document.querySelector('[data-ref="tk-why"]').title };
+      });
+      check(w.whole && /this one plays on/.test(w.tip), `video @ ${vp.name}: 'waiting' — the reason is whole (${w.h} px tall) and is the line's tooltip too`);
+
+      const lit = async (deck) => {
+        await page.evaluate((dv) => {
+          const d = window.__segueDemo;
+          d.view.setDeck(0, dv);
+          d.view.frame(d.frameAt(d.state().t));
+        }, deck);
+        await settle(400); // the ring's colour and glow ease over 0.25 s
+        return page.evaluate(() => {
+          const box = document.querySelector('[data-vdeck="0"]');
+          const ring = getComputedStyle(box.querySelector('.vscreen'));
+          const st = box.querySelector('[data-part="status"]');
+          return { shadow: ring.boxShadow, bg: ring.backgroundColor, status: st.textContent, tip: st.title };
+        });
+      };
+      const clip = await lit({ playId: 61, title: 'Clip Song', artist: 'Clip Artist', duration: 30, provider: 'preview', wave: null, status: 'live' });
+      const live = await lit({ playId: 62, title: 'Video Song', artist: 'Video Artist', duration: 200, provider: 'youtube', wave: null, status: 'live' });
+      const told = await lit({ playId: 63, title: 'Clip Song', artist: 'Clip Artist', duration: 30, provider: 'preview', wave: null, status: 'live', statusText: 'Preview clip' });
+      check(/^No video · its 30-s preview/.test(clip.status) && /30-second preview/.test(clip.tip) && clip.bg !== live.bg && /44px/.test(live.shadow) && !/44px/.test(clip.shadow) && live.tip === '' && /^Preview clip/.test(told.status) && told.bg === clip.bg, `video @ ${vp.name}: a deck playing a preview says so ("${clip.status}") and its screen is not lit as the one on air (ring ${clip.bg} vs ${live.bg})`);
+      const real = errors.filter((e) => !ignorable(e));
+      check(real.length === 0, `video waiting / preview deck @ ${vp.name}: no console errors${real.length ? ` — ${real.join(' | ')}` : ''}`);
+    } finally {
+      await close();
+    }
+  }
+
+  // frame() cost in video mode
+  for (const vp of [VIEWPORTS[0], VIEWPORTS[2]]) {
+    const { page, close } = await launch(vp);
+    try {
+      await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1&mode=video&vstate=ready`);
+      const r = await page.evaluate(() => {
+        const d = window.__segueDemo;
+        const xs = [];
+        // ready → through the hand-over: status changes, countdowns, bars
+        for (let i = 0; i < 1200; i++) xs.push(d.step(1 / 30));
+        xs.sort((a, b) => a - b);
+        // the same span again, timed as one batch (not limited by the 0.1 ms timer resolution; includes the mock)
+        d.seek(d.moment('ready'));
+        const t0 = performance.now();
+        for (let i = 0; i < 1200; i++) d.step(1 / 30);
+        const batch = (performance.now() - t0) / 1200;
+        return { mean: xs.reduce((a, b) => a + b, 0) / xs.length, p95: xs[Math.floor(xs.length * 0.95)], max: xs[xs.length - 1], batch };
+      });
+      const limit = vp.mobile ? 8 : 4;
+      const line = `video frame() @ ${vp.name}: 1200 frames mean ${r.mean.toFixed(2)} ms (batch-timed, incl. mock: ${r.batch.toFixed(3)}) · p95 ${r.p95.toFixed(2)} · max ${r.max.toFixed(2)}`;
+      notes.push(line);
+      check(r.p95 < limit, `${line}  (target p95 < ${limit} ms)`);
+    } finally {
+      await close();
+    }
+  }
+}
+
+// ── setlist: the row on air stays in view ─────────────────────────────────────────────────────
+async function setlistChecks(srv) {
+  console.log('\n== setlist follows the row on air ==');
+  const { page, errors, close } = await launch(VIEWPORTS[0]);
+  try {
+    await open(page, `${srv.url}/ui-demo.html?screen=stage&freeze=1`);
+    const r = await page.evaluate(async () => {
+      const v = window.__segueDemo.view;
+      const frames = () => new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+      const list = document.querySelector('.crate-list');
+      const row = (i, state) => ({ key: `k${i}|0`, title: `Row Song ${i}`, artist: `Row Artist ${i}`, state });
+      const inView = (state) => {
+        const el = list.querySelector(`.sl[data-state="${state}"]`);
+        if (!el) return false;
+        const a = el.getBoundingClientRect();
+        const b = list.getBoundingClientRect();
+        return a.top >= b.top - 1 && a.bottom <= b.bottom + 1;
+      };
+      const look = () => ({ top: Math.round(list.scrollTop), now: inView('playing'), next: inView('next'), count: document.querySelector('[data-ref="crate-count"]').textContent });
+      // twelve songs into a set: 12 played, the one on air, the next, 16 queued
+      v.setSetlist(Array.from({ length: 30 }, (_, i) => row(i, i < 12 ? 'played' : i === 12 ? 'playing' : i === 13 ? 'next' : 'queued')), { crate: 30 });
+      await frames();
+      const before = look();
+      // New Set with that song on air: it plays on — the same row, same key — at the top of a fresh order,
+      // and the list keeps its length (the played rows give way to queued ones)
+      v.setSetlist([row(12, 'playing'), row(30, 'next'), ...Array.from({ length: 28 }, (_, i) => row(31 + i, 'queued'))], { crate: 30 });
+      await frames();
+      return { before, after: look() };
+    });
+    check(r.before.top > 100 && r.before.now && r.before.next, `setlist: twelve songs in, the list follows the row on air (scrolled ${r.before.top} px, NOW and NEXT in view, "${r.before.count}")`);
+    check(r.after.now && r.after.next && r.after.top < 60, `setlist: New Set with that song still on air — NOW and NEXT are in view again (scrolled ${r.after.top} px, "${r.after.count}")${r.after.now ? '' : ' — NOW OUT OF VIEW'}`);
+    const real = errors.filter((e) => !ignorable(e));
+    check(real.length === 0, `setlist: no console errors${real.length ? ` — ${real.join(' | ')}` : ''}`);
+  } finally {
+    await close();
+  }
+}
+
 // ── run ───────────────────────────────────────────────────────────────────────────────────────
 await mkdir(SHOTS, { recursive: true });
 const tmp = await mkdtemp(join(tmpdir(), 'segue-ui-'));
@@ -1611,6 +2142,7 @@ try {
   if (want('cued')) await cuedChecks(srv);
   if (want('live')) await liveChecks(srv);
   if (want('robust')) await robustChecks(srv);
+  if (want('setlist')) await setlistChecks(srv);
   if (want('helpers')) await helperChecks(srv);
   if (want('cost')) {
     await frameCost(srv, VIEWPORTS[0]);
@@ -1619,6 +2151,7 @@ try {
   if (want('index')) await indexChecks(srv);
   if (want('csp')) await policyChecks(srv);
   if (want('fonts')) await fontChecks(srv);
+  if (want('video')) await videoChecks(srv);
   if (want('firefox')) await firefoxChecks(srv);
 } catch (err) {
   crashed = err;

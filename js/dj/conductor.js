@@ -263,6 +263,15 @@ export function createConductor(deps) {
   let cycle = 0;
   /** @type {any[]} PlayRec: {id, play, entry, tr, buffer, key, tricks, gone} */
   let plays = [];
+  /**
+   * A set handed over from full songs (load's carry, main.js): the tracks it played or had on air
+   * (entries, oldest first: setlist rows `${id}|c${i}`, out of this order's first pass) and its Elapsed.
+   * While the set it came from plays on until this one sounds (carry.live), Elapsed keeps running from
+   * `carryRunsFrom` (clock ms); once this set starts, that wait is folded into `elapsedBase`.
+   */
+  let carried = [];
+  let elapsedBase = 0;
+  let carryRunsFrom = -1;
   let started = false;
   let starting = false;
   let allowed = false;
@@ -576,19 +585,7 @@ export function createConductor(deps) {
       gone: false,
     };
     plays.push(rec);
-    const at = fresh ? queue.indexOf(e.id) : -1;
-    if (at >= 0) {
-      const pass = queuePass.get(e.id);
-      queue.splice(at, 1);
-      queuePass.delete(e.id);
-      // The next pass was queued while this track was still waiting for its turn in this one, so it
-      // is not in it (an id is in the queue once). It joins that pass now, at the back: every pass
-      // plays every track exactly once.
-      if (pass < cycle) {
-        queue.push(e.id);
-        queuePass.set(e.id, cycle);
-      }
-    }
+    if (fresh) take(e);
     // Big playlists let the compressed audio go once it is in the mix; it is fetched again if the
     // track comes round in a later pass.
     if (e.bytes && entries.size > KEEP_BYTES_UP_TO) {
@@ -598,6 +595,27 @@ export function createConductor(deps) {
     if (plays.length > HISTORY) plays = plays.slice(-HISTORY);
     bump();
     return rec;
+  }
+
+  /** Take a track out of the queue: it has had its turn in this pass (played, or carried over). */
+  function take(e) {
+    const at = queue.indexOf(e.id);
+    if (at < 0) return;
+    const pass = queuePass.get(e.id);
+    queue.splice(at, 1);
+    queuePass.delete(e.id);
+    // The next pass was queued while this track was still waiting for its turn in this one, so it
+    // is not in it (an id is in the queue once). It joins that pass now, at the back: every pass
+    // plays every track exactly once.
+    if (pass < cycle) {
+      queue.push(e.id);
+      queuePass.set(e.id, cycle);
+    }
+  }
+
+  /** Elapsed time carried over from the set this one took over from (see `carried`). */
+  function carriedElapsed() {
+    return elapsedBase + (carryRunsFrom >= 0 ? Math.max(0, clock() - carryRunsFrom) / 1000 : 0);
   }
 
   function refill() {
@@ -610,7 +628,8 @@ export function createConductor(deps) {
         cycle + 1,
         alive,
         queue,
-        plays.map((r) => r.entry.id),
+        // (the tracks carried over from the set before were heard just before this set's own)
+        carried.map((e) => e.id).concat(plays.map((r) => r.entry.id)),
       );
       if (!more.length) break;
       cycle++;
@@ -740,6 +759,11 @@ export function createConductor(deps) {
         }
         if (g !== setGen) return;
         started = true;
+        // the set it took over from played on until now: that time belongs to Elapsed too
+        if (carryRunsFrom >= 0) {
+          elapsedBase = carriedElapsed();
+          carryRunsFrom = -1;
+        }
         userPaused = false;
         // An honest start: where the browser would not let the audio run without a tap (Safari once
         // its file picker has closed, any browser after a drop) the set is cued, not playing — it
@@ -1140,6 +1164,9 @@ export function createConductor(deps) {
     queuePass = new Map(order.map((id) => [id, 0]));
     cycle = 0;
     plays = [];
+    carried = []; // a new set starts its own history (load() applies a carry after this)
+    elapsedBase = 0;
+    carryRunsFrom = -1;
     started = false;
     starting = false;
     paused = false;
@@ -1159,9 +1186,14 @@ export function createConductor(deps) {
    * Load a playlist and begin preparing it. Playback starts as soon as an opener is ready and
    * begin() has been called (autostart: true calls it for you; a share link waits for the tap).
    * @param {any} pl Playlist
-   * @param {{seed?: string, vibe?: number, mode?: string, autostart?: boolean, patient?: boolean}} [opts]
+   * @param {{seed?: string, vibe?: number, mode?: string, autostart?: boolean, patient?: boolean,
+   *   carry?: {played?: string[], elapsed?: number, at?: number, live?: boolean}}} [opts]
    *   patient: the seed comes from a share link — choose the opener from the whole head of the order,
    *   as the sender's set did, even if one of its tracks takes a while to arrive (up to 10 s).
+   *   carry: the set this one takes over from (full songs → Preview, main.js), as fullset.load takes it:
+   *   the track ids it played or has on air (oldest first) are taken out of this order's first pass and
+   *   shown as played, and Elapsed goes on from its `elapsed`. `live` + `at` (clock ms the elapsed was
+   *   read at): that set plays on until this one sounds, and Elapsed runs on through the wait.
    */
   function load(pl, opts = {}) {
     stop();
@@ -1185,6 +1217,15 @@ export function createConductor(deps) {
     if (MODES.includes(opts.mode)) userMode = opts.mode;
     allowed = !!opts.autostart;
     newPlanner();
+    const carry = opts.carry || {};
+    for (const id of Array.isArray(carry.played) ? carry.played : []) {
+      const e = entries.get(id);
+      if (!e || carried.includes(e)) continue;
+      carried.push(e);
+      take(e);
+    }
+    elapsedBase = Number.isFinite(carry.elapsed) && carry.elapsed > 0 ? carry.elapsed : 0;
+    carryRunsFrom = carry.live && Number.isFinite(carry.at) ? carry.at : -1;
     if (!ids.length) {
       failFatal('That playlist has no songs in it.');
       return;
@@ -1228,6 +1269,9 @@ export function createConductor(deps) {
     order = [];
     queue = [];
     plays = [];
+    carried = [];
+    elapsedBase = 0;
+    carryRunsFrom = -1;
     started = false;
     starting = false;
     allowed = false;
@@ -1394,6 +1438,8 @@ export function createConductor(deps) {
     const mixing = started && k > 0 && now < plays[k].tr.tEnd;
     /** Tracks in the mix or announced right now. */
     const onAir = new Set();
+    // what the set before this one played (full songs → Preview), as it showed them
+    carried.forEach((e, i) => row(e, `${e.id}|c${i}`, 'played'));
     plays.forEach((rec, i) => {
       let state = 'played';
       // (a track whose audio has run out is not "now" any more, even if nothing has followed it yet)
@@ -1457,6 +1503,8 @@ export function createConductor(deps) {
         ? { id: playlist.id, title: playlist.title, subtitle: playlist.subtitle, artwork: playlist.artwork, link: playlist.link, source: playlist.source, count: ids.length, total: playlist.total }
         : null,
       now,
+      /** what Elapsed shows: set time plus the time carried over from the set this one took over from */
+      elapsed: (now > 0 ? now : 0) + carriedElapsed(),
       playIndex: cur ? cur.id : -1,
       current: cur ? { playId: cur.id, trackId: cur.entry.id, title: cur.entry.meta.title, artist: cur.entry.meta.artist || '', artwork: cur.entry.meta.artwork || (cur.entry.ref && cur.entry.ref.artwork) } : null,
       decks: [deckInfo(live.decks[0]), deckInfo(live.decks[1])],
@@ -1522,6 +1570,8 @@ export function createConductor(deps) {
     audioState: () => audioState(),
     /** Cheap enough for every animation frame: would Skip do something right now? */
     canSkip: () => started && !!skipTarget(engine.now()),
+    /** What Elapsed shows at set time t (per frame, no allocation): t plus the carried-over time. */
+    elapsedAt: (t) => (t > 0 ? t : 0) + carriedElapsed(),
     snapshot,
     history,
     debug,

@@ -955,3 +955,62 @@ test('canSkip() is the same answer the snapshot gives, without building one', as
     assert.equal(r.conductor.canSkip(), r.conductor.snapshot().canSkip);
   }
 });
+
+test('handed over from full songs: the songs it played are not played again, they show as played, and Elapsed goes on', async () => {
+  const r = rig(10);
+  r.conductor.load(r.playlist, { seed: 'carry1', autostart: false });
+  const plain = r.conductor.debug().order;
+  const heard = [plain[0], plain[1], plain[2]];
+  r.conductor.load(r.playlist, { seed: 'carry1', autostart: true, carry: { played: heard, elapsed: 372 } });
+  let s = r.conductor.snapshot();
+  assert.deepEqual(
+    s.setlist.slice(0, 3).map((x) => [x.key, x.state]),
+    heard.map((id, i) => [`${id}|c${i}`, 'played']),
+    'the songs the full-song set played lead the setlist as played rows',
+  );
+  assert.equal(s.setlist.length, 10, 'each track listed once');
+  assert.equal(s.elapsed, 372, 'Elapsed starts where the full-song set was');
+  await r.run(80);
+  const h = r.conductor.history();
+  assert.ok(h.length >= 5, `${h.length} plays`);
+  const firstPass = h.slice(0, 10 - heard.length).map((x) => x.trackId);
+  for (const id of heard) assert.ok(!firstPass.includes(id), `${id} is not played again in this pass`);
+  assert.ok(plain.slice(3, 6).includes(h[0].trackId), 'the opener comes from the head of what is left of the order');
+  s = r.conductor.snapshot();
+  assert.ok(Math.abs(s.elapsed - (372 + s.now)) < 1e-9, `Elapsed goes on (${s.elapsed} at set time ${s.now})`);
+  assert.equal(r.conductor.elapsedAt(10), 382, 'the per-frame Elapsed adds the same carried time');
+  assert.deepEqual(s.setlist.filter((x) => /\|c\d+$/.test(x.key)).map((x) => x.state), ['played', 'played', 'played']);
+  // the next pass: the carried songs come round again (they are in it, as queued or played rows)
+  for (let k = 0; k < 60 && r.conductor.history().length <= 10 - heard.length; k++) await r.run(5);
+  const later = r.conductor.snapshot().setlist.filter((x) => !/\|c\d+$/.test(x.key)).map((x) => x.key.split('|')[0]);
+  for (const id of heard) assert.ok(later.includes(id), `${id} is in the next pass`);
+  // New Set: a set of its own (no carried rows, Elapsed from 0)
+  r.conductor.newSet('carry2');
+  await r.run(2);
+  s = r.conductor.snapshot();
+  assert.ok(!s.setlist.some((x) => /\|c\d+$/.test(x.key)), 'a new set starts its own history');
+  assert.ok(s.elapsed < 3, `Elapsed restarts (${s.elapsed})`);
+});
+
+test('a hand-over (the full-song set plays on until the previews sound): Elapsed runs on through the wait, then goes on with set time', async () => {
+  const r = rig(8, { delay: () => 900 }); // the first previews take a few seconds to get ready
+  r.conductor.load(r.playlist, { seed: 'carry3', autostart: true, carry: { played: [], elapsed: 100, at: 0, live: true } });
+  await r.run(1);
+  assert.equal(r.conductor.started, false);
+  const waiting = r.conductor.snapshot().elapsed;
+  assert.ok(Math.abs(waiting - 101) < 0.05, `the wait counts while the other set plays on (${waiting})`);
+  for (let k = 0; k < 40 && !r.conductor.started; k++) await r.run(0.2);
+  assert.equal(r.conductor.started, true);
+  await r.run(0.4); // (set time starts just below 0)
+  const s = r.conductor.snapshot();
+  const wait = s.elapsed - 100 - s.now;
+  assert.ok(wait > 1 && wait < 10, `Elapsed = 100 + the wait + set time (wait ${wait.toFixed(2)} s)`);
+  await r.run(5);
+  const later = r.conductor.snapshot();
+  assert.ok(Math.abs(later.elapsed - s.elapsed - (later.now - s.now)) < 1e-6, 'after the start it follows set time only (the wait is not counted twice)');
+  // a plain swap (nothing was playing): the wait does not count
+  const q = rig(8, { delay: () => 900 });
+  q.conductor.load(q.playlist, { seed: 'carry3', autostart: true, carry: { played: [], elapsed: 100, at: 0, live: false } });
+  await q.run(1);
+  assert.equal(q.conductor.snapshot().elapsed, 100);
+});

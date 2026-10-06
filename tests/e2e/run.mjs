@@ -1,9 +1,10 @@
 // Runs every end-to-end script one after the other (each is a headless-Chrome run of its own) and
 // prints a summary. Exit code 0 only when all of them passed.
 //
-//   npm run e2e                       everything (~8 min, needs Chrome and the network)
+//   npm run e2e                       everything (~25 min, needs Chrome and the network; the YouTube suites sit through real ads)
 //   node tests/e2e/run.mjs app mix    only the scripts whose name matches
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const HERE = fileURLToPath(new URL('./', import.meta.url));
@@ -16,6 +17,12 @@ const SUITES = [
   ['ui', 'ui.e2e.mjs', []],
   ['mix', 'mix.e2e.mjs', []],
   ['app', 'app.e2e.mjs', []],
+  // full songs: the YouTube finder, the deck, then the whole app under the real origin with real ads
+  ['youtube', 'youtube.e2e.mjs', []],
+  ['ytdeck', 'ytdeck.e2e.mjs', []],
+  ['full', 'full.e2e.mjs', []],
+  // README "Privacy" against what a plain visit and a share link really contact and leave (cookies), no tap
+  ['privacy', 'privacy.e2e.mjs', []],
 ];
 
 const only = process.argv.slice(2);
@@ -27,6 +34,10 @@ if (!picked.length) {
 
 const run = (script, args) =>
   new Promise((resolve) => {
+    if (!existsSync(HERE + script)) {
+      console.error(`missing: tests/e2e/${script} (counted as a failure)`);
+      return resolve(1);
+    }
     const child = spawn(process.execPath, [HERE + script, ...args], { stdio: 'inherit' });
     child.on('exit', (code, signal) => resolve(signal ? 1 : code ?? 1));
     child.on('error', () => resolve(1));

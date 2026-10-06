@@ -12,15 +12,22 @@
 //     &toasts=1    show one toast of each kind
 //     &empty=1     stage with nothing loaded yet
 //     &fail=1      every load fails the way js/main.js reports one (back to landing, then view.inputError)
+//     &mode=video  full songs: the video stage, with plain placeholder boxes in the two player slots
+//                  (see demo-video.js); picking Preview hands over to the preview mock and back
+//     &vstate=starting|ad|ready|mix   video mode: start at the first song's ad, the next song's muted
+//                  ad, the next song cued and ready, or the middle of a hand-over
 //
 // window.__segueDemo exposes { ready, view, calls, seek(t), step(dt), frameAt(t), state() } for e2e tests.
 
 import { createView } from './view.js';
 import { makeTrack, mulberry32 } from './mock.js';
+import { createVideoSet, mountPlaceholder } from './demo-video.js';
 import { dbToGain, evalParam, positionAt, rateAt, sortEvents, timeAtPosition } from '../dj/timeline.js';
 
 const qs = new URLSearchParams(location.search);
 const flag = (name) => qs.get(name) === '1';
+/** full songs (video stage) or 30-second previews / own files (waveforms) */
+let VIDEO = qs.get('mode') === 'video' && !flag('long');
 
 // ── fake crate ─────────────────────────────────────────────────────────────────────────────────
 // title, artist, bpm, camelot, key name
@@ -284,7 +291,7 @@ const state = {
   recording: flag('rec'),
   seed: 'K3F9QZ',
   vibe: 0.5,
-  mode: flag('long') ? 'medium' : 'preview',
+  mode: flag('long') || VIDEO ? 'medium' : 'preview',
   volume: 0.9,
   t: Number(qs.get('t')) || 0,
 };
@@ -323,8 +330,9 @@ const view = createView(document.getElementById('app'), {
   },
   onSkip() {
     log('onSkip')();
-    set.ensure(cur + 1);
-    const next = set.trans[cur + 1];
+    const s0 = VIDEO ? vset : set;
+    s0.ensure(cur + 1);
+    const next = s0.trans[cur + 1];
     if (state.t < next.tStart - 0.6) state.t = next.tStart - 0.6;
   },
   onNewSet() {
@@ -340,8 +348,13 @@ const view = createView(document.getElementById('app'), {
   },
   onMode(m) {
     log('onMode')(m);
-    state.mode = m;
-    pushTransport();
+    changeMode(m);
+  },
+  // "Play previews instead": what js/main.js does — this set goes on as previews (the stored track
+  // length is not touched; the mock keeps none)
+  onPreviewOnce() {
+    log('onPreviewOnce')();
+    changeMode('preview');
   },
   onVolume(v) {
     log('onVolume')(v);
@@ -390,17 +403,22 @@ view.setDemos(
 /** @type {any[]} */
 let tracks = [];
 
+const REC_WHY = 'Recording works with previews and your own files — YouTube’s audio can’t be recorded';
+
 function pushTransport() {
-  const tr = set && set.trans[cur + 1];
+  const s0 = VIDEO ? vset : set;
+  const tr = s0 && s0.trans[cur + 1];
   view.setTransport({
     playing: state.playing,
-    canSkip: !!tr && state.t < tr.tStart - 0.7,
-    recording: state.recording,
+    canSkip: !!tr && state.t >= (VIDEO ? AD_FIRST_T() : 0) && state.t < tr.tStart - 0.7,
+    recording: state.recording && !VIDEO,
     seed: state.seed,
     vibe: state.vibe,
     mode: state.mode,
-    modeEnabled: flag('long'),
+    modeEnabled: true,
     volume: state.volume,
+    recordEnabled: !VIDEO,
+    recordWhy: VIDEO ? REC_WHY : '',
   });
 }
 
@@ -443,14 +461,39 @@ function fakeLoad(what) {
 }
 
 function newSet() {
-  set = createMockSet(state.seed, tracks);
+  if (VIDEO) vset = createVideoSet(state.seed, vtracks, state.mode === 'preview' ? 'medium' : state.mode);
+  else set = createMockSet(state.seed, tracks);
   cur = 0;
   lastSig = '';
   loaded[0] = loaded[1] = -2;
+  vshown[0].id = vshown[1].id = -2;
   state.t = 0;
   state.playing = true;
   sync(0);
   pushTransport();
+}
+
+/** A Track length change (or "Play previews instead"): what js/main.js does with it. */
+function changeMode(m) {
+  state.mode = m;
+  // Preview and the full-song lengths are two different engines
+  const video = m !== 'preview' && !flag('long');
+  if (video !== VIDEO) switchEngine(video);
+  else if (VIDEO) {
+    // a new leave point: re-plan from here on (the mock simply re-plans the whole set)
+    const t = state.t;
+    newSet();
+    seek(t);
+  } else pushTransport();
+}
+
+/** Preview ↔ full songs: the stage switches between waveforms and the two video slots. */
+function switchEngine(video) {
+  VIDEO = video;
+  if (VIDEO && state.mode === 'preview') state.mode = 'medium';
+  view.setStageMode(VIDEO ? 'video' : 'waves');
+  if (VIDEO) mountPlayers();
+  newSet();
 }
 
 function deckView(play) {
@@ -465,6 +508,10 @@ function deckView(play) {
 /** Push deck / transition / setlist state for set time t (only what changed). */
 function sync(t) {
   if (flag('empty')) return;
+  if (VIDEO) {
+    videoSync(t);
+    return;
+  }
   // which play is "current": the last one whose incoming transition has finished
   if (cur >= set.trans.length || t < set.trans[cur].tEnd) cur = 0;
   for (;;) {
@@ -536,6 +583,7 @@ const frameState = {
 const noise = mulberry32(99);
 
 function frameAt(t) {
+  if (VIDEO) return videoFrameAt(t);
   const f = frameState;
   f.t = t;
   f.playing = state.playing;
@@ -609,9 +657,148 @@ function frameAt(t) {
   return f;
 }
 
+// ── full songs (video stage) ───────────────────────────────────────────────────────────────────
+/** @type {ReturnType<typeof createVideoSet>} */
+let vset;
+/** @type {any[]} */
+let vtracks = [];
+/** what each deck shows: play id (−1 empty, −2 not pushed yet) and its status */
+const vshown = [{ id: -2, st: '' }, { id: -2, st: '' }];
+/** @type {ReturnType<typeof mountPlaceholder>[]} */
+let players = [];
+const AD_FIRST_T = () => (vset ? vset.plays[0].startAt : 0);
+
+/** The integrator mounts one YouTube player per slot, once; the demo mounts placeholder boxes. */
+function mountPlayers() {
+  if (players.length) return;
+  players = [mountPlaceholder(view.videoSlot(0), 'A'), mountPlaceholder(view.videoSlot(1), 'B')];
+}
+
+function videoDeckView(p, st) {
+  const T = p.track;
+  return {
+    playId: p.id, title: T.title, artist: T.artist, artwork: T.artwork, link: T.link, bpm: NaN, camelot: undefined,
+    keyName: undefined, duration: T.durationS, provider: 'youtube', wave: null, beats: [], downbeat: 0, cues: null,
+    status: st, statusText: p.id === 0 && st === 'ad' ? 'Starting · ad playing' : undefined,
+  };
+}
+
+function videoSync(t) {
+  vset.ensure(cur + 3);
+  if (cur >= vset.trans.length || t < vset.trans[cur].tEnd) cur = 0;
+  for (;;) {
+    vset.ensure(cur + 3);
+    if (t >= vset.trans[cur + 1].tEnd) cur++;
+    else break;
+  }
+  for (let d = 0; d < 2; d++) {
+    let id = -1;
+    let st = '';
+    for (let k = Math.max(0, cur - 1); k <= cur + 2; k++) {
+      const p = vset.plays[k];
+      if (p.deck !== d) continue;
+      const s0 = vset.status(p, t);
+      if (s0) {
+        id = k;
+        st = s0;
+      }
+    }
+    if (id !== vshown[d].id || st !== vshown[d].st) {
+      vshown[d].id = id;
+      vshown[d].st = st;
+      view.setDeck(d, id < 0 ? null : videoDeckView(vset.plays[id], st));
+      if (players[d]) players[d].show(st, id < 0 ? null : vset.plays[id].track);
+    }
+  }
+
+  const first = vset.plays[0];
+  const next = vset.trans[cur + 1];
+  const phase = t < first.startAt ? 'starting' : t >= next.tStart ? 'active' : t >= next.announceAt ? 'upcoming' : 'solo';
+  const sig = `v|${cur}|${phase}`;
+  if (sig === lastSig) return;
+  lastSig = sig;
+  if (phase === 'solo') view.setTransition(null);
+  else if (phase === 'starting') {
+    const tr = vset.trans[0];
+    view.setTransition({ type: 'start', label: tr.label, why: tr.why, state: 'starting', fromTitle: '', toTitle: first.track.title, tStart: tr.tStart, tEnd: tr.tStart, marks: [] });
+  } else {
+    view.setTransition({
+      type: next.type, label: next.label, why: next.why, state: phase, synced: false,
+      fromTitle: vset.plays[cur].track.title, toTitle: vset.plays[cur + 1].track.title,
+      tStart: next.tStart, tEnd: next.tEnd, marks: next.marks,
+    });
+  }
+
+  const n = vset.order.length;
+  const base = cur - (cur % n);
+  const items = [];
+  for (let j = 0; j < n; j++) {
+    const k = base + j;
+    vset.ensure(k);
+    const T = vset.plays[k].track;
+    let st = 'queued';
+    if (k < cur) st = 'played';
+    else if (k === cur) st = phase === 'starting' ? 'next' : 'playing';
+    else if (k === cur + 1) st = phase === 'active' ? 'mixing' : 'next';
+    else if (k === cur + 3) st = 'loading';
+    items.push({ key: `${T.id}`, title: T.title, artist: T.artist, artwork: T.artwork, state: st, via: k > 0 && k <= cur + 1 ? vset.trans[k].label : undefined, link: T.link, deck: vset.plays[k].deck });
+  }
+  view.setSetlist(items, { crate: n });
+  pushTransport();
+}
+
+const mkVDeck = () => ({ pos: 0, rate: 1, bpmNow: NaN, gain: 0, low: 0, mid: 0, high: 0, hpf: 20, lpf: 20000, audible: 0, startsIn: 0, duration: 0, leaveAt: 0, eqActive: false });
+const vdeckFrames = [mkVDeck(), mkVDeck()];
+const vframe = {
+  t: 0, playing: true, elapsed: 0, decks: [null, null], crossfade: -1, beatPhase: -1,
+  // the analyser cannot hear YouTube's player: the levels stay at silence
+  levels: { rms: 0, peak: 0, bands: new Uint8Array(64) },
+};
+
+function videoFrameAt(t) {
+  const f = vframe;
+  f.t = t;
+  f.playing = state.playing;
+  f.elapsed = t;
+  let g0 = 0;
+  let g1 = 0;
+  for (let d = 0; d < 2; d++) {
+    const id = vshown[d].id;
+    if (id < 0) {
+      f.decks[d] = null;
+      continue;
+    }
+    const p = vset.plays[id];
+    const df = vdeckFrames[d];
+    df.pos = t < p.startAt ? 0 : Math.min(p.duration, t - p.startAt);
+    df.startsIn = t < p.startAt ? p.startAt - t : 0;
+    df.gain = vset.volume(p, t);
+    df.audible = df.gain;
+    df.duration = p.duration;
+    df.leaveAt = p.leaveAt;
+    f.decks[d] = df;
+    if (d === 0) g0 = df.gain;
+    else g1 = df.gain;
+  }
+  if (g0 + g1 > 0.001) f.crossfade = (g1 - g0) / (g0 + g1);
+  return f;
+}
+
+/** Set time of a named moment in the mock full-song set (for &vstate= and the tests). */
+function videoMoment(name) {
+  vset.ensure(4);
+  const p1 = vset.plays[1];
+  const mix = vset.trans.find((x, i) => i > 0 && x.tEnd - x.tStart >= 10) || vset.trans[1];
+  if (name === 'starting') return 4;
+  if (name === 'ad') return p1.loadAt + 5;
+  if (name === 'ready') return Math.min(p1.adUntil + 3, vset.trans[1].announceAt - 1);
+  if (name === 'mix') return mix.tStart + (mix.tEnd - mix.tStart) * 0.45;
+  return 0;
+}
+
 function seek(t) {
   state.t = Math.max(0, t);
-  if (state.screen === 'stage' && set) {
+  if (state.screen === 'stage' && (VIDEO ? vset : set)) {
     sync(state.t);
     view.frame(frameAt(state.t));
   }
@@ -632,7 +819,7 @@ function loop(now) {
   requestAnimationFrame(loop);
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
-  if (state.screen !== 'stage' || !set) return;
+  if (state.screen !== 'stage' || !(VIDEO ? vset : set)) return;
   step(dt);
 }
 
@@ -647,14 +834,23 @@ const ready = (async () => {
       an: makeTrack({ seed: i + 3, bpm, duration: long ? 360 : 30, firstBeat: 0.1 + ((i * 37) % 23) / 100 }),
     };
   });
+  // the same crate as full songs: three to four and a half minutes each, no analysis (no audio reaches the page)
+  vtracks = CRATE.map(([title, artist], i) => ({
+    id: `demo:${i}`, title, artist, artwork: covers[i], link: 'https://www.youtube.com/', durationS: 168 + ((i * 53) % 104),
+  }));
   view.setPlaylist({
     title: 'Late Night Drive', subtitle: 'Fourteen after-hours cuts for the demo', artwork: covers[2],
     link: 'https://open.spotify.com/', count: CRATE.length, source: flag('long') ? 'local' : 'spotify',
   });
+  if (VIDEO) {
+    view.setStageMode('video');
+    mountPlayers();
+  }
   view.setLoading({ title: 'Digging through the crate', detail: 'Finding audio 9 / 14 — Juno Arias · Cassette Summer', progress: 0.62 });
 
-  const t0 = state.t;
   newSet();
+  const moment = VIDEO ? qs.get('vstate') : null;
+  const t0 = moment ? videoMoment(moment) : Number(qs.get('t')) || 0;
   state.t = t0;
   const screen = ['landing', 'loading', 'ready', 'stage'].includes(qs.get('screen')) ? qs.get('screen') : 'landing';
   go(screen);
@@ -676,9 +872,13 @@ window.__segueDemo = {
   seek,
   step,
   frameAt,
+  /** video mode: set time of 'starting' | 'ad' | 'ready' | 'mix' in the mock full-song set */
+  moment: (name) => (VIDEO ? videoMoment(name) : NaN),
   state: () => ({
-    ...state, cur, phase: lastSig,
-    trans: set ? set.trans.map((x) => ({ type: x.type, tStart: x.tStart, tEnd: x.tEnd, announceAt: x.announceAt })) : [],
-    plays: set ? set.plays.map((x) => ({ deck: x.deck, startAt: x.startAt, loadAt: x.loadAt, offset: x.offset })) : [],
+    ...state, cur, phase: lastSig, video: VIDEO,
+    trans: !VIDEO && set ? set.trans.map((x) => ({ type: x.type, tStart: x.tStart, tEnd: x.tEnd, announceAt: x.announceAt })) : [],
+    plays: !VIDEO && set ? set.plays.map((x) => ({ deck: x.deck, startAt: x.startAt, loadAt: x.loadAt, offset: x.offset })) : [],
+    vtrans: VIDEO && vset ? vset.trans.map((x) => ({ type: x.type, tStart: x.tStart, tEnd: x.tEnd, announceAt: x.announceAt })) : [],
+    vplays: VIDEO && vset ? vset.plays.map((x) => ({ deck: x.deck, loadAt: x.loadAt, adUntil: x.adUntil, startAt: x.startAt, leaveAt: x.leaveAt, endAt: x.endAt, duration: x.duration })) : [],
   }),
 };

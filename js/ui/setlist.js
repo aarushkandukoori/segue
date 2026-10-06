@@ -22,8 +22,11 @@ const STATE_LABEL = {
 export function createSetlist(list, extra) {
   /** @type {Map<string, any>} */
   const rows = new Map();
+  // The row the list last followed, and where it was. Both count: after New Set the song on air keeps
+  // its key but the played rows above it are gone, so it moves to the top while the key stays the same.
   let focusKey = '';
-  let lastUserScroll = 0;
+  let focusIdx = -1;
+  let lastUserScroll = -Infinity; // not 0: the first seconds of a page are not "the user just scrolled"
   /** @type {[any, any]} */
   let deckViews = [null, null];
   /** @type {any[]} */
@@ -108,6 +111,7 @@ export function createSetlist(list, extra) {
     let prev = null;
     let played = 0;
     let nowKey = '';
+    let nowIdx = -1;
     for (const it of current) {
       if (!it || it.key == null) continue;
       const key = String(it.key);
@@ -123,7 +127,10 @@ export function createSetlist(list, extra) {
       if (row.li !== want) list.insertBefore(row.li, want);
       prev = row.li;
       if (it.state === 'played') played++;
-      if (!nowKey && (it.state === 'playing' || it.state === 'mixing')) nowKey = key;
+      if (!nowKey && (it.state === 'playing' || it.state === 'mixing')) {
+        nowKey = key;
+        nowIdx = seen.size - 1;
+      }
     }
     for (const [key, row] of rows) {
       if (seen.has(key)) continue;
@@ -134,15 +141,21 @@ export function createSetlist(list, extra) {
     const crate = info && Number.isFinite(info.crate) && info.crate >= 0 ? Math.round(info.crate) : seen.size;
     setText(extra.count, seen.size ? `${played} played · ${crate} in the crate` : '');
 
-    // Follow the playing track unless the user just scrolled the list themselves.
-    if (nowKey && nowKey !== focusKey) {
+    // Follow the playing track unless the user just scrolled the list themselves — when it changes, and
+    // when the rows above it change (New Set keeps the song on air but drops the played rows).
+    if (nowKey && (nowKey !== focusKey || nowIdx !== focusIdx)) {
       focusKey = nowKey;
-      if (performance.now() - lastUserScroll > 4000) {
-        const row = rows.get(nowKey);
-        const top = row.li.offsetTop - list.clientHeight * 0.28;
-        list.scrollTop = top > 0 ? top : 0;
-      }
+      focusIdx = nowIdx;
+      if (performance.now() - lastUserScroll > 4000) follow();
     }
+  }
+
+  /** Scroll the list so the row on air sits near its top (nothing to do when nothing is on air). */
+  function follow() {
+    const row = focusKey ? rows.get(focusKey) : null;
+    if (!row) return;
+    const top = row.li.offsetTop - list.clientHeight * 0.28;
+    list.scrollTop = top > 0 ? top : 0;
   }
 
   /** Called when a deck is (un)loaded so rows can pick up the deck colour. */
@@ -154,5 +167,8 @@ export function createSetlist(list, extra) {
     }
   }
 
-  return { set, setDecks };
+  /** The list was just opened at a new size (a sheet): bring the row on air into view. */
+  const reveal = () => follow();
+
+  return { set, setDecks, reveal };
 }

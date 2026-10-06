@@ -9,6 +9,12 @@
 //     gone, or the next track is still loading). The ticker says so, and why, for as long as it lasts.
 //   trick — a mid-solo trick ("Beat repeat") on the track that is playing, while the next transition
 //     is already announced. It shows as a pill for its second or two and never replaces "Next: …".
+//   state 'starting' — full songs: the first song is waiting for YouTube's pre-roll ad to finish. How
+//     long that takes is unknown, so there is no countdown — just what is happening, why, and a way out
+//     ("Play previews instead", wired by the view to handlers.onPreviewOnce() — this set only, the
+//     visitor's stored track length stays; onMode('preview') when that handler is missing). Its reason line (and
+//     'waiting''s) may wrap to a second line instead of being cut short: it is the only explanation of
+//     a silence whose length nobody knows.
 
 import { clamp01, el, fmtTime, setText } from './dom.js';
 
@@ -62,8 +68,9 @@ export function createTicker(root, R) {
    */
   function set(v, sides) {
     const waiting = !!v && v.state === 'waiting';
+    const starting = !!v && v.state === 'starting';
     const next = v
-      ? `${v.state}|${v.type}|${v.label}|${v.fromTitle}|${v.toTitle}|${v.tStart}|${v.tEnd}|${(v.marks || []).length}${waiting ? `|${v.why}` : ''}`
+      ? `${v.state}|${v.type}|${v.label}|${v.fromTitle}|${v.toTitle}|${v.tStart}|${v.tEnd}|${(v.marks || []).length}${waiting || starting ? `|${v.why}` : ''}`
       : '';
     tv = v || null;
     if (sides) {
@@ -76,6 +83,12 @@ export function createTicker(root, R) {
     sig = next;
     qFill = qCount = -1;
     clearMarks();
+    R['tk-act'].hidden = !starting;
+    // the reason line can be cut short on a narrow screen (one line while a move is announced): the
+    // whole sentence stays one hover away, and the live region below reads it out
+    const why = tv && tv.why ? String(tv.why) : '';
+    if (why) R['tk-why'].title = why;
+    else R['tk-why'].removeAttribute('title');
 
     if (!tv) {
       root.dataset.state = 'idle';
@@ -98,6 +111,20 @@ export function createTicker(root, R) {
       setText(R['tk-count'], '');
       paintFill(0);
       setText(R['tk-live'], `${tv.label || 'Waiting for the next track'}.${tv.why ? ` ${tv.why}` : ''}`);
+      return;
+    }
+
+    if (starting) {
+      // The first song is behind an ad of unknown length: say so, no countdown, offer the way out.
+      root.dataset.state = 'starting';
+      setText(R['tk-tag'], 'Starting');
+      setText(R['tk-label'], tv.label || 'Starting the set');
+      setText(R['tk-to'], tv.toTitle ? `with ${tv.toTitle}` : '');
+      setText(R['tk-why'], tv.why || '');
+      setText(R['tk-count-lbl'], '');
+      setText(R['tk-count'], '');
+      paintFill(0);
+      setText(R['tk-live'], `${tv.label || 'Starting the set'}.${tv.why ? ` ${tv.why}` : ''}`);
       return;
     }
 
@@ -145,7 +172,7 @@ export function createTicker(root, R) {
 
   /** @param {number} t set time */
   function frame(t) {
-    if (!tv || tv.state === 'waiting') return;
+    if (!tv || tv.state === 'waiting' || tv.state === 'starting') return;
     if (tv.state === 'active') {
       const span = tv.tEnd - tv.tStart;
       paintFill(span > 0 ? (t - tv.tStart) / span : 1);

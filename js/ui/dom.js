@@ -113,6 +113,7 @@ export function linkLabel(url) {
   if (onDomain(host, 'spotify.com')) return 'Open in Spotify';
   if (onDomain(host, 'deezer.com') || onDomain(host, 'deezer.page.link')) return 'Open in Deezer';
   if (onDomain(host, 'apple.com')) return 'Open in Apple Music';
+  if (onDomain(host, 'youtube.com') || onDomain(host, 'youtu.be') || onDomain(host, 'youtube-nocookie.com')) return 'Open on YouTube';
   return 'Open track';
 }
 
